@@ -1,0 +1,17 @@
+.{
+    .name = .msvcup,
+    .fingerprint = 0xbd52518ef5381747,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{
+        .zipcmdline = .{
+            .url = "git+https://github.com/marler8997/zipcmdline#3dfca786a489d117e4b72ea10ffb4bbd9fc2dd72",
+            .hash = "12201a08d7eff7619c8eb8284691a3ff959861b4bdd87216f180ed136672fb4ea26f",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
