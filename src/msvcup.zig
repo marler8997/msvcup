@@ -1,3 +1,5 @@
+// TODO: maybe  manifests file should go in the cache directory?
+//       maybe the packages should go in a subdirectory of the cache?
 const log = std.log.scoped(.msvcup);
 
 const global = struct {
@@ -40,7 +42,7 @@ pub fn main() !u8 {
         const cmd_arg_index: usize = cmd_arg_index_blk: {
             var arg_index: usize = 0;
             while (true) : (arg_index += 1) {
-                if (arg_index == all_args.len) try usage();
+                if (arg_index == all_args.len) try usage(arena);
                 const arg = all_args[arg_index];
                 if (!std.mem.startsWith(u8, arg, "-")) break :cmd_arg_index_blk arg_index;
                 errExit("TODO: add support for specifying options before command", .{});
@@ -59,21 +61,37 @@ pub fn main() !u8 {
     return 0xff;
 }
 
-fn usage() !noreturn {
+fn usage(arena: std.mem.Allocator) !noreturn {
+    const msvcup_dir: MsvcupDir = try .alloc(arena);
     try std.io.getStdErr().writer().print(
-        \\msvcup version {s}
+        \\msvcup version {[version]s}
         \\
         \\Usage: msvcup COMMAND ARGS...
         \\
         \\Commands:
+        \\--------------------------------------------------------------------------------
         \\
-        \\  list               | list all PKGS
-        \\  install PKGS...    | install PKGS (i.e. msvc-14.44.17.14 or sdk-10.0.22621.7)
+        \\  list                      | List all PKGS.
+        \\  install PKGS...           | Install the given PKGS, which are of the form:
+        \\                            |
+        \\                            |      <PKG_NAME>-<VERSION>
+        \\                            |
+        \\                            | installed to {[install_dir]s}.
+        \\  list-payloads             | List all the payloads.
         \\
-        \\  list-payloads      | list all the payloads
+        \\InstallOptions:
+        \\--------------------------------------------------------------------------------
+        \\  --lock-file PATH          | A manifest to hold all payloads/urls installed.
+        \\  --manifest-update-<OPT>   | Controls whether to update to the latest manifest
+        \\                            | if it's already been downloaded. This option will
+        \\                            | control whether it's updated to the latest, OPT
+        \\                            | can be set to "off", "daily", or "always".
         \\
     ,
-        .{@embedFile("version")},
+        .{
+            .version = @embedFile("version"),
+            .install_dir = msvcup_dir.root_path,
+        },
     );
     std.process.exit(0xff);
 }
@@ -307,26 +325,27 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         // target_arches: Arches,
         // cache_dir: []const u8,
     };
-    const config: Config = blk: {
+    const config: Config = blk_config: {
         var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
-        // var maybe_install_dir: ?[]const u8 = null;
         var maybe_lock_file: ?[]const u8 = null;
         var maybe_manifest_update: ?ManifestUpdate = null;
         var cache_dir: ?[]const u8 = null;
-
-        // var maybe_host_arch: ?Arch = null;
-        // var target_arches: Arches = .none;
-        // var maybe_cache_dir: ?[]const u8 = null;
-        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        // TODO: add an option to include signing tools
-        // var include_signing
 
         var arg_index: usize = 0;
         while (arg_index < args.len) : (arg_index += 1) {
             const arg = args[arg_index];
             if (!std.mem.startsWith(u8, arg, "-")) {
                 switch (MsvcupPackage.fromString(arg)) {
-                    .ok => |pkg| insertSorted(MsvcupPackage, arena, &msvcup_pkgs, pkg, {}, MsvcupPackage.order) catch |e| oom(e),
+                    .ok => |pkg| {
+                        insertSorted(
+                            MsvcupPackage,
+                            arena,
+                            &msvcup_pkgs,
+                            pkg,
+                            {},
+                            MsvcupPackage.order,
+                        ) catch |e| oom(e);
+                    },
                     .unknown_name => errExit("unknown package '{s}'", .{arg}),
                     .invalid_version => |v| errExit("package '{s}' has invalid version '{s}'", .{ arg, v }),
                 }
@@ -340,25 +359,10 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 maybe_manifest_update = .daily;
             } else if (std.mem.eql(u8, arg, "--manifest-update-always")) {
                 maybe_manifest_update = .always;
-            } else if (std.mem.eql(u8, arg, "--download-dir")) {
+            } else if (std.mem.eql(u8, arg, "--cache-dir")) {
                 arg_index += 1;
-                if (arg_index == args.len) errExit("--download-dir missing argument", .{});
+                if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
                 cache_dir = args[arg_index];
-                // } else if (std.mem.eql(u8, arg, "--host-arch")) {
-                //     arg_index += 1;
-                //     if (arg_index == args.len) errExit("--host-arch missing argument", .{});
-                //     const arch_str = args[arg_index];
-                //     maybe_host_arch = Arch.fromString(arch_str) orelse errExit("invalid --host-arch '{s}'", .{arch_str});
-                // } else if (std.mem.eql(u8, arg, "--target-arch")) {
-                //     arg_index += 1;
-                //     if (arg_index == args.len) errExit("--host-arch missing argument", .{});
-                //     const arch_str = args[arg_index];
-                //     const arch = Arch.fromString(arch_str) orelse errExit("invalid --target-arch '{s}'", .{arch_str});
-                //     target_arches.set(arch, true);
-                // } else if (std.mem.eql(u8, arg, "--cache-dir")) {
-                //     arg_index += 1;
-                //     if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
-                //     maybe_cache_dir = args[arg_index];
             } else errExit("unknown cmdline argument '{s}'", .{arg});
         }
 
@@ -367,7 +371,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
             std.debug.assert(.lt == MsvcupPackage.order({}, msvcup_pkgs.items[i - 1], msvcup_pkgs.items[i]));
         };
 
-        break :blk .{
+        break :blk_config .{
             .msvcup_pkgs = msvcup_pkgs.toOwnedSlice(arena) catch |e| oom(e),
             .lock_file = maybe_lock_file orelse errExit(
                 "missing cmdline arguments: --lock-file PATH",
@@ -1965,6 +1969,10 @@ fn identifyPayload(payload_filename: []const u8) PayloadId {
         return .sdk;
     // contains a bunch of ".lib" file in the um directory
     if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK Desktop Libs "))
+        return .sdk;
+
+    // includes tools like signtool.exe
+    if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK Signing Tools-"))
         return .sdk;
 
     // contains cppwinrt and winrt headers
