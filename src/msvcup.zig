@@ -171,6 +171,10 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 const msvcup_pkg: MsvcupPackage = .initStr(.msvc, p.build_version);
                 insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
             },
+            .diasdk => {
+                const msvcup_pkg: MsvcupPackage = .initStr(.diasdk, pkg.version);
+                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
+            },
         }
 
         for (pkgs.payloadsFromPkgIndex(.fromInt(pkg_index))) |payload| {
@@ -220,15 +224,13 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
             .en_us => {},
             .other => continue,
         }
+        // just a sanity check
         switch (identifyPackage(pkg.id)) {
-            .unknown => {},
             .unexpected => |u| try std.debug.panic(
                 "unexpected package id '{s}' (expected {s} at offset {} '{s}')\n",
                 .{ pkg.id, @tagName(u.expected), u.offset, pkg.id[u.offset..] },
             ),
-            .msvc_version_something => {},
-            .msvc_version_tools_something => {},
-            .msvc_version_host_target => {},
+            else => {},
         }
         const payload_range = pkgs.payloadRangeFromPkgIndex(.fromInt(pkg_index));
         for (payload_range.start..payload_range.limit) |payload_index| {
@@ -257,17 +259,9 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 const MsvcupPackageKind = enum {
     msvc,
     sdk,
+    diasdk,
     pub fn order(_: void, lhs: MsvcupPackageKind, rhs: MsvcupPackageKind) std.math.Order {
-        return switch (lhs) {
-            .msvc => switch (rhs) {
-                .msvc => .eq,
-                .sdk => .lt,
-            },
-            .sdk => switch (rhs) {
-                .msvc => .gt,
-                .sdk => .eq,
-            },
-        };
+        return std.math.order(@intFromEnum(lhs), @intFromEnum(rhs));
     }
 };
 const MsvcupPackage = struct {
@@ -284,6 +278,7 @@ const MsvcupPackage = struct {
         const kind: MsvcupPackageKind, const version: []const u8 = blk: {
             if (startsWith(u8, pkg, "msvc-")) |version| break :blk .{ .msvc, version };
             if (startsWith(u8, pkg, "sdk-")) |version| break :blk .{ .sdk, version };
+            if (startsWith(u8, pkg, "diasdk-")) |version| break :blk .{ .diasdk, version };
             return .unknown_name;
         };
         return if (isValidVersion(version)) .{ .ok = .{
@@ -717,11 +712,18 @@ fn installFromLockFile(
     return .success;
 }
 
+const FinishKind = enum { msvc, sdk };
 fn finishPackage(
     scratch: std.mem.Allocator,
     msvcup_dir: MsvcupDir,
     msvcup_pkg: MsvcupPackage,
 ) !void {
+    const finish_kind: FinishKind = switch (msvcup_pkg.kind) {
+        .msvc => .msvc,
+        .sdk => .sdk,
+        .diasdk => return,
+    };
+
     const install_path = msvcup_dir.path(scratch, &.{msvcup_pkg.poolString().slice}) catch |e| oom(e);
     defer scratch.free(install_path);
 
@@ -730,7 +732,7 @@ fn finishPackage(
     // have to go in and look at the directory that was actually created to
     // get the "install version".
     const install_version = blk: {
-        const query_path = switch (msvcup_pkg.kind) {
+        const query_path = switch (finish_kind) {
             .msvc => std.fs.path.join(scratch, &.{ install_path, "VC", "Tools", "MSVC" }) catch |e| oom(e),
             .sdk => std.fs.path.join(scratch, &.{ install_path, "Windows Kits", "10", "Include" }) catch |e| oom(e),
         };
@@ -796,7 +798,7 @@ fn finishPackage(
         defer install_dir.close();
         inline for (std.meta.fields(Arch)) |arch_field| {
             const arch: Arch = @enumFromInt(arch_field.value);
-            const env_bat = generateVcvarsBat(scratch, msvcup_pkg, install_version, arch) catch |e| oom(e);
+            const env_bat = generateVcvarsBat(scratch, finish_kind, install_version, arch) catch |e| oom(e);
             defer scratch.free(env_bat);
             const env_basename = std.fmt.allocPrint(scratch, "vcvars-{s}.bat", .{@tagName(arch)}) catch |e| oom(e);
             defer scratch.free(env_basename);
@@ -816,14 +818,14 @@ fn finishPackage(
 
 fn generateVcvarsBat(
     allocator: std.mem.Allocator,
-    msvcup_pkg: MsvcupPackage,
+    finish_kind: FinishKind,
     install_version: []const u8,
     target_arch: Arch,
 ) error{OutOfMemory}![]const u8 {
     var bat: std.ArrayListUnmanaged(u8) = .{};
     defer bat.deinit(allocator);
     const writer = bat.writer(allocator);
-    switch (msvcup_pkg.kind) {
+    switch (finish_kind) {
         .msvc => {
             try writer.print(
                 "set INCLUDE=%~dp0VC\\Tools\\MSVC\\{s}\\include;%INCLUDE%\n",
@@ -1127,9 +1129,12 @@ fn installPayloadZip(
                 continue;
             }
 
-            const sub_path = filename[prefix.len..];
+            // for some reason, the VSIX filenames can be URL percent encoded?!?
+            const sub_path_encoded = filename[prefix.len..];
+            const sub_path_decoded = allocUrlPercentDecoded(scratch, sub_path_encoded) catch |e| oom(e);
+            defer scratch.free(sub_path_encoded);
 
-            const install_path = std.fs.path.join(scratch, &.{ install_dir_path, sub_path }) catch |e| oom(e);
+            const install_path = std.fs.path.join(scratch, &.{ install_dir_path, sub_path_decoded }) catch |e| oom(e);
             defer scratch.free(install_path);
             switch (try updateInstallingManifest(install_dir, installing_manifest, install_path)) {
                 .already_installed => {
@@ -1388,7 +1393,10 @@ fn endInstall(
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 // TODO: make this take an array of patterns instead
 //       it would be great to be ale to see which patterns pulled in packages/payloads
-fn isMsvcPkg(id: []const u8) ?[]const u8 {
+fn getInstallPkg(id: []const u8) ?union(enum) {
+    msvc: []const u8,
+    diasdk,
+} {
     return switch (identifyPackage(id)) {
         .unknown => null,
         .unexpected => |u| try std.debug.panic(
@@ -1399,7 +1407,7 @@ fn isMsvcPkg(id: []const u8) ?[]const u8 {
             const crt = scanIdPart(id, p.something.ptr - id.ptr);
             if (!std.mem.eql(u8, crt.slice, "CRT")) return null;
             // contains vcruntime.h
-            if (std.mem.eql(u8, id[crt.end..], "Headers.base")) return p.build_version;
+            if (std.mem.eql(u8, id[crt.end..], "Headers.base")) return .{ .msvc = p.build_version };
 
             const after_crt_part = scanIdPart(id, crt.end);
 
@@ -1412,25 +1420,26 @@ fn isMsvcPkg(id: []const u8) ?[]const u8 {
                 //     concrt140.dll - Concurrency runtime for parallel programming
                 //     vccorlib140.dll - Core library components
                 // it also contains debug versions, which are files ending in "d.dll"
-                if (std.mem.eql(u8, after_arch, "base")) return p.build_version;
+                if (std.mem.eql(u8, after_arch, "base")) return .{ .msvc = p.build_version };
             } else {
                 _ = Arch.fromStringIgnoreCase(after_crt_part.slice) orelse return null;
                 const after_arch = id[after_crt_part.end..];
                 // contains libcmt.lib
-                if (std.mem.eql(u8, after_arch, "Desktop.base")) return p.build_version;
+                if (std.mem.eql(u8, after_arch, "Desktop.base")) return .{ .msvc = p.build_version };
                 // contains oldnames.lib
-                if (std.mem.eql(u8, after_arch, "Store.base")) return p.build_version;
+                if (std.mem.eql(u8, after_arch, "Store.base")) return .{ .msvc = p.build_version };
             }
             return null;
         },
         .msvc_version_tools_something => null,
         .msvc_version_host_target => |p| {
             // "base" contains cl.exe
-            if (std.mem.eql(u8, p.name, "base")) return p.build_version;
+            if (std.mem.eql(u8, p.name, "base")) return .{ .msvc = p.build_version };
             // "Res.base" contains clui.dll required by cl.exe
-            if (std.mem.eql(u8, p.name, "Res.base")) return p.build_version;
+            if (std.mem.eql(u8, p.name, "Res.base")) return .{ .msvc = p.build_version };
             return null;
         },
+        .diasdk => return .diasdk,
     };
 }
 
@@ -1473,7 +1482,7 @@ fn updateLockFile(
 ) !void {
     const payloads: []const InstallPayload = blk_payloads: {
         var payloads: std.ArrayListUnmanaged(InstallPayload) = .{};
-        var msvc_pkgs: std.ArrayListUnmanaged(InstallPackage) = .{};
+        var install_pkgs: std.ArrayListUnmanaged(InstallPackage) = .{};
 
         for (pkgs.slice, 0..) |pkg, pkg_index| {
             switch (pkg.language) {
@@ -1482,22 +1491,36 @@ fn updateLockFile(
                 .other => continue,
             }
 
-            if (isMsvcPkg(pkg.id)) |pkg_msvc_version| {
-                for (msvcup_pkgs) |msvcup_pkg| {
+            if (getInstallPkg(pkg.id)) |install_pkg| switch (install_pkg) {
+                .msvc => |pkg_msvc_version| for (msvcup_pkgs) |msvcup_pkg| {
                     if (msvcup_pkg.kind != .msvc) continue;
                     if (std.mem.eql(u8, msvcup_pkg.version.slice, pkg_msvc_version)) {
                         insertSorted(
                             InstallPackage,
                             scratch,
-                            &msvc_pkgs,
+                            &install_pkgs,
                             .init(msvcup_pkg, pkg_index),
                             pkgs.slice,
                             InstallPackage.order,
                         ) catch |e| oom(e);
                         break;
                     }
-                }
-            }
+                },
+                .diasdk => for (msvcup_pkgs) |msvcup_pkg| {
+                    if (msvcup_pkg.kind != .diasdk) continue;
+                    if (std.mem.eql(u8, msvcup_pkg.version.slice, pkg.version)) {
+                        insertSorted(
+                            InstallPackage,
+                            scratch,
+                            &install_pkgs,
+                            .init(msvcup_pkg, pkg_index),
+                            pkgs.slice,
+                            InstallPackage.order,
+                        ) catch |e| oom(e);
+                        break;
+                    }
+                },
+            };
 
             const payload_range = pkgs.payloadRangeFromPkgIndex(.fromInt(pkg_index));
             for (payload_range.start..payload_range.limit) |payload_index| {
@@ -1616,7 +1639,7 @@ fn updateLockFile(
 
         log.warn("TODO: add the dependencies for all the packages we've added", .{});
 
-        for (msvc_pkgs.items) |install_pkg| {
+        for (install_pkgs.items) |install_pkg| {
             const r = pkgs.payloadRangeFromPkgIndex(install_pkg.index);
             for (r.start..r.limit) |payload_index| {
                 insertSorted(
@@ -1845,6 +1868,7 @@ const PackageId = union(enum) {
         target_arch: Arch,
         name: []const u8,
     },
+    diasdk,
 };
 
 fn isVersionDigit(c: u8) bool {
@@ -1896,6 +1920,10 @@ fn scanIdVersion(id: []const u8, start: usize) Scan {
 }
 
 fn identifyPackage(id: []const u8) PackageId {
+    if (std.mem.eql(u8, id, "Microsoft.VisualCpp.DIA.SDK")) {
+        return .diasdk;
+    }
+
     const msvc_prefix = "Microsoft.VC.";
 
     if (std.mem.startsWith(u8, id, msvc_prefix)) {
@@ -1948,6 +1976,7 @@ fn identifyPackage(id: []const u8) PackageId {
             .name = id[target_part.end..],
         } };
     }
+
     return .unknown;
 }
 
