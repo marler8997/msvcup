@@ -522,7 +522,7 @@ fn checkLockFilePkgs(
     msvcup_pkgs: []const MsvcupPackage,
 ) ?LockFileMismatch {
     std.debug.assert(msvcup_pkgs.len > 0);
-    var line_it = std.mem.splitScalar(u8, lock_file_content, '\n');
+    var line_it = std.mem.tokenizeAny(u8, lock_file_content, "\r\n");
     var lineno: u32 = 0;
     var msvcup_pkg_index: usize = 0;
     var msvcup_pkg_match_count: usize = 0;
@@ -664,7 +664,7 @@ fn installFromLockFile(
     lock_file_path: []const u8,
     lock_file_content: []const u8,
 ) !enum { success, version_mismatch } {
-    var line_it = std.mem.splitScalar(u8, lock_file_content, '\n');
+    var line_it = std.mem.tokenizeAny(u8, lock_file_content, "\r\n");
     var lineno: u32 = 0;
     var save_cab_pos: ?struct { lineno: u32, offset: usize } = null;
     while (line_it.next()) |line| {
@@ -930,7 +930,7 @@ fn installPayload(
     }
 
     {
-        var line_it = std.mem.splitScalar(u8, cabs, '\n');
+        var line_it = std.mem.tokenizeAny(u8, cabs, "\r\n");
         var lineno: u32 = cabs_lineno - 1;
         while (line_it.next()) |line| {
             lineno += 1;
@@ -984,7 +984,7 @@ fn installPayload(
             {
                 var installer_dir = try std.fs.cwd().openDir(installer_path, .{});
                 defer installer_dir.close();
-                var line_it = std.mem.splitScalar(u8, cabs, '\n');
+                var line_it = std.mem.tokenizeAny(u8, cabs, "\r\n");
                 var lineno: u32 = cabs_lineno - 1;
                 while (line_it.next()) |line| {
                     lineno += 1;
