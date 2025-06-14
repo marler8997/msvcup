@@ -1757,6 +1757,7 @@ fn updateLockFile(
     }
 
     log.info("{} payloads:", .{payloads.len});
+    if (std.fs.path.dirname(lock_file_path)) |dir| try std.fs.cwd().makePath(dir);
     const lock_file = try std.fs.cwd().createFile(lock_file_path, .{});
     defer lock_file.close();
     var bw = std.io.bufferedWriter(lock_file.writer());
