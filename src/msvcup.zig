@@ -828,38 +828,38 @@ fn generateVcvarsBat(
     switch (finish_kind) {
         .msvc => {
             try writer.print(
-                "set INCLUDE=%~dp0VC\\Tools\\MSVC\\{s}\\include;%INCLUDE%\n",
+                "set \"INCLUDE=%~dp0VC\\Tools\\MSVC\\{s}\\include;%INCLUDE%\"\n",
                 .{install_version},
             );
             try writer.print(
-                "set PATH=%~dp0VC\\Tools\\MSVC\\{s}\\bin\\Host{s}\\{s};%PATH%\n",
+                "set \"PATH=%~dp0VC\\Tools\\MSVC\\{s}\\bin\\Host{s}\\{s};%PATH%\"\n",
                 .{ install_version, @tagName(Arch.native), @tagName(target_arch) },
             );
             try writer.print(
-                "set LIB=%~dp0VC\\Tools\\MSVC\\{s}\\lib\\{s};%LIB%\n",
+                "set \"LIB=%~dp0VC\\Tools\\MSVC\\{s}\\lib\\{s};%LIB%\"\n",
                 .{ install_version, @tagName(target_arch) },
             );
         },
         .sdk => {
             try writer.print(
-                "set INCLUDE=%~dp0Windows Kits\\10\\Include\\{s}\\ucrt;" ++
+                "set \"INCLUDE=%~dp0Windows Kits\\10\\Include\\{s}\\ucrt;" ++
                     "%~dp0Windows Kits\\10\\Include\\{0s}\\shared;" ++
                     "%~dp0Windows Kits\\10\\Include\\{0s}\\um;" ++
                     "%~dp0Windows Kits\\10\\Include\\{0s}\\winrt;" ++
                     "%~dp0Windows Kits\\10\\Include\\{0s}\\cppwinrt;" ++
-                    "%INCLUDE%\n",
+                    "%INCLUDE%\"\n",
                 .{install_version},
             );
             try writer.print(
-                "set PATH=%~dp0Windows Kits\\10\\bin\\{[version]s}\\{[host_arch]s};" ++
+                "set \"PATH=%~dp0Windows Kits\\10\\bin\\{[version]s}\\{[host_arch]s};" ++
                     //"%~dp0Windows Kits\\10\\bin\\{[version]s}\\ucrt;\n",
-                    "%PATH%\n",
+                    "%PATH%\"\n",
                 .{ .version = install_version, .host_arch = @tagName(Arch.native) },
             );
             try writer.print(
-                "set LIB=%~dp0Windows Kits\\10\\Lib\\{[version]s}\\ucrt\\{[target_arch]s};" ++
+                "set \"LIB=%~dp0Windows Kits\\10\\Lib\\{[version]s}\\ucrt\\{[target_arch]s};" ++
                     "%~dp0Windows Kits\\10\\Lib\\{[version]s}\\um\\{[target_arch]s};" ++
-                    "%LIB%\n",
+                    "%LIB%\"\n",
                 .{ .version = install_version, .target_arch = @tagName(target_arch) },
             );
         },
