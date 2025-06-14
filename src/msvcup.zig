@@ -1426,6 +1426,7 @@ fn getInstallPkg(id: []const u8) ?union(enum) {
                 const after_arch = id[after_crt_part.end..];
                 // contains libcmt.lib
                 if (std.mem.eql(u8, after_arch, "Desktop.base")) return .{ .msvc = p.build_version };
+                if (std.mem.eql(u8, after_arch, "Desktop.debug.base")) return .{ .msvc = p.build_version };
                 // contains oldnames.lib
                 if (std.mem.eql(u8, after_arch, "Store.base")) return .{ .msvc = p.build_version };
             }
