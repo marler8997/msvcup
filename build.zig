@@ -2,6 +2,15 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const autoenv_cpu: Arch = b.option(Arch, "autoenv-target", "") orelse switch (target.result.cpu.arch) {
+        .x86_64 => .x64,
+        .x86 => .x64,
+        .aarch64 => .arm64,
+        .arm => .arm,
+        // whatever, we'll just use x64 for now
+        else => .x64,
+    };
+
     const release_version = try makeCalVersion();
     const dev_version = b.fmt("{s}-dev", .{release_version});
     const write_files_version = b.addWriteFiles();
@@ -23,6 +32,9 @@ pub fn build(b: *std.Build) !void {
             .single_threaded = true,
             .imports = &.{
                 .{ .name = "version", .module = dev_version_embed },
+                .{ .name = "autoenv_exe", .module = b.createModule(.{
+                    .root_source_file = addAutoenvExe(b, autoenv_cpu).getEmittedBin(),
+                }) },
             },
         }),
     });
@@ -40,7 +52,28 @@ pub fn build(b: *std.Build) !void {
     const ci_step = b.step("ci", "The build/test step to run on the CI");
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(test_step);
-    try ci(b, release_version_embed, ci_step);
+    try ci(b, release_version_embed, autoenv_cpu, ci_step);
+}
+
+fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "autoenv",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/autoenv.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = switch (cpu) {
+                    .x64 => .x86_64,
+                    .x86 => .x86,
+                    .arm => .arm,
+                    .arm64 => .aarch64,
+                },
+                .os_tag = .windows,
+            }),
+            .optimize = .ReleaseSmall,
+            .single_threaded = true,
+            .pic = true,
+        }),
+    });
 }
 
 fn addTests(b: *std.Build, msvcup: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
@@ -69,6 +102,7 @@ fn makeCalVersion() ![11]u8 {
 fn ci(
     b: *std.Build,
     release_version_embed: *std.Build.Module,
+    autoenv_cpu: Arch,
     ci_step: *std.Build.Step,
 ) !void {
     const zip_dep = b.dependency("zipcmdline", .{});
@@ -116,6 +150,9 @@ fn ci(
                 .single_threaded = true,
                 .imports = &.{
                     .{ .name = "version", .module = release_version_embed },
+                    .{ .name = "autoenv_exe", .module = b.createModule(.{
+                        .root_source_file = addAutoenvExe(b, autoenv_cpu).getEmittedBin(),
+                    }) },
                 },
             }),
         });

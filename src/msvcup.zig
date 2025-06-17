@@ -55,6 +55,7 @@ pub fn main() !u8 {
         break :cmd_args_blk .{ cmd, all_args[0 .. all_args.len - 1] };
     };
     if (std.mem.eql(u8, cmd, "install")) return install(arena, args);
+    if (std.mem.eql(u8, cmd, "autoenv")) return autoenv(arena, args);
     if (std.mem.eql(u8, cmd, "list")) return listCommand(arena, args);
     if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(arena, args);
     log.err("unknown command '{s}'", .{cmd});
@@ -77,6 +78,10 @@ fn usage(arena: std.mem.Allocator) !noreturn {
         \\                            |      <PKG_NAME>-<VERSION>
         \\                            |
         \\                            | installed to {[install_dir]s}.
+        \\  autoenv                   | Creates a directory of executable wrappers that
+        \\      TARGET_CPU            | work without being inside a build environment.
+        \\      NOENV_DIRECTORY       |
+        \\      PKGS...               |
         \\  list-payloads             | List all the payloads.
         \\
         \\InstallOptions:
@@ -492,6 +497,165 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         .success => return 0,
         .version_mismatch => @panic("lock file version mismatch even after update"),
     }
+}
+
+fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+    const Config = struct {
+        target_cpu: Arch,
+        out_dir: []const u8,
+        pkgs: []const MsvcupPackage,
+    };
+    const config: Config = blk_config: {
+        var maybe_target_cpu: ?Arch = null;
+        var maybe_out_dir: ?[]const u8 = null;
+        var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
+
+        var arg_index: usize = 0;
+        while (arg_index < args.len) : (arg_index += 1) {
+            const arg = args[arg_index];
+            if (!std.mem.startsWith(u8, arg, "-")) {
+                switch (MsvcupPackage.fromString(arg)) {
+                    .ok => |pkg| {
+                        insertSorted(
+                            MsvcupPackage,
+                            arena,
+                            &msvcup_pkgs,
+                            pkg,
+                            {},
+                            MsvcupPackage.order,
+                        ) catch |e| oom(e);
+                    },
+                    .unknown_name => errExit("unknown package '{s}'", .{arg}),
+                    .invalid_version => |v| errExit("package '{s}' has invalid version '{s}'", .{ arg, v }),
+                }
+            } else if (std.mem.eql(u8, arg, "--target-cpu")) {
+                arg_index += 1;
+                if (arg_index == args.len) errExit("--target_cpu missing argument", .{});
+                const target_cpu_str = args[arg_index];
+                maybe_target_cpu = Arch.fromString(target_cpu_str) orelse errExit(
+                    "invalid --target-cpu '{s}'",
+                    .{target_cpu_str},
+                );
+            } else if (std.mem.eql(u8, arg, "--out-dir")) {
+                arg_index += 1;
+                if (arg_index == args.len) errExit("--out-dir missing argument", .{});
+                maybe_out_dir = args[arg_index];
+            } else errExit("unknown cmdline argument '{s}'", .{arg});
+        }
+
+        break :blk_config .{
+            .target_cpu = maybe_target_cpu orelse errExit(
+                "missing cmdline arguments: --target-cpu PATH",
+                .{},
+            ),
+            .out_dir = maybe_out_dir orelse errExit(
+                "missing cmdline arguments: --out-dir PATH",
+                .{},
+            ),
+            .pkgs = msvcup_pkgs.toOwnedSlice(arena) catch |e| oom(e),
+        };
+    };
+
+    var out_dir = try std.fs.cwd().makeOpenPath(config.out_dir, .{});
+    defer out_dir.close();
+
+    var maybe_msvc_version: ?StringPool.Val = null;
+    var maybe_sdk_version: ?StringPool.Val = null;
+
+    {
+        var env_file = try out_dir.createFile("env", .{});
+        defer env_file.close();
+        var bw_env_file = std.io.bufferedWriter(env_file.writer());
+        for (config.pkgs) |pkg| {
+            switch (pkg.kind) {
+                .msvc => {
+                    if (maybe_msvc_version) |_| errExit("you can't specify multiple msvc packages", .{});
+                    maybe_msvc_version = pkg.version;
+                },
+                .sdk => {
+                    if (maybe_sdk_version) |_| errExit("you can't specify multiple sdk packages", .{});
+                    maybe_sdk_version = pkg.version;
+                },
+                .diasdk => {},
+            }
+            const vcvars_path = try std.fmt.allocPrint(
+                arena,
+                "C:\\msvcup\\{s}\\vcvars-{s}.bat",
+                .{ pkg, @tagName(config.target_cpu) },
+            );
+            defer arena.free(vcvars_path);
+            std.fs.accessAbsolute(vcvars_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => errExit(
+                    "package '{s}' has no vcvars file '{s}'",
+                    .{ pkg, vcvars_path },
+                ),
+                else => |e| return e,
+            };
+
+            try bw_env_file.writer().print("{s}\n", .{vcvars_path});
+        }
+        try bw_env_file.flush();
+    }
+
+    const Tool = struct {
+        name: []const u8,
+        cmake_names: []const []const u8,
+    };
+    const msvc_tools = [_]Tool{
+        .{ .name = "cl", .cmake_names = &.{ "C_COMPILER", "CXX_COMPILER" } },
+        .{ .name = "ml64", .cmake_names = &.{"ASM_COMPILER"} },
+        .{ .name = "link", .cmake_names = &.{"LINKER"} },
+        .{ .name = "lib", .cmake_names = &.{"AR"} },
+    } ++ switch (builtin.cpu.arch) {
+        .aarch64 => [_]Tool{
+            .{ .name = "armasm64", .cmake_names = &.{} },
+        },
+        else => [_]Tool{},
+    };
+    const sdk_tools = [_]Tool{
+        .{ .name = "rc", .cmake_names = &.{"RC_COMPILER"} },
+        .{ .name = "mt", .cmake_names = &.{"MT"} },
+    };
+
+    if (maybe_msvc_version) |_| {
+        inline for (msvc_tools) |tool| {
+            try writeAutoenvExe(out_dir, tool.name ++ ".exe");
+        }
+    }
+    if (maybe_sdk_version) |_| {
+        inline for (sdk_tools) |tool| {
+            try writeAutoenvExe(out_dir, tool.name ++ ".exe");
+        }
+    }
+
+    {
+        var toolchain_file = try out_dir.createFile("toolchain.cmake", .{});
+        defer toolchain_file.close();
+        var bw = std.io.bufferedWriter(toolchain_file.writer());
+        if (maybe_msvc_version) |_| {
+            inline for (msvc_tools) |tool| {
+                for (tool.cmake_names) |cmake_name| {
+                    try bw.writer().print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
+                }
+            }
+        }
+        if (maybe_sdk_version) |_| {
+            inline for (sdk_tools) |tool| {
+                for (tool.cmake_names) |cmake_name| {
+                    try bw.writer().print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
+                }
+            }
+        }
+        try bw.flush();
+    }
+
+    return 0;
+}
+
+fn writeAutoenvExe(out_dir: std.fs.Dir, exe: []const u8) !void {
+    var exe_file = try out_dir.createFile(exe, .{});
+    defer exe_file.close();
+    try exe_file.writer().writeAll(@embedFile("autoenv_exe"));
 }
 
 const LockFileMismatch = union(enum) {
