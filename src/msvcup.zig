@@ -706,13 +706,17 @@ fn checkLockFilePkgs(
                         break;
                     },
                     .lt => {
-                        if (msvcup_pkg_match_count == 0) @panic("here");
-                        if (msvcup_pkg_index + 1 == msvcup_pkgs.len) @panic("here");
+                        if (msvcup_pkg_match_count == 0) return .{
+                            .missing_pkg = msvcup_pkgs[msvcup_pkg_index],
+                        };
+                        if (msvcup_pkg_index + 1 == msvcup_pkgs.len) return .{
+                            .extra_pkg = payload_msvcup_pkg,
+                        };
                         msvcup_pkg_index += 1;
                         msvcup_pkg_match_count = 0;
                         continue;
                     },
-                    .gt => @panic("todo: gt"),
+                    .gt => return .{ .extra_pkg = payload_msvcup_pkg },
                 },
                 .cab => break,
             }
