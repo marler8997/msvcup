@@ -619,12 +619,12 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
     if (maybe_msvc_version) |_| {
         inline for (msvc_tools) |tool| {
-            try writeAutoenvExe(out_dir, tool.name ++ ".exe");
+            try updateFile(out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
         }
     }
     if (maybe_sdk_version) |_| {
         inline for (sdk_tools) |tool| {
-            try writeAutoenvExe(out_dir, tool.name ++ ".exe");
+            try updateFile(out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
         }
     }
 
@@ -652,10 +652,17 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     return 0;
 }
 
-fn writeAutoenvExe(out_dir: std.fs.Dir, exe: []const u8) !void {
-    var exe_file = try out_dir.createFile(exe, .{});
-    defer exe_file.close();
-    try exe_file.writer().writeAll(@embedFile("autoenv_exe"));
+fn updateFile(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !void {
+    const needs_update = !try fileMatches(dir, sub_path, content);
+    {
+        const status: []const u8 = if (needs_update) "updating..." else "already up-to-date";
+        std.log.info("{s}: {s}", .{ sub_path, status });
+    }
+    if (needs_update) {
+        var file = try dir.createFile(sub_path, .{});
+        defer file.close();
+        try file.writer().writeAll(content);
+    }
 }
 
 const LockFileMismatch = union(enum) {
@@ -970,16 +977,7 @@ fn finishPackage(
             defer scratch.free(env_bat);
             const env_basename = std.fmt.allocPrint(scratch, "vcvars-{s}.bat", .{@tagName(arch)}) catch |e| oom(e);
             defer scratch.free(env_basename);
-            const needs_update = !try fileMatches(install_dir, env_basename, env_bat);
-            {
-                const status: []const u8 = if (needs_update) "updating..." else "already up-to-date";
-                std.log.info("{s}: {s}", .{ env_basename, status });
-            }
-            if (needs_update) {
-                var vcvars_file = try install_dir.createFile(env_basename, .{});
-                defer vcvars_file.close();
-                try vcvars_file.writer().writeAll(env_bat);
-            }
+            try updateFile(install_dir, env_basename, env_bat);
         }
     }
 }
