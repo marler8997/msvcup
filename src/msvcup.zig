@@ -499,6 +499,26 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 }
 
+const Tool = struct {
+    name: []const u8,
+    cmake_names: []const []const u8,
+};
+const msvc_tools = [_]Tool{
+    .{ .name = "cl", .cmake_names = &.{ "C_COMPILER", "CXX_COMPILER" } },
+    .{ .name = "ml64", .cmake_names = &.{"ASM_COMPILER"} },
+    .{ .name = "link", .cmake_names = &.{"LINKER"} },
+    .{ .name = "lib", .cmake_names = &.{"AR"} },
+} ++ switch (builtin.cpu.arch) {
+    .aarch64 => [_]Tool{
+        .{ .name = "armasm64", .cmake_names = &.{} },
+    },
+    else => [_]Tool{},
+};
+const sdk_tools = [_]Tool{
+    .{ .name = "rc", .cmake_names = &.{"RC_COMPILER"} },
+    .{ .name = "mt", .cmake_names = &.{"MT"} },
+};
+
 fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const Config = struct {
         target_cpu: Arch,
@@ -597,26 +617,6 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         try bw_env_file.flush();
     }
 
-    const Tool = struct {
-        name: []const u8,
-        cmake_names: []const []const u8,
-    };
-    const msvc_tools = [_]Tool{
-        .{ .name = "cl", .cmake_names = &.{ "C_COMPILER", "CXX_COMPILER" } },
-        .{ .name = "ml64", .cmake_names = &.{"ASM_COMPILER"} },
-        .{ .name = "link", .cmake_names = &.{"LINKER"} },
-        .{ .name = "lib", .cmake_names = &.{"AR"} },
-    } ++ switch (builtin.cpu.arch) {
-        .aarch64 => [_]Tool{
-            .{ .name = "armasm64", .cmake_names = &.{} },
-        },
-        else => [_]Tool{},
-    };
-    const sdk_tools = [_]Tool{
-        .{ .name = "rc", .cmake_names = &.{"RC_COMPILER"} },
-        .{ .name = "mt", .cmake_names = &.{"MT"} },
-    };
-
     if (maybe_msvc_version) |_| {
         inline for (msvc_tools) |tool| {
             try updateFile(out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
@@ -629,24 +629,9 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 
     {
-        var toolchain_file = try out_dir.createFile("toolchain.cmake", .{});
-        defer toolchain_file.close();
-        var bw = std.io.bufferedWriter(toolchain_file.writer());
-        if (maybe_msvc_version) |_| {
-            inline for (msvc_tools) |tool| {
-                for (tool.cmake_names) |cmake_name| {
-                    try bw.writer().print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
-                }
-            }
-        }
-        if (maybe_sdk_version) |_| {
-            inline for (sdk_tools) |tool| {
-                for (tool.cmake_names) |cmake_name| {
-                    try bw.writer().print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
-                }
-            }
-        }
-        try bw.flush();
+        const cmake = generateToolchainCmake(arena, maybe_msvc_version, maybe_sdk_version) catch |e| oom(e);
+        defer arena.free(cmake);
+        try updateFile(out_dir, "toolchain.cmake", cmake);
     }
 
     return 0;
@@ -987,7 +972,7 @@ fn generateVcvarsBat(
     finish_kind: FinishKind,
     install_version: []const u8,
     target_arch: Arch,
-) error{OutOfMemory}![]const u8 {
+) error{OutOfMemory}![]u8 {
     var bat: std.ArrayListUnmanaged(u8) = .{};
     defer bat.deinit(allocator);
     const writer = bat.writer(allocator);
@@ -1031,6 +1016,31 @@ fn generateVcvarsBat(
         },
     }
     return bat.toOwnedSlice(allocator) catch |e| oom(e);
+}
+
+fn generateToolchainCmake(
+    allocator: std.mem.Allocator,
+    maybe_msvc_version: ?StringPool.Val,
+    maybe_sdk_version: ?StringPool.Val,
+) error{OutOfMemory}![]u8 {
+    var content: std.ArrayListUnmanaged(u8) = .{};
+    defer content.deinit(allocator);
+    const writer = content.writer(allocator);
+    if (maybe_msvc_version) |_| {
+        inline for (msvc_tools) |tool| {
+            for (tool.cmake_names) |cmake_name| {
+                try writer.print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
+            }
+        }
+    }
+    if (maybe_sdk_version) |_| {
+        inline for (sdk_tools) |tool| {
+            for (tool.cmake_names) |cmake_name| {
+                try writer.print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
+            }
+        }
+    }
+    return content.toOwnedSlice(allocator) catch |e| oom(e);
 }
 
 const CacheEntry = struct {
