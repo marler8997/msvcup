@@ -634,6 +634,17 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         try updateFile(out_dir, "toolchain.cmake", cmake);
     }
 
+    const maybe_msvc_install: ?Install = if (maybe_msvc_version) |version| try .init(arena, arena, .msvc, version) else null;
+    defer if (maybe_msvc_install) |i| i.deinit(arena);
+    const maybe_sdk_install: ?Install = if (maybe_sdk_version) |version| try .init(arena, arena, .sdk, version) else null;
+    defer if (maybe_sdk_install) |i| i.deinit(arena);
+
+    {
+        const libc_txt = generateLibcTxt(arena, maybe_msvc_install, maybe_sdk_install, config.target_cpu) catch |e| oom(e);
+        defer arena.free(libc_txt);
+        try updateFile(out_dir, "libc.txt", libc_txt);
+    }
+
     return 0;
 }
 
@@ -887,38 +898,8 @@ fn finishPackage(
     const install_path = msvcup_dir.path(scratch, &.{msvcup_pkg.poolString().slice}) catch |e| oom(e);
     defer scratch.free(install_path);
 
-    // The actual directory version can and does differ from both the
-    // package id build version and the package version itself, so, we just
-    // have to go in and look at the directory that was actually created to
-    // get the "install version".
-    const install_version = blk: {
-        const query_path = switch (finish_kind) {
-            .msvc => std.fs.path.join(scratch, &.{ install_path, "VC", "Tools", "MSVC" }) catch |e| oom(e),
-            .sdk => std.fs.path.join(scratch, &.{ install_path, "Windows Kits", "10", "Include" }) catch |e| oom(e),
-        };
-        defer scratch.free(query_path);
-        var query_dir = try std.fs.cwd().openDir(query_path, .{ .iterate = true });
-        defer query_dir.close();
-        var version_entry: ?[]const u8 = null;
-        var it = query_dir.iterate();
-        while (try it.next()) |entry| {
-            if (!isValidVersion(entry.name)) {
-                std.log.info("entry '{s}' in directory '{s}' is not a valid version", .{ entry.name, query_path });
-            } else if (version_entry) |existing| std.debug.panic(
-                "directory '{s}' has multiple version entries '{s}' and '{s}'",
-                .{ query_path, existing, entry.name },
-            ) else {
-                version_entry = scratch.dupe(u8, entry.name) catch |e| oom(e);
-            }
-        }
-        const version = version_entry orelse std.debug.panic(
-            "directory '{s}' did not contain any version subdirectories",
-            .{query_path},
-        );
-        std.log.info("{s} install version '{s}'", .{ msvcup_pkg, version });
-        break :blk version;
-    };
-    defer scratch.free(install_version);
+    const install_version = try queryInstallVersion(scratch, scratch, finish_kind, install_path);
+    std.log.info("{s} install version '{s}'", .{ msvcup_pkg, install_version });
 
     // first, remove all scripts that are for an SDK that we are no longer including
     clean_env_blk: {
@@ -965,6 +946,44 @@ fn finishPackage(
             try updateFile(install_dir, env_basename, env_bat);
         }
     }
+}
+
+// The actual directory version can and does differ from both the
+// package id build version and the package version itself, so, we just
+// have to go in and look at the directory that was actually created to
+// get the "install version".
+fn queryInstallVersion(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    finish_kind: FinishKind,
+    install_path: []const u8,
+) ![]u8 {
+    const query_path = switch (finish_kind) {
+        .msvc => std.fs.path.join(scratch, &.{ install_path, "VC", "Tools", "MSVC" }) catch |e| oom(e),
+        .sdk => std.fs.path.join(scratch, &.{ install_path, "Windows Kits", "10", "Include" }) catch |e| oom(e),
+    };
+    defer scratch.free(query_path);
+    var query_dir = std.fs.cwd().openDir(query_path, .{ .iterate = true }) catch |e| std.debug.panic(
+        "open directory '{s}' failed with {s}",
+        .{ query_path, @errorName(e) },
+    );
+    defer query_dir.close();
+    var version_entry: ?[]u8 = null;
+    var it = query_dir.iterate();
+    while (try it.next()) |entry| {
+        if (!isValidVersion(entry.name)) {
+            std.log.info("entry '{s}' in directory '{s}' is not a valid version", .{ entry.name, query_path });
+        } else if (version_entry) |existing| std.debug.panic(
+            "directory '{s}' has multiple version entries '{s}' and '{s}'",
+            .{ query_path, existing, entry.name },
+        ) else {
+            version_entry = allocator.dupe(u8, entry.name) catch |e| oom(e);
+        }
+    }
+    return version_entry orelse std.debug.panic(
+        "directory '{s}' did not contain any version subdirectories",
+        .{query_path},
+    );
 }
 
 fn generateVcvarsBat(
@@ -1040,6 +1059,65 @@ fn generateToolchainCmake(
             }
         }
     }
+    return content.toOwnedSlice(allocator) catch |e| oom(e);
+}
+
+const Install = struct {
+    path: []const u8,
+    install_version: []const u8,
+    pub fn init(
+        allocator: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        finish_kind: FinishKind,
+        version: StringPool.Val,
+    ) !Install {
+        const path = try std.fmt.allocPrint(allocator, "C:\\msvcup\\{s}-{s}", .{ @tagName(finish_kind), version.slice });
+        errdefer allocator.free(path);
+        const install_version = try queryInstallVersion(allocator, scratch, finish_kind, path);
+        return .{ .path = path, .install_version = install_version };
+    }
+    pub fn deinit(self: Install, allocator: std.mem.Allocator) void {
+        allocator.free(self.install_version);
+        allocator.free(self.path);
+    }
+};
+
+fn generateLibcTxt(
+    allocator: std.mem.Allocator,
+    maybe_msvc: ?Install,
+    maybe_sdk: ?Install,
+    target_cpu: Arch,
+) error{OutOfMemory}![]u8 {
+    var content: std.ArrayListUnmanaged(u8) = .{};
+    defer content.deinit(allocator);
+    const writer = content.writer(allocator);
+    if (maybe_msvc) |msvc| {
+        try writer.print(
+            \\sys_include_dir={[root]s}\\VC\Tools\MSVC\{[version]s}\include
+            \\crt_dir={[root]s}\\VC\Tools\MSVC\{[version]s}
+            \\msvc_lib_dir={[root]s}\\VC\Tools\MSVC\{[version]s}\lib\{[target]s}
+            \\
+        , .{
+            .root = msvc.path,
+            .version = msvc.install_version,
+            .target = @tagName(target_cpu),
+        });
+    }
+    if (maybe_sdk) |sdk| {
+        try writer.print(
+            \\include_dir={[root]s}\\Windows Kits\10\Include\{[version]s}\ucrt
+            \\kernel32_lib_dir={[root]s}\\Windows Kits\10\lib\{[version]s}\um\{[target]s}
+            \\
+        , .{
+            .root = sdk.path,
+            .version = sdk.install_version,
+            .target = @tagName(target_cpu),
+        });
+    }
+    try writer.writeAll(
+        \\gcc_dir=
+        \\
+    );
     return content.toOwnedSlice(allocator) catch |e| oom(e);
 }
 
