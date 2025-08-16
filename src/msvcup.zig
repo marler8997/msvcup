@@ -1093,9 +1093,8 @@ fn generateLibcTxt(
     const writer = content.writer(allocator);
     if (maybe_msvc) |msvc| {
         try writer.print(
-            \\sys_include_dir={[root]s}\\VC\Tools\MSVC\{[version]s}\include
-            \\crt_dir={[root]s}\\VC\Tools\MSVC\{[version]s}
-            \\msvc_lib_dir={[root]s}\\VC\Tools\MSVC\{[version]s}\lib\{[target]s}
+            \\sys_include_dir={[root]s}\VC\Tools\MSVC\{[version]s}\include
+            \\msvc_lib_dir={[root]s}\VC\Tools\MSVC\{[version]s}\lib\{[target]s}
             \\
         , .{
             .root = msvc.path,
@@ -1105,8 +1104,9 @@ fn generateLibcTxt(
     }
     if (maybe_sdk) |sdk| {
         try writer.print(
-            \\include_dir={[root]s}\\Windows Kits\10\Include\{[version]s}\ucrt
-            \\kernel32_lib_dir={[root]s}\\Windows Kits\10\lib\{[version]s}\um\{[target]s}
+            \\include_dir={[root]s}\Windows Kits\10\Include\{[version]s}\ucrt
+            \\kernel32_lib_dir={[root]s}\Windows Kits\10\lib\{[version]s}\um\{[target]s}
+            \\crt_dir={[root]s}\Windows Kits\10\Lib\{[version]s}\ucrt\{[target]s}
             \\
         , .{
             .root = sdk.path,
