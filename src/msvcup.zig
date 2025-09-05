@@ -79,8 +79,8 @@ fn usage(arena: std.mem.Allocator) !noreturn {
         \\                            |
         \\                            | installed to {[install_dir]s}.
         \\  autoenv                   | Creates a directory of executable wrappers that
-        \\      TARGET_CPU            | work without being inside a build environment.
-        \\      NOENV_DIRECTORY       |
+        \\      --target-cpu  CPU     | work without being inside a build environment.
+        \\      --out-dir PATH        |
         \\      PKGS...               |
         \\  list-payloads             | List all the payloads.
         \\
@@ -565,7 +565,7 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
         break :blk_config .{
             .target_cpu = maybe_target_cpu orelse errExit(
-                "missing cmdline arguments: --target-cpu PATH",
+                "missing cmdline arguments: --target-cpu CPU",
                 .{},
             ),
             .out_dir = maybe_out_dir orelse errExit(
@@ -629,7 +629,7 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 
     {
-        const cmake = generateToolchainCmake(arena, maybe_msvc_version, maybe_sdk_version) catch |e| oom(e);
+        const cmake = generateToolchainCmake(arena, config.target_cpu, maybe_msvc_version, maybe_sdk_version) catch |e| oom(e);
         defer arena.free(cmake);
         try updateFile(out_dir, "toolchain.cmake", cmake);
     }
@@ -1039,12 +1039,24 @@ fn generateVcvarsBat(
 
 fn generateToolchainCmake(
     allocator: std.mem.Allocator,
+    target_cpu: Arch,
     maybe_msvc_version: ?StringPool.Val,
     maybe_sdk_version: ?StringPool.Val,
 ) error{OutOfMemory}![]u8 {
     var content: std.ArrayListUnmanaged(u8) = .{};
     defer content.deinit(allocator);
     const writer = content.writer(allocator);
+
+    try writer.writeAll("set(CMAKE_SYSTEM_NAME Windows)\n");
+    if (switch (target_cpu) {
+        .x64 => "AMD64",
+        .x86 => "X86",
+        .arm => null,
+        .arm64 => "ARM64",
+    }) |processor| {
+        try writer.print("set(CMAKE_SYSTEM_PROCESSOR {s})\n", .{processor});
+    }
+
     if (maybe_msvc_version) |_| {
         inline for (msvc_tools) |tool| {
             for (tool.cmake_names) |cmake_name| {
