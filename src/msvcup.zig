@@ -176,6 +176,10 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 const msvcup_pkg: MsvcupPackage = .initStr(.msvc, p.build_version);
                 insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
             },
+            .msbuild => |version| {
+                const msvcup_pkg: MsvcupPackage = .initStr(.msbuild, version);
+                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
+            },
             .diasdk => {
                 const msvcup_pkg: MsvcupPackage = .initStr(.diasdk, pkg.version);
                 insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
@@ -264,6 +268,7 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 const MsvcupPackageKind = enum {
     msvc,
     sdk,
+    msbuild,
     diasdk,
     pub fn order(_: void, lhs: MsvcupPackageKind, rhs: MsvcupPackageKind) std.math.Order {
         return std.math.order(@intFromEnum(lhs), @intFromEnum(rhs));
@@ -283,6 +288,7 @@ const MsvcupPackage = struct {
         const kind: MsvcupPackageKind, const version: []const u8 = blk: {
             if (startsWith(u8, pkg, "msvc-")) |version| break :blk .{ .msvc, version };
             if (startsWith(u8, pkg, "sdk-")) |version| break :blk .{ .sdk, version };
+            if (startsWith(u8, pkg, "msbuild-")) |version| break :blk .{ .msbuild, version };
             if (startsWith(u8, pkg, "diasdk-")) |version| break :blk .{ .diasdk, version };
             return .unknown_name;
         };
@@ -596,6 +602,7 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                     if (maybe_sdk_version) |_| errExit("you can't specify multiple sdk packages", .{});
                     maybe_sdk_version = pkg.version;
                 },
+                .msbuild => {},
                 .diasdk => {},
             }
             const vcvars_path = try std.fmt.allocPrint(
@@ -892,6 +899,7 @@ fn finishPackage(
     const finish_kind: FinishKind = switch (msvcup_pkg.kind) {
         .msvc => .msvc,
         .sdk => .sdk,
+        .msbuild => return,
         .diasdk => return,
     };
 
@@ -1661,6 +1669,7 @@ fn endInstall(
 //       it would be great to be ale to see which patterns pulled in packages/payloads
 fn getInstallPkg(id: []const u8) ?union(enum) {
     msvc: []const u8,
+    msbuild: []const u8,
     diasdk,
 } {
     return switch (identifyPackage(id)) {
@@ -1706,6 +1715,7 @@ fn getInstallPkg(id: []const u8) ?union(enum) {
             if (std.mem.eql(u8, p.name, "Res.base")) return .{ .msvc = p.build_version };
             return null;
         },
+        .msbuild => |version| return .{ .msbuild = version },
         .diasdk => return .diasdk,
     };
 }
@@ -1772,6 +1782,19 @@ fn updateLockFile(
                         ) catch |e| oom(e);
                         break;
                     }
+                },
+                .msbuild => |pkg_msbuild_version| for (msvcup_pkgs) |msvcup_pkg| {
+                    if (msvcup_pkg.kind != .msbuild) continue;
+                    if (!std.mem.eql(u8, msvcup_pkg.version.slice, pkg_msbuild_version)) continue;
+                    insertSorted(
+                        InstallPackage,
+                        scratch,
+                        &install_pkgs,
+                        .init(msvcup_pkg, pkg_index),
+                        pkgs.slice,
+                        InstallPackage.order,
+                    ) catch |e| oom(e);
+                    break;
                 },
                 .diasdk => for (msvcup_pkgs) |msvcup_pkg| {
                     if (msvcup_pkg.kind != .diasdk) continue;
@@ -2136,6 +2159,7 @@ const PackageId = union(enum) {
         target_arch: Arch,
         name: []const u8,
     },
+    msbuild: []const u8, // version
     diasdk,
 };
 
@@ -2187,7 +2211,31 @@ fn scanIdVersion(id: []const u8, start: usize) Scan {
     }
 }
 
+fn isDigits(s: []const u8) bool {
+    for (s) |c| switch (c) {
+        '0'...'9' => {},
+        else => return false,
+    };
+    return true;
+}
+
 fn identifyPackage(id: []const u8) PackageId {
+    // NOTE: we're assuming this package is currently at version 170
+    if (std.mem.eql(u8, id, "Microsoft.Build")) return .{ .msbuild = "170" };
+    // NOTE: we're assuming this package is currently at version 170
+    if (std.mem.eql(u8, id, "Microsoft.Build.Arm64")) return .{ .msbuild = "170" };
+    const msbuild_prefix = "Microsoft.VisualStudio.VC.MSBuild.";
+    if (std.mem.startsWith(u8, id, msbuild_prefix)) {
+        const version = scanIdPart(id, msbuild_prefix.len);
+        // if (std.mem.startsWith(u8, version.slice, "v") and isDigits(version.slice[1..])) {
+        //     return .{ .msbuild = version.slice[1..] };
+        // }
+        // right now only v170 really works
+        if (std.mem.eql(u8, version.slice, "v170")) {
+            return .{ .msbuild = "170" };
+        }
+    }
+
     if (std.mem.eql(u8, id, "Microsoft.VisualCpp.DIA.SDK")) {
         return .diasdk;
     }
@@ -3049,7 +3097,11 @@ const PayloadIndex = enum(usize) {
         return @intFromEnum(self);
     }
     pub fn order(payloads: []const Payload, lhs: PayloadIndex, rhs: PayloadIndex) std.math.Order {
-        return orderAlphabetical({}, payloads[lhs.int()].nameDecoded(), payloads[rhs.int()].nameDecoded());
+        switch (orderAlphabetical({}, payloads[lhs.int()].nameDecoded(), payloads[rhs.int()].nameDecoded())) {
+            .lt, .gt => |o| return o,
+            .eq => {},
+        }
+        return orderAlphabetical({}, &payloads[lhs.int()].sha256, &payloads[rhs.int()].sha256);
     }
     pub fn lessThan(payloads: []const Payload, lhs: PayloadIndex, rhs: PayloadIndex) bool {
         return order(payloads, lhs, rhs) == .lt;
