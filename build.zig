@@ -49,6 +49,15 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "");
     addTests(b, msvcup, test_step);
 
+    {
+        const test_example = b.addSystemCommand(&.{ "cmd.exe", "/c", "build.bat" });
+        test_example.cwd = b.path("example");
+        test_example.has_side_effects = true;
+        const test_example_step = b.step("test-example", "");
+        test_example_step.dependOn(&test_example.step);
+        if (builtin.os.tag == .windows) test_step.dependOn(test_example_step);
+    }
+
     const ci_step = b.step("ci", "The build/test step to run on the CI");
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(test_step);
