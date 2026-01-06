@@ -53,3 +53,7 @@ This generates a directory with wrapper executables (`cl.exe`, `link.exe`, etc) 
 - **Lock file**: All components and URLs are saved before install, enabling reproducible builds via source control.
 - **Install metadata**: Every installed file is tracked in `<package>/install`. This allows msvcup to detect file conflicts and allows the user to query which component(s) installed which files.
 - **Download cache**: Packages are cached in `C:\msvcup\cache`. Failed installs can be retried without network access.
+
+## Acknowledgements
+
+Special thanks to Mārtiņš Možeiko (@mmozeiko) for his original [Python MSVC installer](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977), which served as a vital reference for this project.
