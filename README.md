@@ -14,7 +14,10 @@ The Visual Studio Installer manages thousands of components, modifies the regist
 
 ## Quick Start
 
-Check out [example/build.bat](example/build.bat) for a batch script that downloads msvcup, installs an MSVC/SDK, and compiles "hello.c".
+- for CMake projects, see [example/cmake/build.bat](example/cmake/build.bat)
+- for "handmade" style projects, see [example/handmade/build.bat](example/handmade/build.bat)
+
+These examples contain batch scripts that download msvcup, install an MSVC/SDK, and then compile "hello.c".
 
 After downloading msvcup, the example will install the toolchain and an SDK with a command like this:
 
