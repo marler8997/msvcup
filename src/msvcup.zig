@@ -54,7 +54,9 @@ pub fn main() !u8 {
         }
         break :cmd_args_blk .{ cmd, all_args[0 .. all_args.len - 1] };
     };
-    if (std.mem.eql(u8, cmd, "install")) return install(arena, args);
+    if (std.mem.eql(u8, cmd, "update")) return updateCommand(arena, args);
+    // if (std.mem.eql(u8, cmd, "install")) return install(arena, args);
+    // if (std.mem.eql(u8, cmd, "update-and-install")) return updateAndInstall(arena, args);
     if (std.mem.eql(u8, cmd, "autoenv")) return autoenv(arena, args);
     if (std.mem.eql(u8, cmd, "list")) return listCommand(arena, args);
     if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(arena, args);
@@ -73,20 +75,21 @@ fn usage(arena: std.mem.Allocator) !noreturn {
         \\--------------------------------------------------------------------------------
         \\
         \\  list                      | List all PKGS.
-        \\  install PKGS...           | Install the given PKGS, which are of the form:
+        \\  update LOCK_FILE PKGS...  | Update the lock file with the given PKGS. PKGS are
+        \\                            | of the form:
         \\                            |
         \\                            |      <PKG_NAME>-<VERSION>
         \\                            |
         \\                            | installed to {[install_dir]s}.
+        \\  install LOCK_FILE         | Install packages from the given lock-file
         \\  autoenv                   | Creates a directory of executable wrappers that
         \\      --target-cpu  CPU     | work without being inside a build environment.
         \\      --out-dir PATH        |
         \\      PKGS...               |
         \\  list-payloads             | List all the payloads.
         \\
-        \\InstallOptions:
+        \\UpdateOptions:
         \\--------------------------------------------------------------------------------
-        \\  --lock-file PATH          | A manifest to hold all payloads/urls installed.
         \\  --manifest-update-<OPT>   | Controls whether to update to the latest manifest
         \\                            | if it's already been downloaded. This option will
         \\                            | control whether it's updated to the latest, OPT
@@ -320,16 +323,12 @@ const MsvcupPackage = struct {
     }
 };
 
-fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn updateCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const Config = struct {
         msvcup_pkgs: []const MsvcupPackage,
-        // install_dir: []const u8,
         lock_file: []const u8,
         manifest_update: ManifestUpdate,
         cache_dir: ?[]const u8,
-        // host_arch: Arch,
-        // target_arches: Arches,
-        // cache_dir: []const u8,
     };
     const config: Config = blk_config: {
         var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
@@ -341,7 +340,9 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         while (arg_index < args.len) : (arg_index += 1) {
             const arg = args[arg_index];
             if (!std.mem.startsWith(u8, arg, "-")) {
-                switch (MsvcupPackage.fromString(arg)) {
+                if (maybe_lock_file == null) {
+                    maybe_lock_file = arg;
+                } else switch (MsvcupPackage.fromString(arg)) {
                     .ok => |pkg| {
                         insertSorted(
                             MsvcupPackage,
@@ -355,10 +356,6 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                     .unknown_name => errExit("unknown package '{s}'", .{arg}),
                     .invalid_version => |v| errExit("package '{s}' has invalid version '{s}'", .{ arg, v }),
                 }
-            } else if (std.mem.eql(u8, arg, "--lock-file")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--lock-file missing argument", .{});
-                maybe_lock_file = args[arg_index];
             } else if (std.mem.eql(u8, arg, "--manifest-update-off")) {
                 maybe_manifest_update = .off;
             } else if (std.mem.eql(u8, arg, "--manifest-update-daily")) {
@@ -380,7 +377,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         break :blk_config .{
             .msvcup_pkgs = msvcup_pkgs.toOwnedSlice(arena) catch |e| oom(e),
             .lock_file = maybe_lock_file orelse errExit(
-                "missing cmdline arguments: --lock-file PATH",
+                "missing cmdline LOCK_FILE argument",
                 .{},
             ),
             .manifest_update = maybe_manifest_update orelse errExit(
@@ -388,15 +385,6 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 .{},
             ),
             .cache_dir = cache_dir,
-            // .host_arch = maybe_host_arch orelse errExit(
-            //     "missing cmdline arguments: --host-arch ARCH",
-            //     .{},
-            // ),
-            // .target_arches = target_arches,
-            // .cache_dir = maybe_cache_dir orelse std.fs.path.join(arena, &.{
-            //     try std.fs.getAppDataDir(arena, "msvc"),
-            //     "cache",
-            // }) catch |e| oom(e),
         };
     };
 
@@ -413,52 +401,52 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         &.{"cache"},
     ) catch |e| oom(e);
 
-    const root_node = std.Progress.start(.{ .root_name = "msvcup install" });
+    const root_node = std.Progress.start(.{ .root_name = "msvcup update" });
     defer root_node.end();
 
     var scratch_instance: ScratchAllocator = .init();
     const scratch = scratch_instance.allocator();
 
-    const try_no_update = switch (config.manifest_update) {
-        .off => true,
-        .daily => @panic("todo"),
-        .always => false,
-    };
-    if (try_no_update) {
-        const maybe_lock_file_content: ?[]const u8 = blk: {
-            if (std.fs.cwd().openFile(config.lock_file, .{})) |lock_file| {
-                defer lock_file.close();
-                log.info("lock file found: '{s}'", .{config.lock_file});
-                break :blk try lock_file.readToEndAlloc(arena, std.math.maxInt(usize));
-            } else |err| switch (err) {
-                error.FileNotFound => {
-                    log.info("lock file NOT found: '{s}'", .{config.lock_file});
-                    break :blk null;
-                },
-                else => |e| return e,
-            }
-        };
-        if (maybe_lock_file_content) |content| {
-            if (checkLockFilePkgs(config.lock_file, content, config.msvcup_pkgs)) |mismatch| {
-                std.log.info("{}", .{mismatch});
-            } else {
-                const result = try installFromLockFile(
-                    scratch,
-                    root_node,
-                    config.msvcup_pkgs,
-                    msvcup_dir,
-                    cache_dir,
-                    config.lock_file,
-                    content,
-                );
-                scratch_instance.reset();
-                switch (result) {
-                    .success => return 0,
-                    .version_mismatch => {},
-                }
-            }
-        }
-    }
+    // const try_no_update = switch (config.manifest_update) {
+    //     .off => true,
+    //     .daily => @panic("todo"),
+    //     .always => false,
+    // };
+    // if (try_no_update) {
+    //     const maybe_lock_file_content: ?[]const u8 = blk: {
+    //         if (std.fs.cwd().openFile(config.lock_file, .{})) |lock_file| {
+    //             defer lock_file.close();
+    //             log.info("lock file found: '{s}'", .{config.lock_file});
+    //             break :blk try lock_file.readToEndAlloc(arena, std.math.maxInt(usize));
+    //         } else |err| switch (err) {
+    //             error.FileNotFound => {
+    //                 log.info("lock file NOT found: '{s}'", .{config.lock_file});
+    //                 break :blk null;
+    //             },
+    //             else => |e| return e,
+    //         }
+    //     };
+    //     if (maybe_lock_file_content) |content| {
+    //         if (checkLockFilePkgs(config.lock_file, content, config.msvcup_pkgs)) |mismatch| {
+    //             std.log.info("{}", .{mismatch});
+    //         } else {
+    //             const result = try installFromLockFile(
+    //                 scratch,
+    //                 root_node,
+    //                 config.msvcup_pkgs,
+    //                 msvcup_dir,
+    //                 cache_dir,
+    //                 config.lock_file,
+    //                 content,
+    //             );
+    //             scratch_instance.reset();
+    //             switch (result) {
+    //                 .success => return 0,
+    //                 .version_mismatch => {},
+    //             }
+    //         }
+    //     }
+    // }
 
     const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
     defer vsman.freeConst(arena);
@@ -491,19 +479,210 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         "lock file '{s}' still doesn't match what we're installing even after it's been udpated: {s}",
         .{ config.lock_file, mismatch },
     );
-    switch (try installFromLockFile(
-        scratch,
-        root_node,
-        config.msvcup_pkgs,
-        msvcup_dir,
-        cache_dir,
-        config.lock_file,
-        lock_file_content,
-    )) {
-        .success => return 0,
-        .version_mismatch => @panic("lock file version mismatch even after update"),
-    }
+    return 0;
 }
+
+fn install() void {
+    // switch (try installFromLockFile(
+    //     scratch,
+    //     root_node,
+    //     config.msvcup_pkgs,
+    //     msvcup_dir,
+    //     cache_dir,
+    //     config.lock_file,
+    //     lock_file_content,
+    // )) {
+    //     .success => return 0,
+    //     .version_mismatch => @panic("lock file version mismatch even after update"),
+    // }
+}
+
+// fn updateAndInstall(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+//     const Config = struct {
+//         msvcup_pkgs: []const MsvcupPackage,
+//         // install_dir: []const u8,
+//         lock_file: []const u8,
+//         manifest_update: ManifestUpdate,
+//         cache_dir: ?[]const u8,
+//         // host_arch: Arch,
+//         // target_arches: Arches,
+//         // cache_dir: []const u8,
+//     };
+//     const config: Config = blk_config: {
+//         var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
+//         var maybe_lock_file: ?[]const u8 = null;
+//         var maybe_manifest_update: ?ManifestUpdate = null;
+//         var cache_dir: ?[]const u8 = null;
+
+//         var arg_index: usize = 0;
+//         while (arg_index < args.len) : (arg_index += 1) {
+//             const arg = args[arg_index];
+//             if (!std.mem.startsWith(u8, arg, "-")) {
+//                 switch (MsvcupPackage.fromString(arg)) {
+//                     .ok => |pkg| {
+//                         insertSorted(
+//                             MsvcupPackage,
+//                             arena,
+//                             &msvcup_pkgs,
+//                             pkg,
+//                             {},
+//                             MsvcupPackage.order,
+//                         ) catch |e| oom(e);
+//                     },
+//                     .unknown_name => errExit("unknown package '{s}'", .{arg}),
+//                     .invalid_version => |v| errExit("package '{s}' has invalid version '{s}'", .{ arg, v }),
+//                 }
+//             } else if (std.mem.eql(u8, arg, "--lock-file")) {
+//                 arg_index += 1;
+//                 if (arg_index == args.len) errExit("--lock-file missing argument", .{});
+//                 maybe_lock_file = args[arg_index];
+//             } else if (std.mem.eql(u8, arg, "--manifest-update-off")) {
+//                 maybe_manifest_update = .off;
+//             } else if (std.mem.eql(u8, arg, "--manifest-update-daily")) {
+//                 maybe_manifest_update = .daily;
+//             } else if (std.mem.eql(u8, arg, "--manifest-update-always")) {
+//                 maybe_manifest_update = .always;
+//             } else if (std.mem.eql(u8, arg, "--cache-dir")) {
+//                 arg_index += 1;
+//                 if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
+//                 cache_dir = args[arg_index];
+//             } else errExit("unknown cmdline argument '{s}'", .{arg});
+//         }
+
+//         // sanity check everything is sorted
+//         if (msvcup_pkgs.items.len > 0) for (1..msvcup_pkgs.items.len) |i| {
+//             std.debug.assert(.lt == MsvcupPackage.order({}, msvcup_pkgs.items[i - 1], msvcup_pkgs.items[i]));
+//         };
+
+//         break :blk_config .{
+//             .msvcup_pkgs = msvcup_pkgs.toOwnedSlice(arena) catch |e| oom(e),
+//             .lock_file = maybe_lock_file orelse errExit(
+//                 "missing cmdline arguments: --lock-file PATH",
+//                 .{},
+//             ),
+//             .manifest_update = maybe_manifest_update orelse errExit(
+//                 "missing one of --manifest-update-off, --manifest-update-daily or --manifest-update-always",
+//                 .{},
+//             ),
+//             .cache_dir = cache_dir,
+//             // .host_arch = maybe_host_arch orelse errExit(
+//             //     "missing cmdline arguments: --host-arch ARCH",
+//             //     .{},
+//             // ),
+//             // .target_arches = target_arches,
+//             // .cache_dir = maybe_cache_dir orelse std.fs.path.join(arena, &.{
+//             //     try std.fs.getAppDataDir(arena, "msvc"),
+//             //     "cache",
+//             // }) catch |e| oom(e),
+//         };
+//     };
+
+//     const msvcup_dir: MsvcupDir = try .alloc(arena);
+//     log.debug("msvcup dir '{s}'", .{msvcup_dir.root_path});
+
+//     if (config.msvcup_pkgs.len == 0) errExit(
+//         "no packages were given to install, use 'list' to list the available packages",
+//         .{},
+//     );
+
+//     const cache_dir: []const u8 = config.cache_dir orelse msvcup_dir.path(
+//         arena,
+//         &.{"cache"},
+//     ) catch |e| oom(e);
+
+//     const root_node = std.Progress.start(.{ .root_name = "msvcup install" });
+//     defer root_node.end();
+
+//     var scratch_instance: ScratchAllocator = .init();
+//     const scratch = scratch_instance.allocator();
+
+//     const try_no_update = switch (config.manifest_update) {
+//         .off => true,
+//         .daily => @panic("todo"),
+//         .always => false,
+//     };
+//     if (try_no_update) {
+//         const maybe_lock_file_content: ?[]const u8 = blk: {
+//             if (std.fs.cwd().openFile(config.lock_file, .{})) |lock_file| {
+//                 defer lock_file.close();
+//                 log.info("lock file found: '{s}'", .{config.lock_file});
+//                 break :blk try lock_file.readToEndAlloc(arena, std.math.maxInt(usize));
+//             } else |err| switch (err) {
+//                 error.FileNotFound => {
+//                     log.info("lock file NOT found: '{s}'", .{config.lock_file});
+//                     break :blk null;
+//                 },
+//                 else => |e| return e,
+//             }
+//         };
+//         if (maybe_lock_file_content) |content| {
+//             if (checkLockFilePkgs(config.lock_file, content, config.msvcup_pkgs)) |mismatch| {
+//                 std.log.info("{}", .{mismatch});
+//             } else {
+//                 const result = try installFromLockFile(
+//                     scratch,
+//                     root_node,
+//                     config.msvcup_pkgs,
+//                     msvcup_dir,
+//                     cache_dir,
+//                     config.lock_file,
+//                     content,
+//                 );
+//                 scratch_instance.reset();
+//                 switch (result) {
+//                     .success => return 0,
+//                     .version_mismatch => {},
+//                 }
+//             }
+//         }
+//     }
+
+//     const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
+//     defer vsman.freeConst(arena);
+//     scratch_instance.reset();
+
+//     const pkgs = try getPackages(arena, scratch, vsman);
+//     // defer arena.free(pkgs);
+//     scratch_instance.reset();
+
+//     try updateLockFile(
+//         scratch,
+//         root_node,
+//         config.msvcup_pkgs,
+//         config.lock_file,
+//         pkgs,
+//         cache_dir,
+//     );
+//     scratch_instance.reset();
+
+//     const lock_file_content = blk: {
+//         const lock_file = std.fs.cwd().openFile(config.lock_file, .{}) catch |e| std.debug.panic(
+//             "failed to open lock file '{s}' with {s} just after updating it",
+//             .{ config.lock_file, @errorName(e) },
+//         );
+//         defer lock_file.close();
+//         break :blk try lock_file.readToEndAlloc(arena, std.math.maxInt(usize));
+//     };
+
+//     if (checkLockFilePkgs(config.lock_file, lock_file_content, config.msvcup_pkgs)) |mismatch| errExit(
+//         "lock file '{s}' still doesn't match what we're installing even after it's been udpated: {s}",
+//         .{ config.lock_file, mismatch },
+//     );
+//     switch (try installFromLockFile(
+//         scratch,
+//         root_node,
+//         config.msvcup_pkgs,
+//         msvcup_dir,
+//         cache_dir,
+//         config.lock_file,
+//         lock_file_content,
+//     )) {
+//         .success => return 0,
+//         .version_mismatch => @panic("lock file version mismatch even after update"),
+//     }
+// }
+
+// fn install2() void {}
 
 const Tool = struct {
     name: []const u8,
@@ -2045,7 +2224,7 @@ fn updateLockFile(
         }
     }
 
-    log.info("{} payloads:", .{payloads.len});
+    // log.info("{} payloads", .{payloads.len});
     if (std.fs.path.dirname(lock_file_path)) |dir| try std.fs.cwd().makePath(dir);
     const lock_file = try std.fs.cwd().createFile(lock_file_path, .{});
     defer lock_file.close();

@@ -1,4 +1,4 @@
-@setlocal
+@setlocal enabledelayedexpansion
 
 @if %PROCESSOR_ARCHITECTURE%==AMD64 (
     set MSVCUP_ARCH=x86_64
@@ -36,7 +36,12 @@
 set MSVC=msvc-14.44.17.14
 set SDK=sdk-10.0.22621.7
 
-%~dp0msvcup.exe install --lock-file %~dp0msvcup.lock --manifest-update-off %MSVC% %SDK%
+@if not exist %~dp0msvcup.lock (
+    %~dp0msvcup.exe update %~dp0msvcup.lock --manifest-update-off %MSVC% %SDK%
+)
+@if not exist %~dp0msvcup.lock exit /b 1
+
+%~dp0msvcup.exe install %~dp0msvcup.lock
 @if %errorlevel% neq 0 (exit /b %errorlevel%)
 
 @REM @if not exist %~dp0autoenv mkdir %~dp0autoenv
