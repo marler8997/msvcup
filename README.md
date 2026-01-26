@@ -8,7 +8,7 @@ The Visual Studio Installer manages thousands of components, modifies the regist
 
 - **Fast**: Runs in milliseconds when already installed. Put it at the start of every build script.
 - **Reproducible**: Lock file ensures everyone gets the same toolchain.
-- **Hermetic**: Every package is installed to its own versioned directory. No registry modifications. No conflicts.
+- **Isolated**: Every package is installed to its own versioned directory. No registry modifications. No conflicts.
 - **Cross-compilation**: Target x64, arm64, or x86 out of the box.
 - **Minimal**: Download only what's needed to get a working native toolchain/SDK.
 
