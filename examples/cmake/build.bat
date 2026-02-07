@@ -27,7 +27,7 @@
 
 @if not exist %~dp0msvcup.exe (
     echo msvcup.exe: installing...
-    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2025_08_15/msvcup-%MSVCUP_ARCH%-windows.zip
+    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_02_07/msvcup-%MSVCUP_ARCH%-windows.zip
     tar -C%~dp0 -xf %~dp0msvcup.zip
     del %~dp0msvcup.zip
 ) else (
@@ -37,40 +37,20 @@
 
 set MSVC=msvc-14.44.17.14
 set SDK=sdk-10.0.22621.7
+set NINJA_PKG=ninja-1.13.2
+set NINJA=C:\msvcup\%NINJA_PKG%\ninja.exe
+set CMAKE_PKG=cmake-4.2.3
+set CMAKE=C:\msvcup\%CMAKE_PKG%\bin\cmake.exe
 
-%~dp0msvcup.exe install --lock-file %~dp0msvcup.lock --manifest-update-off %MSVC% %SDK%
+%~dp0msvcup.exe install --lock-file %~dp0msvcup.lock --manifest-update-off %MSVC% %SDK% %NINJA_PKG% %CMAKE_PKG%
 @if %errorlevel% neq 0 (exit /b %errorlevel%)
 
 %~dp0msvcup.exe autoenv --target-cpu %TARGET_CPU% --out-dir %~dp0autoenv\%TARGET_CPU% %MSVC% %SDK%
 @if %errorlevel% neq 0 (exit /b %errorlevel%)
 
-
-@set CMAKE_VERSION=4.2.1
-@set CMAKE=%~dp0cmake-%CMAKE_VERSION%-windows-%CMAKE_ARCH%\bin\cmake.exe
-@if not exist %CMAKE% (
-    echo cmake: installing...
-    curl -L -o %~dp0cmake.zip https://github.com/Kitware/CMake/releases/download/v%CMAKE_VERSION%/cmake-%CMAKE_VERSION%-windows-%CMAKE_ARCH%.zip
-    tar -C%~dp0 -xf %~dp0cmake.zip
-    del %~dp0cmake.zip
-) else (
-    echo cmake: already installed
-)
-@if not exist %CMAKE% exit /b 1
-
-
-@if not exist %~dp0ninja.exe (
-    echo ninja.exe: installing...
-    curl -L -o %~dp0ninja.zip https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip
-    tar -C%~dp0 -xf %~dp0ninja.zip
-    del %~dp0ninja.zip
-) else (
-    echo ninja.exe: already installed
-)
-@if not exist %~dp0ninja.exe exit /b 1
-
 @if not exist %~dp0out\%TARGET_CPU%\build.ninja (
-    %CMAKE% -S %~dp0 -B %~dp0out/%TARGET_CPU% -DCMAKE_TOOLCHAIN_FILE=%~dp0/autoenv/%TARGET_CPU%/toolchain.cmake -GNinja -DCMAKE_MAKE_PROGRAM=%~dp0ninja.exe
+    %CMAKE% -S %~dp0 -B %~dp0out/%TARGET_CPU% -DCMAKE_TOOLCHAIN_FILE=%~dp0/autoenv/%TARGET_CPU%/toolchain.cmake -GNinja -DCMAKE_MAKE_PROGRAM=%NINJA%
     @if %errorlevel% neq 0 (exit /b %errorlevel%)
 )
 
-%~dp0ninja.exe -C %~dp0out\%TARGET_CPU%
+%NINJA% -C %~dp0out\%TARGET_CPU%

@@ -99,3 +99,8 @@ sdk-10.0.22621.7|https://download.visualstudio.microsoft.com/download/pr/10d3c2a
 |https://download.visualstudio.microsoft.com/download/pr/10d3c2ab-450a-44f7-84b4-a11b2bade847/31293c2b4e08fc6d7cad9fdd3c293e4e/e5c4b31ff9997ac5603f4f28cd7df602.cab|788a5f2f20127c77e0d73675a7eb0daeca8fbd398b1818a0e3d085e9b504a36a e5c4b31ff9997ac5603f4f28cd7df602.cab
 |https://download.visualstudio.microsoft.com/download/pr/10d3c2ab-450a-44f7-84b4-a11b2bade847/a261a06df246ecd1e10a5d6f1790c335/e98fa5eb5fee6ce17a7a69d585870b7c.cab|60b029421e01a986472dfd5c35eada3cf66b477191c7075021a8b4918904ac09 e98fa5eb5fee6ce17a7a69d585870b7c.cab
 sdk-10.0.22621.7|https://download.visualstudio.microsoft.com/download/pr/10d3c2ab-450a-44f7-84b4-a11b2bade847/ee49a2e87b010ad3f13d723d5997cf0e/windows sdk signing tools-x86_en-us.msi|54e927447876539ad55bb6d70c25ed8c1ab5723708acba5c988836599eb8d064
+ninja-1.13.2|https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip|07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65
+ninja-1.13.2|https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-winarm64.zip|e52f0bdef9dfb1003229dbd6508a508c4073fd017247002adc66e5e806cb0391
+cmake-4.2.3|https://github.com/Kitware/CMake/releases/download/v4.2.3/cmake-4.2.3-windows-arm64.zip|751b206b1cf65151b72c525d26267c1d9beebf8fafc365ae00286571d9fd3ed9
+cmake-4.2.3|https://github.com/Kitware/CMake/releases/download/v4.2.3/cmake-4.2.3-windows-i386.zip|ad46d82c99a818a2cdd694fe82bec99f0cb557d864dc5fff5d54d347c7cdd98f
+cmake-4.2.3|https://github.com/Kitware/CMake/releases/download/v4.2.3/cmake-4.2.3-windows-x86_64.zip|eb4ebf5155dbb05436d675706b2a08189430df58904257ae5e91bcba4c86933c
