@@ -338,17 +338,63 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
         const sha256 = try fetch(root_node, scratch, uri, cache_path, .{});
         try finishCacheFetch(scratch, cache_dir, config.url, sha256, cache_path);
-        try std.io.getStdOut().writer().writeAll(&sha256);
+        try std.io.getStdOut().writer().print("{f}", .{sha256});
         try std.io.getStdOut().writer().writeAll("\n");
     }
     return 0;
+}
+
+const Sha = struct {
+    bytes: [32]u8,
+    pub fn parseHex(hex: *const [64]u8) ?Sha {
+        var result: Sha = undefined;
+        for (&result.bytes, 0..) |*byte, i| {
+            const high: u8 = nibbleFromHex(hex[i * 2]) orelse return null;
+            const low: u8 = nibbleFromHex(hex[i * 2 + 1]) orelse return null;
+            byte.* = (high << 4) | low;
+        }
+        return result;
+    }
+    fn nibbleFromHex(c: u8) ?u4 {
+        return switch (c) {
+            '0'...'9' => @intCast(c - '0'),
+            'a'...'f' => @intCast(c - 'a' + 10),
+            else => null,
+        };
+    }
+    pub fn eql(sha: *const Sha, other: *const Sha) bool {
+        return std.mem.eql(u8, &sha.bytes, &other.bytes);
+    }
+    pub fn toHex(sha: *const Sha) [64]u8 {
+        var buf: [64]u8 = undefined;
+        std.debug.assert(64 == (std.fmt.bufPrint(&buf, "{f}", .{sha}) catch unreachable).len);
+        return buf;
+    }
+    pub fn format(
+        value: Sha,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("{f}", .{std.fmt.fmtSliceHexLower(&value.bytes)});
+    }
+};
+
+fn lowerShaHex(sha: *const [64]u8) [64]u8 {
+    var result: [64]u8 = undefined;
+    for (&result, sha) |*dst, src| {
+        dst.* = std.ascii.toLower(src);
+    }
+    return result;
 }
 
 fn finishCacheFetch(
     scratch: std.mem.Allocator,
     cache_dir: []const u8,
     url: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     cache_path: []const u8,
 ) !void {
     const entry = CacheEntry.alloc(scratch, scratch, cache_dir, sha256, basenameFromUrl(url));
@@ -857,7 +903,7 @@ fn checkLockFilePkgs(
 
 const LockFilePayload = struct {
     url_decoded: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     url_kind: union(enum) {
         top_level: MsvcupPackage,
         cab: []const u8,
@@ -921,7 +967,7 @@ fn parseLockFilePayload(
         .{ lock_file_path, lineno, url_decoded },
     );
     const hash_spec = scanTo(line, url_end + 1, ' ');
-    const sha256: [64]u8 = blk: {
+    const sha256_hex: [64]u8 = blk: {
         if (hash_spec.slice.len == 64) {
             break :blk hash_spec.slice[0..64].*;
         }
@@ -933,15 +979,12 @@ fn parseLockFilePayload(
             "{s}:{}: invalid hash index {} (url is only {} chars)",
             .{ lock_file_path, lineno, hash_index, url_decoded.len },
         );
-        break :blk url_decoded[hash_index..][0..64].*;
+        break :blk lowerShaHex(url_decoded[hash_index..][0..64]);
     };
-    for (sha256) |c| {
-        if (!switch (c) {
-            '0'...'9', 'A'...'F', 'a'...'f' => true,
-            else => false,
-        })
-            errExit("{s}:{}: invalid sha256 hash '{s}'", .{ lock_file_path, lineno, &sha256 });
-    }
+    const sha256 = Sha.parseHex(&sha256_hex) orelse errExit(
+        "{s}:{}: invalid sha256 hash '{s}'",
+        .{ lock_file_path, lineno, &sha256_hex },
+    );
     switch (url_kind) {
         .vsix, .msi, .zip => |install_kind| {
             if (hash_spec.end != line.len) errExit(
@@ -1303,10 +1346,10 @@ const CacheEntry = struct {
         allocator: std.mem.Allocator,
         scratch: std.mem.Allocator,
         cache_dir: []const u8,
-        sha256: [64]u8,
+        sha256: Sha,
         name: []const u8,
     ) CacheEntry {
-        const cache_basename = std.fmt.allocPrint(scratch, "{s}-{s}", .{ &sha256, name }) catch |e| oom(e);
+        const cache_basename = std.fmt.allocPrint(scratch, "{s}-{s}", .{ sha256, name }) catch |e| oom(e);
         defer scratch.free(cache_basename);
         const path = std.fs.path.join(allocator, &.{ cache_dir, cache_basename }) catch |e| oom(e);
         const new_basename = path[path.len - cache_basename.len ..];
@@ -1325,7 +1368,7 @@ fn installPayload(
     lock_file_path: []const u8,
     cache_dir: []const u8,
     url_decoded: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     strip_root_dir: bool,
     cabs_lineno: u32,
     cabs: []const u8,
@@ -2336,7 +2379,7 @@ fn writePayload(
     maybe_target: ?MsvcupPackage,
     url_kind: LockFileUrlKind,
     url: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     file_name: []const u8,
 ) !void {
     std.debug.assert(url_kind == getLockFileUrlKind(url));
@@ -2352,7 +2395,9 @@ fn writePayload(
     };
     std.debug.assert(expect_target_string == (maybe_target != null));
     const target_str: []const u8 = if (maybe_target) |t| t.poolString().slice else "";
-    if (std.ascii.indexOfIgnoreCase(url, &sha256)) |hash_index| {
+
+    const sha_hex = sha256.toHex();
+    if (std.ascii.indexOfIgnoreCase(url, &sha_hex)) |hash_index| {
         try writer.print("{s}|{s}|{d}{s}{s}\n", .{ target_str, url, hash_index, space, out_file_name });
     } else {
         try writer.print("{s}|{s}|{s}{s}{s}\n", .{ target_str, url, sha256, space, std.fs.path.basenameWindows(out_file_name) });
@@ -2639,7 +2684,7 @@ const Package = struct {
 };
 const Payload = struct {
     url_decoded: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     file_name: []const u8,
     pub fn nameDecoded(self: *const Payload) []const u8 {
         return basenameFromUrl(self.url_decoded);
@@ -2735,7 +2780,7 @@ fn readVsManifestLocking(
     }
 }
 
-fn sha256FromUri(uri: std.Uri) [64]u8 {
+fn sha256FromUri(uri: std.Uri) Sha {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     uri.format("", .{}, hasher.writer()) catch |e| switch (e) {};
     const digest = hasher.finalResult();
@@ -2746,7 +2791,7 @@ fn sha256FromUri(uri: std.Uri) [64]u8 {
 
 const VsManifestPayload = struct {
     url_decoded: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     size: u63,
     pub fn free(self: VsManifestPayload, allocator: std.mem.Allocator) void {
         allocator.free(self.url_decoded);
@@ -2812,7 +2857,7 @@ fn vsManifestPayloadFromChManifest(
 
 const PayloadJson = struct {
     fileName: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     size: u63,
     url: []const u8,
     pub fn init(obj: JsonContext.Object) PayloadJson {
@@ -2822,7 +2867,7 @@ const PayloadJson = struct {
             const field = obj.getField(&err, "fileName") catch errExit("{}", .{err});
             break :blk field.as(.string, &err) catch errExit("{}", .{err});
         };
-        const sha256: [64]u8 = blk: {
+        const sha256: Sha = blk: {
             const field = obj.getField(&err, "sha256") catch errExit("{}", .{err});
             const str = field.as(.string, &err) catch errExit("{}", .{err});
             if (str.len != 64) {
@@ -2832,7 +2877,11 @@ const PayloadJson = struct {
                     .{ file_path, field, str, str.len },
                 );
             }
-            break :blk str[0..64].*;
+            const sha_hex = lowerShaHex(str[0..64]);
+            break :blk Sha.parseHex(&sha_hex) orelse {
+                const file_path: []const u8 = if (obj.parent_context.getFilePath()) |p| p else "?";
+                errExit("{s}: invalid sha '{s}'", .{ file_path, &sha_hex });
+            };
         };
         const size: u63 = blk: {
             const field = obj.getField(&err, "size") catch errExit("{}", .{err});
@@ -3113,7 +3162,7 @@ fn fetchPayload(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     cache_dir: []const u8,
-    sha256: [64]u8,
+    sha256: Sha,
     url_decoded: []const u8,
     cache_path: []const u8,
 ) !void {
@@ -3122,10 +3171,10 @@ fn fetchPayload(
     var cache_lock = try LockFile.lock(cache_lock_path);
     defer cache_lock.unlock();
     if (std.fs.cwd().access(cache_path, .{})) {
-        log.info("ALREADY FETCHED  | {s} {s}", .{ url_decoded, &sha256 });
+        log.info("ALREADY FETCHED  | {s} {f}", .{ url_decoded, sha256 });
     } else |err| switch (err) {
         error.FileNotFound => {
-            log.info("FETCHING         | {s} {s}", .{ url_decoded, &sha256 });
+            log.info("FETCHING         | {s} {f}", .{ url_decoded, sha256 });
             const fetch_path = std.mem.concat(scratch, u8, &.{ cache_path, ".fetching" }) catch |e| oom(e);
             defer scratch.free(fetch_path);
             const actual_sha256 = try fetch(
@@ -3135,10 +3184,10 @@ fn fetchPayload(
                 fetch_path,
                 .{},
             );
-            if (!std.mem.eql(u8, &actual_sha256, &sha256)) {
+            if (!sha256.eql(&actual_sha256)) {
                 std.log.err(
-                    "SHA256 mismatch:\nexpected: {s}\nactual  : {s}\n",
-                    .{ &sha256, &actual_sha256 },
+                    "SHA256 mismatch:\nexpected: {f}\nactual  : {f}\n",
+                    .{ sha256, actual_sha256 },
                 );
                 try finishCacheFetch(scratch, cache_dir, url_decoded, actual_sha256, fetch_path);
                 std.process.exit(0xff);
@@ -3157,7 +3206,7 @@ fn fetch(
     opt: struct {
         size: ?u64 = null,
     },
-) ![64]u8 {
+) !Sha {
     log.info("fetch: {}", .{uri});
     const progress_node_name = std.fmt.allocPrint(scratch, "fetch {}", .{uri}) catch |e| oom(e);
     defer scratch.free(progress_node_name);
@@ -3241,15 +3290,9 @@ fn fetch(
         .{ uri, size, total_received },
     );
 
-    var actual_sha256_bytes: [32]u8 = undefined;
-    hasher.final(&actual_sha256_bytes);
-    var actual_sha256_hex: [64]u8 = undefined;
-    std.debug.assert(64 == (std.fmt.bufPrint(
-        &actual_sha256_hex,
-        "{}",
-        .{std.fmt.fmtSliceHexLower(&actual_sha256_bytes)},
-    ) catch unreachable).len);
-    return actual_sha256_hex;
+    var sha: Sha = undefined;
+    hasher.final(&sha.bytes);
+    return sha;
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
@@ -3364,7 +3407,7 @@ const PayloadIndex = enum(usize) {
             .lt, .gt => |o| return o,
             .eq => {},
         }
-        return orderAlphabetical({}, &payloads[lhs.int()].sha256, &payloads[rhs.int()].sha256);
+        return orderNumeric({}, &payloads[lhs.int()].sha256.bytes, &payloads[rhs.int()].sha256.bytes);
     }
     pub fn lessThan(payloads: []const Payload, lhs: PayloadIndex, rhs: PayloadIndex) bool {
         return order(payloads, lhs, rhs) == .lt;
@@ -3504,7 +3547,7 @@ fn getPackages(
             std.debug.assert(filename.len > 0);
             out_payloads[out_payload_count] = .{
                 .url_decoded = allocator.dupe(u8, p.url) catch |e| oom(e),
-                .sha256 = p.sha256,
+                .sha256 = Sha.parseHex(&p.sha256).?,
                 .file_name = allocator.dupe(u8, filename) catch |e| oom(e),
             };
             out_payload_count += 1;
