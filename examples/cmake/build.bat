@@ -28,7 +28,7 @@
 @if not exist %~dp0msvcup.exe (
     echo msvcup.exe: installing...
     curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2025_08_15/msvcup-%MSVCUP_ARCH%-windows.zip
-    tar xf %~dp0msvcup.zip
+    tar -C%~dp0 -xf %~dp0msvcup.zip
     del %~dp0msvcup.zip
 ) else (
     echo msvcup.exe: already installed
@@ -49,9 +49,9 @@ set SDK=sdk-10.0.22621.7
 @set CMAKE=%~dp0cmake-%CMAKE_VERSION%-windows-%CMAKE_ARCH%\bin\cmake.exe
 @if not exist %CMAKE% (
     echo cmake: installing...
-    curl -L -o cmake.zip https://github.com/Kitware/CMake/releases/download/v%CMAKE_VERSION%/cmake-%CMAKE_VERSION%-windows-%CMAKE_ARCH%.zip
-    tar xf cmake.zip
-    del cmake.zip
+    curl -L -o %~dp0cmake.zip https://github.com/Kitware/CMake/releases/download/v%CMAKE_VERSION%/cmake-%CMAKE_VERSION%-windows-%CMAKE_ARCH%.zip
+    tar -C%~dp0 -xf %~dp0cmake.zip
+    del %~dp0cmake.zip
 ) else (
     echo cmake: already installed
 )
@@ -60,9 +60,9 @@ set SDK=sdk-10.0.22621.7
 
 @if not exist %~dp0ninja.exe (
     echo ninja.exe: installing...
-    curl -L -o ninja.zip https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip
-    tar xf ninja.zip
-    del ninja.zip
+    curl -L -o %~dp0ninja.zip https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip
+    tar -C%~dp0 -xf %~dp0ninja.zip
+    del %~dp0ninja.zip
 ) else (
     echo ninja.exe: already installed
 )

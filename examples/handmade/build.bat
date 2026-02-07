@@ -26,7 +26,7 @@
 @if not exist %~dp0msvcup.exe (
     echo msvcup.exe: installing...
     curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2025_08_15/msvcup-%MSVCUP_ARCH%-windows.zip
-    tar xf %~dp0msvcup.zip
+    tar -C%~dp0 -xf %~dp0msvcup.zip
     del %~dp0msvcup.zip
 ) else (
     echo msvcup.exe: already installed
