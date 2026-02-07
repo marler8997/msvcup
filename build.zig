@@ -23,6 +23,23 @@ pub fn build(b: *std.Build) !void {
     });
     b.getInstallStep().dependOn(&b.addInstallFile(release_version_file, "version-release").step);
 
+    const extrapkgs_mod = blk: {
+        const generate_exe = b.addExecutable(.{
+            .name = "generate-extrapkgs",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/generate-extrapkgs.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+                .single_threaded = true,
+            }),
+        });
+        const run = b.addRunArtifact(generate_exe);
+        run.addFileArg(b.path("extrapkgs.lock"));
+        break :blk b.createModule(.{
+            .root_source_file = run.addOutputFileArg("extrapkgs.zig"),
+        });
+    };
+
     const msvcup = b.addExecutable(.{
         .name = "msvcup",
         .root_module = b.createModule(.{
@@ -32,6 +49,7 @@ pub fn build(b: *std.Build) !void {
             .single_threaded = true,
             .imports = &.{
                 .{ .name = "version", .module = dev_version_embed },
+                .{ .name = "extrapkgs", .module = extrapkgs_mod },
                 .{ .name = "autoenv_exe", .module = b.createModule(.{
                     .root_source_file = addAutoenvExe(b, autoenv_cpu).getEmittedBin(),
                 }) },
@@ -61,7 +79,7 @@ pub fn build(b: *std.Build) !void {
     const ci_step = b.step("ci", "The build/test step to run on the CI");
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(test_step);
-    try ci(b, release_version_embed, autoenv_cpu, ci_step);
+    try ci(b, release_version_embed, extrapkgs_mod, autoenv_cpu, ci_step);
 }
 
 fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
@@ -111,6 +129,7 @@ fn makeCalVersion() ![11]u8 {
 fn ci(
     b: *std.Build,
     release_version_embed: *std.Build.Module,
+    extrapkgs_mod: *std.Build.Module,
     autoenv_cpu: Arch,
     ci_step: *std.Build.Step,
 ) !void {
@@ -159,6 +178,7 @@ fn ci(
                 .single_threaded = true,
                 .imports = &.{
                     .{ .name = "version", .module = release_version_embed },
+                    .{ .name = "extrapkgs", .module = extrapkgs_mod },
                     .{ .name = "autoenv_exe", .module = b.createModule(.{
                         .root_source_file = addAutoenvExe(b, autoenv_cpu).getEmittedBin(),
                     }) },

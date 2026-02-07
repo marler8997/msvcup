@@ -58,6 +58,7 @@ pub fn main() !u8 {
     if (std.mem.eql(u8, cmd, "autoenv")) return autoenv(arena, args);
     if (std.mem.eql(u8, cmd, "list")) return listCommand(arena, args);
     if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(arena, args);
+    if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(arena, args);
     log.err("unknown command '{s}'", .{cmd});
     return 0xff;
 }
@@ -184,6 +185,14 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 const msvcup_pkg: MsvcupPackage = .initStr(.diasdk, pkg.version);
                 insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
             },
+            .ninja => |version| {
+                const msvcup_pkg: MsvcupPackage = .initStr(.ninja, version);
+                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
+            },
+            .cmake => |version| {
+                const msvcup_pkg: MsvcupPackage = .initStr(.cmake, version);
+                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
+            },
         }
 
         for (pkgs.payloadsFromPkgIndex(.fromInt(pkg_index))) |payload| {
@@ -265,11 +274,105 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     return 0;
 }
 
+fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+    const root_node = std.Progress.start(.{ .root_name = "msvcup fetch" });
+    defer root_node.end();
+
+    const Config = struct {
+        url: []const u8,
+        cache_dir: ?[]const u8,
+    };
+    const config: Config = blk_config: {
+        var url: ?[]const u8 = null;
+        var cache_dir: ?[]const u8 = null;
+        var arg_index: usize = 0;
+        while (arg_index < args.len) : (arg_index += 1) {
+            const arg = args[arg_index];
+            if (!std.mem.startsWith(u8, arg, "-")) {
+                if (url != null) errExit("too many cmdline args, expected 1 URL", .{});
+                url = arg;
+            } else if (std.mem.eql(u8, arg, "--cache-dir")) {
+                arg_index += 1;
+                if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
+                cache_dir = args[arg_index];
+            } else errExit("unknown cmdline argument '{s}'", .{arg});
+        }
+        break :blk_config .{
+            .url = url orelse errExit("missing URL to fetch", .{}),
+            .cache_dir = cache_dir,
+        };
+    };
+
+    const uri = std.Uri.parse(config.url) catch |err| errExit(
+        "invalid uri '{s}': {s}",
+        .{ config.url, @errorName(err) },
+    );
+    const pkg = switch (extra.parseUrl(config.url)) {
+        .ok => |pkg| pkg,
+        .unexpected => |u| errExit(
+            "invalid package url '{s}' expected {s} at offset {} but got '{s}'",
+            .{ config.url, u.what, u.offset, config.url[u.offset..] },
+        ),
+    };
+    _ = pkg;
+
+    const msvcup_dir: MsvcupDir = try .alloc(arena);
+    log.debug("msvcup dir '{s}'", .{msvcup_dir.root_path});
+
+    const cache_dir: []const u8 = config.cache_dir orelse msvcup_dir.path(
+        arena,
+        &.{"cache"},
+    ) catch |e| oom(e);
+
+    var scratch_instance: ScratchAllocator = .init();
+    const scratch = scratch_instance.allocator();
+
+    {
+        const cache_path = std.fs.path.join(scratch, &.{ cache_dir, "nohash" }) catch |e| oom(e);
+        defer scratch.free(cache_path);
+
+        const cache_lock_path = std.mem.concat(scratch, u8, &.{ cache_path, ".lock" }) catch |e| oom(e);
+        defer scratch.free(cache_lock_path);
+        var cache_lock = try LockFile.lock(cache_lock_path);
+        defer cache_lock.unlock();
+
+        const sha256 = try fetch(root_node, scratch, uri, cache_path, .{});
+        try finishCacheFetch(scratch, cache_dir, config.url, sha256, cache_path);
+        try std.io.getStdOut().writer().writeAll(&sha256);
+        try std.io.getStdOut().writer().writeAll("\n");
+    }
+    return 0;
+}
+
+fn finishCacheFetch(
+    scratch: std.mem.Allocator,
+    cache_dir: []const u8,
+    url: []const u8,
+    sha256: [64]u8,
+    cache_path: []const u8,
+) !void {
+    const entry = CacheEntry.alloc(scratch, scratch, cache_dir, sha256, basenameFromUrl(url));
+    defer entry.free(scratch);
+    const already_exists = if (std.fs.accessAbsolute(entry.path, .{})) true else |err| switch (err) {
+        error.FileNotFound => false,
+        else => |e| return e,
+    };
+    if (already_exists) {
+        std.log.info("{s}: already exists", .{entry.path});
+        try std.fs.cwd().deleteFile(cache_path);
+    } else {
+        std.log.info("{s}: newly fetched", .{entry.path});
+        try std.fs.cwd().rename(cache_path, entry.path);
+    }
+}
+
 const MsvcupPackageKind = enum {
     msvc,
     sdk,
     msbuild,
     diasdk,
+    ninja,
+    cmake,
     pub fn order(_: void, lhs: MsvcupPackageKind, rhs: MsvcupPackageKind) std.math.Order {
         return std.math.order(@intFromEnum(lhs), @intFromEnum(rhs));
     }
@@ -290,6 +393,8 @@ const MsvcupPackage = struct {
             if (startsWith(u8, pkg, "sdk-")) |version| break :blk .{ .sdk, version };
             if (startsWith(u8, pkg, "msbuild-")) |version| break :blk .{ .msbuild, version };
             if (startsWith(u8, pkg, "diasdk-")) |version| break :blk .{ .diasdk, version };
+            if (startsWith(u8, pkg, "ninja-")) |version| break :blk .{ .ninja, version };
+            if (startsWith(u8, pkg, "cmake-")) |version| break :blk .{ .cmake, version };
             return .unknown_name;
         };
         return if (isValidVersion(version)) .{ .ok = .{
@@ -505,6 +610,15 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 }
 
+const native_arch: ?Arch = switch (builtin.cpu.arch) {
+    .x86_64 => .x64,
+    .x86 => .x86,
+    .arm => .arm,
+    .aarch64 => .arm64,
+    .powerpc64le, .riscv64, .s390x => null,
+    else => |a| @compileError("unhandled host cpu: " ++ @tagName(a)),
+};
+
 const Tool = struct {
     name: []const u8,
     cmake_names: []const []const u8,
@@ -604,6 +718,8 @@ fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 },
                 .msbuild => {},
                 .diasdk => {},
+                .ninja => continue,
+                .cmake => continue,
             }
             const vcvars_path = try std.fmt.allocPrint(
                 arena,
@@ -706,7 +822,7 @@ fn checkLockFilePkgs(
         const payload = parseLockFilePayload(lock_file_path, lineno, line);
         while (true) {
             switch (payload.url_kind) {
-                .vsix_or_msi => |payload_msvcup_pkg| switch (MsvcupPackage.order(
+                .top_level => |payload_msvcup_pkg| switch (MsvcupPackage.order(
                     {},
                     msvcup_pkgs[msvcup_pkg_index],
                     payload_msvcup_pkg,
@@ -743,9 +859,35 @@ const LockFilePayload = struct {
     url_decoded: []const u8,
     sha256: [64]u8,
     url_kind: union(enum) {
-        vsix_or_msi: MsvcupPackage,
+        top_level: MsvcupPackage,
         cab: []const u8,
     },
+
+    pub fn stripRootDir(payload: *const LockFilePayload) bool {
+        return switch (payload.url_kind) {
+            .top_level => |pkg| switch (pkg.kind) {
+                .cmake => true,
+                else => false,
+            },
+            .cab => false,
+        };
+    }
+
+    pub fn hostArchLimit(payload: *const LockFilePayload) ?Arch {
+        return switch (payload.url_kind) {
+            .top_level => |pkg| switch (pkg.kind) {
+                .msvc, .sdk, .msbuild, .diasdk => null,
+                .ninja, .cmake => switch (extra.parseUrl(payload.url_decoded)) {
+                    .ok => |p| p.arch,
+                    .unexpected => |u| errExit(
+                        "invalid package url '{s}' expected {s} at offset {} but got '{s}'",
+                        .{ payload.url_decoded, u.what, u.offset, payload.url_decoded[u.offset..] },
+                    ),
+                },
+            },
+            .cab => null,
+        };
+    }
 };
 fn parseLockFilePayload(
     lock_file_path: []const u8,
@@ -801,7 +943,7 @@ fn parseLockFilePayload(
             errExit("{s}:{}: invalid sha256 hash '{s}'", .{ lock_file_path, lineno, &sha256 });
     }
     switch (url_kind) {
-        .vsix, .msi => |install_kind| {
+        .vsix, .msi, .zip => |install_kind| {
             if (hash_spec.end != line.len) errExit(
                 "{s}:{}: a payload of kind '{s}' should not contain anything after the hash",
                 .{ lock_file_path, lineno, @tagName(install_kind) },
@@ -809,7 +951,7 @@ fn parseLockFilePayload(
             return .{
                 .url_decoded = url_decoded,
                 .sha256 = sha256,
-                .url_kind = .{ .vsix_or_msi = maybe_msvcup_pkg orelse errExit(
+                .url_kind = .{ .top_level = maybe_msvcup_pkg orelse errExit(
                     "{s}:{}: missing msvcup package",
                     .{ lock_file_path, lineno },
                 ) },
@@ -849,8 +991,18 @@ fn installFromLockFile(
         lineno += 1;
         if (line.len == 0) continue;
         const parsed = parseLockFilePayload(lock_file_path, lineno, line);
+        if (parsed.hostArchLimit()) |host_arch_limit| {
+            if (native_arch != host_arch_limit) {
+                const name = basenameFromUrl(parsed.url_decoded);
+                std.log.info(
+                    "skipping payload '{s}' arch {s} != host arch {s}",
+                    .{ name, @tagName(host_arch_limit), if (native_arch) |a| @tagName(a) else "null" },
+                );
+                continue;
+            }
+        }
         switch (parsed.url_kind) {
-            .vsix_or_msi => |payload_msvcup_pkg| {
+            .top_level => |payload_msvcup_pkg| {
                 const cabs_lineno, const cabs: []const u8 = if (save_cab_pos) |pos|
                     .{ pos.lineno, lock_file_content[pos.offset .. line.ptr - lock_file_content.ptr] }
                 else
@@ -870,6 +1022,7 @@ fn installFromLockFile(
                     cache_dir,
                     parsed.url_decoded,
                     parsed.sha256,
+                    parsed.stripRootDir(),
                     cabs_lineno,
                     cabs,
                 );
@@ -901,6 +1054,8 @@ fn finishPackage(
         .sdk => .sdk,
         .msbuild => return,
         .diasdk => return,
+        .ninja => return,
+        .cmake => return,
     };
 
     const install_path = msvcup_dir.path(scratch, &.{msvcup_pkg.poolString().slice}) catch |e| oom(e);
@@ -1168,13 +1323,14 @@ fn installPayload(
     progress_node: std.Progress.Node,
     install_dir_path: []const u8,
     lock_file_path: []const u8,
-    cache_path: []const u8,
+    cache_dir: []const u8,
     url_decoded: []const u8,
     sha256: [64]u8,
+    strip_root_dir: bool,
     cabs_lineno: u32,
     cabs: []const u8,
 ) !void {
-    const install_kind: enum { vsix, msi } = blk: {
+    const install_kind: enum { vsix, msi, zip } = blk: {
         switch (getLockFileUrlKind(url_decoded) orelse errExit(
             "unable to determine install kind from payload url '{s}'",
             .{url_decoded},
@@ -1185,10 +1341,14 @@ fn installPayload(
             },
             .msi => break :blk .msi,
             .cab => unreachable,
+            .zip => {
+                if (cabs.len != 0) @panic("zip payloads should not have cab files");
+                break :blk .zip;
+            },
         }
     };
 
-    const cache_entry = CacheEntry.alloc(scratch, scratch, cache_path, sha256, basenameFromUrl(url_decoded));
+    const cache_entry = CacheEntry.alloc(scratch, scratch, cache_dir, sha256, basenameFromUrl(url_decoded));
     defer cache_entry.free(scratch);
 
     const installed_basename = std.mem.concat(scratch, u8, &.{ cache_entry.basename, ".files" }) catch |e| oom(e);
@@ -1210,12 +1370,12 @@ fn installPayload(
             lineno += 1;
             if (line.len == 0) continue;
             const parsed = parseLockFilePayload(lock_file_path, lineno, line);
-            const cab_cache_entry = CacheEntry.alloc(scratch, scratch, cache_path, parsed.sha256, basenameFromUrl(parsed.url_decoded));
+            const cab_cache_entry = CacheEntry.alloc(scratch, scratch, cache_dir, parsed.sha256, basenameFromUrl(parsed.url_decoded));
             defer cab_cache_entry.free(scratch);
-            try fetchPayload(scratch, progress_node, parsed.sha256, parsed.url_decoded, cab_cache_entry.path);
+            try fetchPayload(scratch, progress_node, cache_dir, parsed.sha256, parsed.url_decoded, cab_cache_entry.path);
         }
     }
-    try fetchPayload(scratch, progress_node, sha256, url_decoded, cache_entry.path);
+    try fetchPayload(scratch, progress_node, cache_dir, sha256, url_decoded, cache_entry.path);
 
     const install_lock_path = std.fs.path.join(scratch, &.{ install_dir_path, ".lock" }) catch |e| oom(e);
     defer scratch.free(install_lock_path);
@@ -1233,16 +1393,19 @@ fn installPayload(
         msi: struct {
             staging_dir: []const u8,
         },
+        zip,
     } = switch (install_kind) {
         .vsix => .vsix,
         .msi => .{ .msi = .{ .staging_dir = std.fs.path.join(
             scratch,
             &.{ install_dir_path, ".msi-staging" },
         ) catch |e| oom(e) } },
+        .zip => .zip,
     };
     defer switch (pre_start_data) {
         .vsix => {},
         .msi => |msi| scratch.free(msi.staging_dir),
+        .zip => {},
     };
     switch (pre_start_data) {
         .vsix => {},
@@ -1265,13 +1428,13 @@ fn installPayload(
                     if (line.len == 0) continue;
                     const parsed = parseLockFilePayload(lock_file_path, lineno, line);
                     const installer_sub_path = switch (parsed.url_kind) {
-                        .vsix_or_msi => unreachable,
+                        .top_level => unreachable,
                         .cab => |path| path,
                     };
                     const cab_cache_entry = CacheEntry.alloc(
                         scratch,
                         scratch,
-                        cache_path,
+                        cache_dir,
                         parsed.sha256,
                         basenameFromUrl(parsed.url_decoded),
                     );
@@ -1286,6 +1449,7 @@ fn installPayload(
             std.log.info("removing '{s}'...", .{installer_path});
             try deleteTree(std.fs.cwd(), installer_path);
         },
+        .zip => {},
     }
 
     {
@@ -1293,9 +1457,8 @@ fn installPayload(
         defer current_install.close();
         // this will always starts with the cache basename
         try current_install.writer().print("{s}\n", .{cache_entry.basename});
-        // try installPayloadZip(scratch, install_dir_path, cache_entry.path, install_dir, current_install);
         switch (pre_start_data) {
-            .vsix => try installPayloadZip(scratch, install_dir_path, cache_entry.path, install_dir, current_install),
+            .vsix => try installPayloadZip(scratch, install_dir_path, cache_entry.path, install_dir, current_install, .vsix, strip_root_dir),
             .msi => |msi| {
                 const target_dir = std.fs.path.join(scratch, &.{ msi.staging_dir, "target" }) catch |e| oom(e);
                 defer scratch.free(target_dir);
@@ -1309,6 +1472,7 @@ fn installPayload(
                 );
                 try deleteTree(std.fs.cwd(), msi.staging_dir);
             },
+            .zip => try installPayloadZip(scratch, install_dir_path, cache_entry.path, install_dir, current_install, .zip, strip_root_dir),
         }
     }
 
@@ -1362,9 +1526,13 @@ fn installPayloadZip(
     cache_path: []const u8,
     install_dir: std.fs.Dir,
     installing_manifest: std.fs.File,
+    kind: enum { vsix, zip },
+    strip_root_dir: bool,
 ) !void {
     var payload_file = try std.fs.cwd().openFile(cache_path, .{});
     defer payload_file.close();
+
+    var last_root_dir: ?[]const u8 = null;
 
     {
         var zip_it = try zip.Iterator.init(payload_file.seekableStream());
@@ -1393,22 +1561,49 @@ fn installPayloadZip(
                 }
             }
 
-            const prefix = "Contents" ++ std.fs.path.sep_str;
+            const prefix: []const u8 = switch (kind) {
+                .vsix => "Contents" ++ std.fs.path.sep_str,
+                .zip => "",
+            };
             if (!std.ascii.startsWithIgnoreCase(filename, prefix)) {
                 log.info("ignore '{s}'", .{filename});
                 continue;
             }
             if (filename[filename.len - 1] == std.fs.path.sep) {
-                log.info("ignore directory '{s}'", .{filename});
+                // log.info("ignore directory '{s}'", .{filename});
                 continue;
             }
 
             // for some reason, the VSIX filenames can be URL percent encoded?!?
             const sub_path_encoded = filename[prefix.len..];
             const sub_path_decoded = allocUrlPercentDecoded(scratch, sub_path_encoded) catch |e| oom(e);
-            defer scratch.free(sub_path_encoded);
+            defer scratch.free(sub_path_decoded);
 
-            const install_path = std.fs.path.join(scratch, &.{ install_dir_path, sub_path_decoded }) catch |e| oom(e);
+            const sub_path = blk: {
+                if (strip_root_dir) {
+                    const root_dir_end = std.mem.indexOfScalar(
+                        u8,
+                        sub_path_decoded,
+                        std.fs.path.sep,
+                    ) orelse std.debug.panic(
+                        "no root dir to strip from  '{s}'",
+                        .{sub_path_decoded},
+                    );
+                    const root_dir = sub_path_decoded[0..root_dir_end];
+                    if (last_root_dir) |last| if (!std.mem.eql(u8, last, root_dir)) std.debug.panic(
+                        "root dir has changed from '{s}' to '{s}', cannot strip",
+                        .{ last, root_dir },
+                    );
+                    last_root_dir = root_dir;
+                    std.debug.assert(sub_path_decoded[root_dir.len] == std.fs.path.sep);
+                    const sub_path = sub_path_decoded[root_dir.len..];
+                    std.debug.assert(sub_path.len > 0);
+                    break :blk sub_path;
+                }
+                break :blk sub_path_decoded;
+            };
+
+            const install_path = std.fs.path.join(scratch, &.{ install_dir_path, sub_path }) catch |e| oom(e);
             defer scratch.free(install_path);
             switch (try updateInstallingManifest(install_dir, installing_manifest, install_path)) {
                 .already_installed => {
@@ -1671,6 +1866,8 @@ fn getInstallPkg(id: []const u8) ?union(enum) {
     msvc: []const u8,
     msbuild: []const u8,
     diasdk,
+    ninja: []const u8,
+    cmake: []const u8,
 } {
     return switch (identifyPackage(id)) {
         .unknown => null,
@@ -1717,6 +1914,8 @@ fn getInstallPkg(id: []const u8) ?union(enum) {
         },
         .msbuild => |version| return .{ .msbuild = version },
         .diasdk => return .diasdk,
+        .ninja => |version| return .{ .ninja = version },
+        .cmake => |version| return .{ .cmake = version },
     };
 }
 
@@ -1809,6 +2008,32 @@ fn updateLockFile(
                         ) catch |e| oom(e);
                         break;
                     }
+                },
+                .ninja => |pkg_ninja_version| for (msvcup_pkgs) |msvcup_pkg| {
+                    if (msvcup_pkg.kind != .ninja) continue;
+                    if (!std.mem.eql(u8, msvcup_pkg.version.slice, pkg_ninja_version)) continue;
+                    insertSorted(
+                        InstallPackage,
+                        scratch,
+                        &install_pkgs,
+                        .init(msvcup_pkg, pkg_index),
+                        pkgs.slice,
+                        InstallPackage.order,
+                    ) catch |e| oom(e);
+                    break;
+                },
+                .cmake => |pkg_cmake_version| for (msvcup_pkgs) |msvcup_pkg| {
+                    if (msvcup_pkg.kind != .cmake) continue;
+                    if (!std.mem.eql(u8, msvcup_pkg.version.slice, pkg_cmake_version)) continue;
+                    insertSorted(
+                        InstallPackage,
+                        scratch,
+                        &install_pkgs,
+                        .init(msvcup_pkg, pkg_index),
+                        pkgs.slice,
+                        InstallPackage.order,
+                    ) catch |e| oom(e);
+                    break;
                 },
             };
 
@@ -1972,7 +2197,7 @@ fn updateLockFile(
             "unable to determine the payload kind from url '{s}'",
             .{payload.url_decoded},
         )) {
-            .vsix => {},
+            .vsix, .cab, .zip => {},
             .msi => {
                 _ = uriFromUrlDecoded(payload.url_decoded) catch errExit(
                     "payload url '{s}' is not a valid uri",
@@ -1989,6 +2214,7 @@ fn updateLockFile(
                 try fetchPayload(
                     scratch,
                     progress_node,
+                    cache_dir,
                     payload.sha256,
                     payload.url_decoded,
                     cache_entry.path,
@@ -2041,7 +2267,6 @@ fn updateLockFile(
                 );
                 std.sort.heap(PayloadIndex, cabs.items[cab_offset..], pkgs.payloads, PayloadIndex.lessThan);
             },
-            .cab => {},
         }
     }
 
@@ -2118,11 +2343,11 @@ fn writePayload(
     if (std.mem.indexOfScalar(u8, url, '\n')) |_| @panic("urls cannot contain newlines");
     if (std.mem.indexOfScalar(u8, file_name, '\n')) |_| @panic("file names cannot contain newlines");
     const space, const out_file_name = switch (url_kind) {
-        .vsix, .msi => .{ "", "" },
+        .vsix, .msi, .zip => .{ "", "" },
         .cab => .{ " ", file_name },
     };
     const expect_target_string = switch (url_kind) {
-        .vsix, .msi => true,
+        .vsix, .msi, .zip => true,
         .cab => false,
     };
     std.debug.assert(expect_target_string == (maybe_target != null));
@@ -2143,6 +2368,7 @@ const PackageId = union(enum) {
             anything,
             arch,
             target_arch,
+            end,
         },
     },
     msvc_version_something: struct {
@@ -2161,6 +2387,8 @@ const PackageId = union(enum) {
     },
     msbuild: []const u8, // version
     diasdk,
+    ninja: []const u8, // version
+    cmake: []const u8, // version
 };
 
 fn isVersionDigit(c: u8) bool {
@@ -2293,6 +2521,37 @@ fn identifyPackage(id: []const u8) PackageId {
         } };
     }
 
+    {
+        const ninja_prefix = "ninja-";
+        if (std.mem.startsWith(u8, id, ninja_prefix)) {
+            const version = scanIdVersion(id, ninja_prefix.len);
+            if (version.slice.len == 0) return .{ .unexpected = .{
+                .offset = ninja_prefix.len,
+                .expected = .version,
+            } };
+            if (version.end != id.len) return .{ .unexpected = .{
+                .offset = version.end,
+                .expected = .end,
+            } };
+            return .{ .ninja = version.slice };
+        }
+    }
+    {
+        const cmake_prefix = "cmake-";
+        if (std.mem.startsWith(u8, id, cmake_prefix)) {
+            const version = scanIdVersion(id, cmake_prefix.len);
+            if (version.slice.len == 0) return .{ .unexpected = .{
+                .offset = cmake_prefix.len,
+                .expected = .version,
+            } };
+            if (version.end != id.len) return .{ .unexpected = .{
+                .offset = version.end,
+                .expected = .end,
+            } };
+            return .{ .cmake = version.slice };
+        }
+    }
+
     return .unknown;
 }
 
@@ -2362,11 +2621,12 @@ fn identifyPayload(payload_filename: []const u8) PayloadId {
     return .unknown;
 }
 
-const LockFileUrlKind = enum { vsix, msi, cab };
+const LockFileUrlKind = enum { vsix, msi, cab, zip };
 fn getLockFileUrlKind(url: []const u8) ?LockFileUrlKind {
     if (std.mem.endsWith(u8, url, ".vsix")) return .vsix;
     if (std.mem.endsWith(u8, url, ".msi")) return .msi;
     if (std.mem.endsWith(u8, url, ".cab")) return .cab;
+    if (std.mem.endsWith(u8, url, ".zip")) return .zip;
     return null;
 }
 
@@ -2465,7 +2725,8 @@ fn readVsManifestLocking(
 
         // NOTE: for some reason the size/sha256 is not right for this?!?
         // try fetch(scratch, uri, vsman_latest_owning.borrow(), payload.size, payload.sha256);
-        try fetch(progress_node, scratch, uri, vsman_latest_owning.borrow(), null, null);
+        const sha256 = try fetch(progress_node, scratch, uri, vsman_latest_owning.borrow(), .{});
+        _ = sha256;
         const content = try readFile(allocator, vsman_latest_owning.borrow()) orelse errExit(
             "{s} still doesn't exist",
             .{vsman_latest_owning.borrow()},
@@ -2703,7 +2964,8 @@ fn readChManifestLocking(
         // //       ALSO, I'd like to see if
         // if (true) std.debug.panic("check uri sha '{s}'", .{uri_sha});
 
-        try fetch(progress_node, scratch, uri, chman_latest_owning.borrow(), null, null);
+        const sha256 = try fetch(progress_node, scratch, uri, chman_latest_owning.borrow(), .{});
+        _ = sha256;
         const content = try readFile(allocator, chman_latest_owning.borrow()) orelse errExit(
             "{s} still doesn't exist",
             .{chman_latest_owning.borrow()},
@@ -2850,6 +3112,7 @@ fn uriFromUrlDecoded(url_decoded: []const u8) !std.Uri {
 fn fetchPayload(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
+    cache_dir: []const u8,
     sha256: [64]u8,
     url_decoded: []const u8,
     cache_path: []const u8,
@@ -2863,21 +3126,38 @@ fn fetchPayload(
     } else |err| switch (err) {
         error.FileNotFound => {
             log.info("FETCHING         | {s} {s}", .{ url_decoded, &sha256 });
-            try fetch(progress_node, scratch, try uriFromUrlDecoded(url_decoded), cache_path, null, sha256);
+            const fetch_path = std.mem.concat(scratch, u8, &.{ cache_path, ".fetching" }) catch |e| oom(e);
+            defer scratch.free(fetch_path);
+            const actual_sha256 = try fetch(
+                progress_node,
+                scratch,
+                try uriFromUrlDecoded(url_decoded),
+                fetch_path,
+                .{},
+            );
+            if (!std.mem.eql(u8, &actual_sha256, &sha256)) {
+                std.log.err(
+                    "SHA256 mismatch:\nexpected: {s}\nactual  : {s}\n",
+                    .{ &sha256, &actual_sha256 },
+                );
+                try finishCacheFetch(scratch, cache_dir, url_decoded, actual_sha256, fetch_path);
+                std.process.exit(0xff);
+            }
+            try std.fs.cwd().rename(fetch_path, cache_path);
         },
         else => |e| return e,
     }
 }
 
-// TODO: modify fetch to support downloading multiple payloads
 fn fetch(
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
     uri: std.Uri,
     out_path: []const u8,
-    maybe_size: ?u64,
-    maybe_sha256: ?[64]u8,
-) !void {
+    opt: struct {
+        size: ?u64 = null,
+    },
+) ![64]u8 {
     log.info("fetch: {}", .{uri});
     const progress_node_name = std.fmt.allocPrint(scratch, "fetch {}", .{uri}) catch |e| oom(e);
     defer scratch.free(progress_node_name);
@@ -2897,7 +3177,6 @@ fn fetch(
     };
 
     var header_buffer: [8196]u8 = undefined;
-
     var request = try client.open(.GET, uri, .{
         .server_header_buffer = &header_buffer,
         .keep_alive = false,
@@ -2905,35 +3184,26 @@ fn fetch(
     defer request.deinit();
     try request.send();
     try request.wait();
-
     if (request.response.status != .ok) return errExit(
         "fetch '{}': HTTP response {} \"{?s}\"",
         .{ uri, @intFromEnum(request.response.status), request.response.status.phrase() },
     );
 
-    const out_path_tmp = std.mem.concat(scratch, u8, &.{ out_path, ".fetching" }) catch |e| oom(e);
-    defer scratch.free(out_path_tmp);
-
-    const file = try std.fs.cwd().createFile(out_path_tmp, .{});
-    defer {
-        if (std.fs.cwd().deleteFile(out_path_tmp)) {
-            log.info("removed '{s}'", .{out_path_tmp});
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => |e| log.err("remove '{s}' failed with {s}", .{ out_path_tmp, @errorName(e) }),
+    const file = try std.fs.cwd().createFile(out_path, .{});
+    defer file.close();
+    const maybe_expected_size = blk: {
+        if (request.response.content_length) |content_length| {
+            if (opt.size) |size| {
+                if (size != content_length) errExit(
+                    "fetch '{}': Content-Length {} != expected size {}",
+                    .{ uri, content_length, size },
+                );
+            }
+            break :blk content_length;
         }
-        file.close();
-    }
-
-    if (request.response.content_length) |content_length| {
-        if (maybe_size) |size| {
-            if (size != content_length) errExit(
-                "fetch '{}': Content-Length {} != expected size {}",
-                .{ uri, content_length, size },
-            );
-        }
-        try file.setEndPos(content_length);
-    }
+        break :blk opt.size;
+    };
+    if (maybe_expected_size) |size| try file.setEndPos(size);
 
     var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
     var total_received: u64 = 0;
@@ -2966,27 +3236,20 @@ fn fetch(
             "fetch '{}': Content-Length is {} but only read {}",
             .{ uri, content_length, total_received },
         );
-    }
+    } else if (opt.size) |size| if (total_received != size) errExit(
+        "fetch '{}': expected size {} but read {}",
+        .{ uri, size, total_received },
+    );
 
-    if (maybe_sha256) |expected_sha256| {
-        var actual_sha256: [32]u8 = undefined;
-        hasher.final(&actual_sha256);
-        var expected_bytes: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&expected_bytes, &expected_sha256) catch errExit(
-            "invalid hex in expected SHA256",
-            .{},
-        );
-        if (!std.mem.eql(u8, &actual_sha256, &expected_bytes)) {
-            var actual_hex: [64]u8 = undefined;
-            _ = std.fmt.bufPrint(&actual_hex, "{}", .{std.fmt.fmtSliceHexLower(&actual_sha256)}) catch unreachable;
-            errExit(
-                "SHA256 mismatch: expected {s}, got {s}",
-                .{ expected_sha256, actual_hex },
-            );
-        }
-    }
-
-    try std.fs.cwd().rename(out_path_tmp, out_path);
+    var actual_sha256_bytes: [32]u8 = undefined;
+    hasher.final(&actual_sha256_bytes);
+    var actual_sha256_hex: [64]u8 = undefined;
+    std.debug.assert(64 == (std.fmt.bufPrint(
+        &actual_sha256_hex,
+        "{}",
+        .{std.fmt.fmtSliceHexLower(&actual_sha256_bytes)},
+    ) catch unreachable).len);
+    return actual_sha256_hex;
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
@@ -3141,7 +3404,7 @@ fn getPackages(
     const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{}", .{json_error});
     const packages_field = file_obj.getField(&json_error, "packages") catch errExit("{}", .{json_error});
     const packages = packages_field.as(.array, &json_error) catch errExit("{}", .{json_error});
-    const out_packages = allocator.alloc(Package, packages.items.len) catch |e| oom(e);
+    const out_packages = allocator.alloc(Package, packages.items.len + extrapkgs.all.len) catch |e| oom(e);
     var out_package_count: usize = 0;
     errdefer {
         for (out_packages[0..out_package_count]) |out_package| {
@@ -3184,6 +3447,23 @@ fn getPackages(
             };
             out_package_count += 1;
         }
+
+        for (extrapkgs.all) |pkg| {
+            const id = identifyPackage(pkg.id);
+            out_packages[out_package_count] = .{
+                .id = allocator.dupe(u8, pkg.id) catch |e| oom(e),
+                .version = allocator.dupe(u8, switch (id) {
+                    .ninja => |version| version,
+                    .cmake => |version| version,
+                    else => unreachable,
+                }) catch |e| oom(e),
+                .language = .neutral,
+                .payloads_offset = payload_count,
+            };
+            out_package_count += 1;
+            payload_count += pkg.payloads.len;
+        }
+
         std.debug.assert(out_package_count == out_packages.len);
         break :payload_count_blk payload_count;
     };
@@ -3216,6 +3496,18 @@ fn getPackages(
                 };
                 out_payload_count += 1;
             }
+        }
+    }
+    for (extrapkgs.all) |pkg| {
+        for (pkg.payloads) |p| {
+            const filename = basenameFromUrl(p.url);
+            std.debug.assert(filename.len > 0);
+            out_payloads[out_payload_count] = .{
+                .url_decoded = allocator.dupe(u8, p.url) catch |e| oom(e),
+                .sha256 = p.sha256,
+                .file_name = allocator.dupe(u8, filename) catch |e| oom(e),
+            };
+            out_payload_count += 1;
         }
     }
     std.debug.assert(out_payload_count == out_payloads.len);
@@ -3369,9 +3661,11 @@ fn oom(e: error{OutOfMemory}) noreturn {
 
 const builtin = @import("builtin");
 const std = @import("std");
+const extrapkgs = @import("extrapkgs");
 const ChannelKind = @import("channelkind.zig").ChannelKind;
 const Arch = @import("arch.zig").Arch;
 const Arches = @import("arch.zig").Arches;
+const extra = @import("extra.zig");
 const LockFile = @import("LockFile.zig");
 const JsonContext = @import("JsonContext.zig");
 const StringPool = @import("StringPool.zig");
