@@ -153,7 +153,6 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const scratch = scratch_instance.allocator();
 
     const msvcup_dir: MsvcupDir = try .alloc(arena);
-    log.debug("msvcup dir '{s}'", .{msvcup_dir.root_path});
 
     const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
     defer vsman.freeConst(arena);
@@ -224,7 +223,6 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const scratch = scratch_instance.allocator();
 
     const msvcup_dir: MsvcupDir = try .alloc(arena);
-    log.debug("msvcup dir '{s}'", .{msvcup_dir.root_path});
 
     const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
     defer vsman.freeConst(arena);
@@ -317,7 +315,6 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     _ = pkg;
 
     const msvcup_dir: MsvcupDir = try .alloc(arena);
-    log.debug("msvcup dir '{s}'", .{msvcup_dir.root_path});
 
     const cache_dir: []const u8 = config.cache_dir orelse msvcup_dir.path(
         arena,
@@ -478,9 +475,6 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         lock_file: []const u8,
         manifest_update: ManifestUpdate,
         cache_dir: ?[]const u8,
-        // host_arch: Arch,
-        // target_arches: Arches,
-        // cache_dir: []const u8,
     };
     const config: Config = blk_config: {
         var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
@@ -539,20 +533,10 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 .{},
             ),
             .cache_dir = cache_dir,
-            // .host_arch = maybe_host_arch orelse errExit(
-            //     "missing cmdline arguments: --host-arch ARCH",
-            //     .{},
-            // ),
-            // .target_arches = target_arches,
-            // .cache_dir = maybe_cache_dir orelse std.fs.path.join(arena, &.{
-            //     try std.fs.getAppDataDir(arena, "msvc"),
-            //     "cache",
-            // }) catch |e| oom(e),
         };
     };
 
     const msvcup_dir: MsvcupDir = try .alloc(arena);
-    log.debug("msvcup dir '{s}'", .{msvcup_dir.root_path});
 
     if (config.msvcup_pkgs.len == 0) errExit(
         "no packages were given to install, use 'list' to list the available packages",
@@ -1609,7 +1593,7 @@ fn installPayloadZip(
                 .zip => "",
             };
             if (!std.ascii.startsWithIgnoreCase(filename, prefix)) {
-                log.info("ignore '{s}'", .{filename});
+                // log.info("ignore '{s}'", .{filename});
                 continue;
             }
             if (filename[filename.len - 1] == std.fs.path.sep) {
