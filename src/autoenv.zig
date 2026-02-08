@@ -43,7 +43,12 @@ pub fn main() !u8 {
             while (line_it.next()) |line| {
                 var scratch: std.heap.ArenaAllocator = .init(arena);
                 defer scratch.deinit();
-                try loadVcVars(scratch.allocator(), line);
+
+                const is_absolute = std.fs.path.isAbsolute(line);
+                const file_path = if (is_absolute) line else try std.fs.path.join(arena, &.{ self_exe_dir_utf8, line });
+                defer if (!is_absolute) arena.free(file_path);
+
+                try loadVcVars(scratch.allocator(), file_path);
             }
         }
         std.debug.assert(arena_instance.reset(.retain_capacity));
