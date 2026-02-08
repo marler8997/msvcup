@@ -1,15 +1,19 @@
 @setlocal enabledelayedexpansion
 
-@if %PROCESSOR_ARCHITECTURE%==AMD64 (
+@set REAL_ARCH=%PROCESSOR_ARCHITECTURE%
+@echo %PROCESSOR_IDENTIFIER% | findstr /i "ARMv8" >nul
+@if %errorlevel%==0 set REAL_ARCH=ARM64
+
+@if %REAL_ARCH%==AMD64 (
     set MSVCUP_ARCH=x86_64
     set HOST_CPU=x64
     set CMAKE_ARCH=x86_64
-) else if %PROCESSOR_ARCHITECTURE%==ARM64 (
+) else if %REAL_ARCH%==ARM64 (
     set MSVCUP_ARCH=aarch64
     set HOST_CPU=arm64
     set CMAKE_ARCH=arm64
 ) else (
-    echo error: unhandled PROCESSOR_ARCHITECTURE "%PROCESSOR_ARCHITECTURE%"
+    echo error: unhandled PROCESSOR_ARCHITECTURE "%REAL_ARCH%"
 )
 
 @if "%~1"=="-h" (
