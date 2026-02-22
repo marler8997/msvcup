@@ -468,10 +468,8 @@ const MsvcupPackage = struct {
 };
 
 fn defaultLockFile(allocator: std.mem.Allocator, install_dir: []const u8) error{OutOfMemory}![]const u8 {
-    return if (std.fs.path.dirname(install_dir)) |dir|
-        try std.fs.path.join(allocator, &.{ dir, "msvcup.lock" })
-    else
-        "msvcup.lock";
+    const dir = std.mem.trimRight(u8, install_dir, "/\\");
+    return try std.fmt.allocPrint(allocator, "{s}.lock", .{dir});
 }
 
 fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
