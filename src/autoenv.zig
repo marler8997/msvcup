@@ -15,7 +15,7 @@ pub fn main() !u8 {
 
     const self_exe_file = getImagePathName() orelse @panic("no image path name");
     const self_exe_paths = splitDirBasename(self_exe_file) orelse errExit(
-        "self exe path '{}' has no parent directory",
+        "self exe path '{f}' has no parent directory",
         .{std.unicode.fmtUtf16Le(self_exe_file)},
     );
     std.debug.assert(self_exe_paths.basename.len > 0);
@@ -54,7 +54,7 @@ pub fn main() !u8 {
         std.debug.assert(arena_instance.reset(.retain_capacity));
 
         break :blk_exe (try findExe(arena, self_exe_paths.basename)) orelse errExit(
-            "unable to find '{}' in PATH",
+            "unable to find '{f}' in PATH",
             .{std.unicode.fmtUtf16Le(self_exe_paths.basename)},
         );
     };
@@ -66,8 +66,9 @@ pub fn main() !u8 {
     //     fatal error C1090: PDB API call failed, error code '23': (0x000006BA)
     const use_job = !std.mem.eql(u16, self_exe_paths.basename, L("cl.exe"));
 
-    const CREATE_SUSPENDED = 0x00000004;
-    const create_process_flags: u32 = if (use_job) CREATE_SUSPENDED else 0;
+    const create_process_flags: win32.CreateProcessFlags = .{
+        .create_suspended = use_job,
+    };
     if (0 == win32.kernel32.CreateProcessW(
         // L(exe_basename),
         exe,
@@ -81,13 +82,13 @@ pub fn main() !u8 {
         &startup_info,
         &process_info,
     )) errExit(
-        "CreateProcess for '{s}' failed, error={}\n",
+        "CreateProcess for '{f}' failed, error={f}\n",
         .{ std.unicode.fmtUtf16Le(self_exe_paths.basename), fmtError(GetLastError()) },
     );
 
     if (use_job) {
         const job = CreateJobObjectW(null, null) orelse errExit(
-            "CreateJobObject failed, error={}",
+            "CreateJobObject failed, error={f}",
             .{fmtError(GetLastError())},
         );
 
@@ -100,7 +101,7 @@ pub fn main() !u8 {
                 &info,
                 @sizeOf(@TypeOf(info)),
             )) errExit(
-                "SetInformationJobObject failed, error={}",
+                "SetInformationJobObject failed, error={f}",
                 .{fmtError(GetLastError())},
             );
         }
@@ -109,14 +110,14 @@ pub fn main() !u8 {
             job,
             process_info.hProcess,
         )) errExit(
-            "AssignProcessToJobObject failed, error={}",
+            "AssignProcessToJobObject failed, error={f}",
             .{fmtError(GetLastError())},
         );
 
         {
             const suspend_count = ResumeThread(process_info.hThread);
             if (suspend_count == -1) return errExit(
-                "ResumeThread failed, error={}",
+                "ResumeThread failed, error={f}",
                 .{fmtError(win32.GetLastError())},
             );
         }
@@ -126,7 +127,7 @@ pub fn main() !u8 {
 
     var exit_code: u32 = undefined;
     if (0 == win32.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code)) errExit(
-        "GetExitCodeProcess failed, error={}",
+        "GetExitCodeProcess failed, error={f}",
         .{fmtError(GetLastError())},
     );
     win32.kernel32.ExitProcess(exit_code);
@@ -220,7 +221,7 @@ fn loadVcVars(scratch: std.mem.Allocator, vcvars_path: []const u8) !void {
         const current_value_len = if (get_env_result == 0) switch (GetLastError()) {
             .ENVVAR_NOT_FOUND => 0,
             else => |e| errExit(
-                "GetEnvironmentVariable '{s}' failed, error={}",
+                "GetEnvironmentVariable '{s}' failed, error={f}",
                 .{ name, fmtError(e) },
             ),
         } else get_env_result - 1;
@@ -278,7 +279,7 @@ fn loadVcVars(scratch: std.mem.Allocator, vcvars_path: []const u8) !void {
             .{ name, std.unicode.fmtUtf16Le(new_value[0 .. new_value.len - 1]) },
         );
         if (0 == SetEnvironmentVariableW(name16, @ptrCast(new_value.ptr))) errExit(
-            "SetEnvironmentVariable failed, error={}",
+            "SetEnvironmentVariable failed, error={f}",
             .{fmtError(GetLastError())},
         );
     }
@@ -288,9 +289,9 @@ fn findExe(allocator: std.mem.Allocator, exe_basename: []const u16) !?[:0]u16 {
     win32.kernel32.SetLastError(.SUCCESS);
     const len_with_null = GetEnvironmentVariableW(L("PATH"), null, 0);
     if (len_with_null == 0) switch (GetLastError()) {
-        .ENVVAR_NOT_FOUND => errExit("no PATH environment variable to find {}", .{std.unicode.fmtUtf16Le(exe_basename)}),
+        .ENVVAR_NOT_FOUND => errExit("no PATH environment variable to find {f}", .{std.unicode.fmtUtf16Le(exe_basename)}),
         else => |e| errExit(
-            "failed to get the PATH environment variable, error={}",
+            "failed to get the PATH environment variable, error={f}",
             .{fmtError(e)},
         ),
     };
@@ -317,7 +318,7 @@ fn findExe(allocator: std.mem.Allocator, exe_basename: []const u16) !?[:0]u16 {
             free_candidate = false;
             return candidate_slice;
         } else |err| switch (err) {
-            error.FileNotFound, error.PermissionDenied => {},
+            error.FileNotFound, error.AccessDenied => {},
             error.Unexpected => |e| return e,
         }
     }
@@ -337,9 +338,11 @@ fn scanPath(line: []const u8, offset: usize, limit: usize) ?struct {
 }
 
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
-    std.io.getStdErr().writer().print(fmt, args) catch |e| std.debug.panic(
-        "error {s} printing another error to stdout",
-        .{@errorName(e)},
+    var stderr_buf: [1000]u8 = undefined;
+    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    stderr.interface.print(fmt, args) catch |e| std.debug.panic(
+        "error {t} printing another error to stdout",
+        .{e},
     );
     std.process.exit(0xff);
 }
@@ -357,27 +360,14 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
 /// of 300 bytes. If the message exceeds 300 bytes (Messages can be arbitrarily
 /// long) then "..." is appended to the message.  The message may contain newlines
 /// and carriage returns but any trailing ones are trimmed.
-///
-/// Provide the 's' fmt specifier to omit the error code.
 pub fn fmtError(error_code: win32.Win32Error) FormatError(300) {
     return .{ .error_code = error_code };
 }
 pub fn FormatError(comptime max_len: usize) type {
     return struct {
         error_code: win32.Win32Error,
-        pub fn format(
-            self: @This(),
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) @TypeOf(writer).Error!void {
-            _ = options;
-            const with_code = comptime blk: {
-                if (std.mem.eql(u8, fmt, "")) break :blk true;
-                if (std.mem.eql(u8, fmt, "s")) break :blk false;
-                @compileError("expected '{}' or '{s}' but got '{" ++ fmt ++ "}'");
-            };
-            if (with_code) try writer.print("{} (", .{@intFromEnum(self.error_code)});
+        pub fn format(self: @This(), writer: *std.Io.Writer) error{WriteFailed}!void {
+            try writer.print("{} (", .{@intFromEnum(self.error_code)});
             var buf: [max_len]u8 = undefined;
             const len = FormatMessageA(
                 .{ .FROM_SYSTEM = 1, .IGNORE_INSERTS = 1 },
@@ -396,7 +386,7 @@ pub fn FormatError(comptime max_len: usize) type {
             if (len + 1 >= buf.len) {
                 try writer.writeAll("...");
             }
-            if (with_code) try writer.writeAll(")");
+            try writer.writeAll(")");
         }
     };
 }
@@ -405,11 +395,11 @@ extern "kernel32" fn GetEnvironmentVariableW(
     lpName: ?[*:0]const u16,
     lpBuffer: ?[*:0]u16,
     nSize: u32,
-) callconv(win32.WINAPI) u32;
+) callconv(.winapi) u32;
 extern "kernel32" fn SetEnvironmentVariableW(
     lpName: ?[*:0]const u16,
     lpValue: ?[*:0]const u16,
-) callconv(win32.WINAPI) win32.BOOL;
+) callconv(.winapi) win32.BOOL;
 
 const PSTR = [*:0]u8;
 extern "kernel32" fn FormatMessageA(
@@ -420,7 +410,7 @@ extern "kernel32" fn FormatMessageA(
     lpBuffer: ?PSTR,
     nSize: u32,
     Arguments: ?*?*i8,
-) callconv(win32.WINAPI) u32;
+) callconv(.winapi) u32;
 
 pub const FORMAT_MESSAGE_OPTIONS = packed struct(u32) {
     _reserved1: u8 = 0,
@@ -436,7 +426,7 @@ pub const FORMAT_MESSAGE_OPTIONS = packed struct(u32) {
 extern "kernel32" fn CreateJobObjectW(
     lpJobAttributes: ?*win32.SECURITY_ATTRIBUTES,
     lpName: ?[*:0]const u16,
-) callconv(win32.WINAPI) ?win32.HANDLE;
+) callconv(.winapi) ?win32.HANDLE;
 
 pub const JOBOBJECTINFOCLASS = enum(i32) {
     JobObjectExtendedLimitInformation = 9,
@@ -502,15 +492,15 @@ extern "kernel32" fn SetInformationJobObject(
     JobObjectInformationClass: JOBOBJECTINFOCLASS,
     lpJobObjectInformation: ?*anyopaque,
     cbJobObjectInformationLength: u32,
-) callconv(win32.WINAPI) win32.BOOL;
+) callconv(.winapi) win32.BOOL;
 
 extern "kernel32" fn AssignProcessToJobObject(
     hJob: ?win32.HANDLE,
     hProcess: ?win32.HANDLE,
-) callconv(win32.WINAPI) win32.BOOL;
+) callconv(.winapi) win32.BOOL;
 
 extern "kernel32" fn ResumeThread(
     hThread: ?win32.HANDLE,
-) callconv(win32.WINAPI) u32;
+) callconv(.winapi) u32;
 
-extern "kernel32" fn GetCommandLineW() callconv(win32.WINAPI) ?[*:0]u16;
+extern "kernel32" fn GetCommandLineW() callconv(.winapi) ?[*:0]u16;

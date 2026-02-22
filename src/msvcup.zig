@@ -64,7 +64,9 @@ pub fn main() !u8 {
 
 fn usage(arena: std.mem.Allocator) !noreturn {
     const msvcup_dir: MsvcupDir = try .alloc(arena);
-    try std.io.getStdErr().writer().print(
+    var stderr_buf: [1000]u8 = undefined;
+    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    stderr.interface.print(
         \\msvcup version {[version]s}
         \\
         \\Usage: msvcup COMMAND ARGS...
@@ -94,7 +96,8 @@ fn usage(arena: std.mem.Allocator) !noreturn {
             .version = @embedFile("version"),
             .install_dir = msvcup_dir.root_path,
         },
-    );
+    ) catch return stderr.err.?;
+    stderr.interface.flush() catch return stderr.err.?;
     std.process.exit(0xff);
 }
 
@@ -201,12 +204,14 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         }
     }
 
-    var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
-    try bw.writer().writeAll("autoenv\n");
+    var stdout_buf: [2000]u8 = undefined;
+    const stdout = std.fs.File.stdout().writer(&stdout_buf);
+    const w = &stdout.interface;
+    w.writeAll("autoenv\n") catch return stdout.err.?;
     for (msvcup_pkgs.items) |msvcup_pkg| {
-        try bw.writer().print("{}\n", .{msvcup_pkg});
+        w.print("{}\n", .{msvcup_pkg}) catch return stdout.err.?;
     }
-    try bw.flush();
+    w.flush() catch return stdout.err.?;
     return 0;
 }
 
@@ -258,7 +263,9 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         }
     }
 
-    var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
+    var buf: [8192]u8 = undefined;
+    const stdout = std.io.getStdOut();
+    var bw = stdout.writer(&buf);
     for (payload_indices.items) |payload_index| {
         const pkg_index = pkgs.pkgIndexFromPayloadIndex(payload_index);
         const payload = &pkgs.payloads[payload_index.int()];
@@ -332,7 +339,8 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
         const sha256 = try fetch(root_node, scratch, uri, cache_path, .{});
         try finishCacheFetch(scratch, cache_dir, config.url, sha256, cache_path);
-        try std.io.getStdOut().writer().print("{f}", .{sha256});
+        var buf: [8192]u8 = undefined;
+        try std.io.getStdOut().writer(&buf).print("{f}", .{sha256});
         try std.io.getStdOut().writer().writeAll("\n");
     }
     return 0;
@@ -364,15 +372,8 @@ const Sha = struct {
         std.debug.assert(64 == (std.fmt.bufPrint(&buf, "{f}", .{sha}) catch unreachable).len);
         return buf;
     }
-    pub fn format(
-        value: Sha,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{f}", .{std.fmt.fmtSliceHexLower(&value.bytes)});
+    pub fn format(value: Sha, writer: *std.Io.Writer) error{WriteFailed}!void {
+        try writer.print("{x}", .{&value.bytes});
     }
 };
 
@@ -455,15 +456,8 @@ const MsvcupPackage = struct {
             .eq => orderDottedNumeric({}, lhs.version.slice, rhs.version.slice),
         };
     }
-    pub fn format(
-        self: MsvcupPackage,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{s}-{s}", .{ @tagName(self.kind), self.version.slice });
+    pub fn format(self: MsvcupPackage, writer: *std.Io.Writer) error{WriteFailed}!void {
+        try writer.print("{t}-{s}", .{ self.kind, self.version.slice });
     }
 };
 
@@ -592,7 +586,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 config.autoenv,
                 config.msvcup_pkgs,
             )) |mismatch| {
-                std.log.info("{}", .{mismatch});
+                std.log.info("{f}", .{mismatch});
             } else {
                 const result = try installFromLockFile(
                     scratch,
@@ -771,14 +765,7 @@ const LockFileMismatch = union(enum) {
     autoenv: bool, // lockfile value
     missing_pkg: MsvcupPackage,
     extra_pkg: MsvcupPackage,
-    pub fn format(
-        self: LockFileMismatch,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: LockFileMismatch, writer: *std.Io.Writer) error{WriteFailed}!void {
         switch (self) {
             .msvc => |v| try writer.print(
                 "lock file is for msvc version '{s}' but '{s}' was requested",
@@ -788,8 +775,8 @@ const LockFileMismatch = union(enum) {
                 "lock file {s} autoenv",
                 .{@as([]const u8, if (lockfile_value) "has" else "does not have")},
             ),
-            .missing_pkg => |pkg| try writer.print("lock file is missing package '{}'", .{pkg}),
-            .extra_pkg => |pkg| try writer.print("lock file has extra package '{}' that was not given on cmdline", .{pkg}),
+            .missing_pkg => |pkg| try writer.print("lock file is missing package '{f}'", .{pkg}),
+            .extra_pkg => |pkg| try writer.print("lock file has extra package '{f}' that was not given on cmdline", .{pkg}),
         }
     }
 };
@@ -964,7 +951,7 @@ fn parseLockFileLine(
                 .{ lock_file_path, lineno },
             );
             if (maybe_msvcup_pkg) |p| errExit(
-                "{s}:{}: cab payloads should not have an associated msvcup package ('{}' in this case)",
+                "{s}:{}: cab payloads should not have an associated msvcup package ('{f}' in this case)",
                 .{ lock_file_path, lineno, p },
             );
             return .{ .payload = .{
@@ -1028,8 +1015,8 @@ fn installFromLockFile(
                     if (version_ref.*) |v| {
                         if (!v.eql(payload_msvcup_pkg.version)) {
                             errExit(
-                                "lock file contains multiple {s} package versions ('{f}' and '{f}')",
-                                .{ @tagName(payload_msvcup_pkg.kind), v, payload_msvcup_pkg.version },
+                                "lock file contains multiple {t} package versions ('{f}' and '{f}')",
+                                .{ payload_msvcup_pkg.kind, v, payload_msvcup_pkg.version },
                             );
                         }
                     } else {
@@ -1297,7 +1284,7 @@ const CacheEntry = struct {
         sha256: Sha,
         name: []const u8,
     ) CacheEntry {
-        const cache_basename = std.fmt.allocPrint(scratch, "{s}-{s}", .{ sha256, name }) catch |e| oom(e);
+        const cache_basename = std.fmt.allocPrint(scratch, "{f}-{s}", .{ sha256, name }) catch |e| oom(e);
         defer scratch.free(cache_basename);
         const path = std.fs.path.join(allocator, &.{ cache_dir, cache_basename }) catch |e| oom(e);
         const new_basename = path[path.len - cache_basename.len ..];
@@ -1347,7 +1334,7 @@ fn installPayload(
     const installed_manifest_path = std.fs.path.join(scratch, &.{ install_dir_path, "install", installed_basename }) catch |e| oom(e);
     defer scratch.free(installed_manifest_path);
     if (std.fs.cwd().access(installed_manifest_path, .{})) {
-        log.info("ALREADY INSTALLED | {s} {s}", .{ basenameFromUrl(url_decoded), &sha256 });
+        log.info("ALREADY INSTALLED | {s} {f}", .{ basenameFromUrl(url_decoded), sha256 });
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -1781,7 +1768,7 @@ pub fn deleteTree(dir: std.fs.Dir, sub_path: []const u8) !void {
             switch (err) {
                 error.FileBusy => {
                     std.log.warn("path '{s}' is busy (attempt {}), will retry", .{ sub_path, attempt });
-                    std.time.sleep(std.time.ns_per_ms * 100); // sleep for 100 ms
+                    std.Thread.sleep(std.time.ns_per_ms * 100); // sleep for 100 ms
                 },
                 else => |e| return e,
             }
@@ -1849,7 +1836,8 @@ fn endInstall(
     {
         const installed_manifest = try std.fs.cwd().createFile(installed_manifest_path_tmp, .{});
         defer installed_manifest.close();
-        var bw = std.io.bufferedWriter(installed_manifest.writer());
+        var buf: [8192]u8 = undefined;
+        var bw = installed_manifest.writer(&buf);
 
         const content = blk: {
             const current_install_file = try std.fs.cwd().openFile(current_install_path, .{});
@@ -2305,7 +2293,8 @@ fn updateLockFile(
     if (std.fs.path.dirname(lock_file_path)) |dir| try std.fs.cwd().makePath(dir);
     const lock_file = try std.fs.cwd().createFile(lock_file_path, .{});
     defer lock_file.close();
-    var bw = std.io.bufferedWriter(lock_file.writer());
+    var buf: [8192]u8 = undefined;
+    var bw = lock_file.writer(&buf);
     // try bw.writer().print("msvc {s}\n", .{msvc_version});
     // for (sdk_versions) |sdk_version| {
     //     try bw.writer().print("sdk {s}\n", .{sdk_version});
@@ -2809,28 +2798,28 @@ fn vsManifestPayloadFromChManifest(
     defer parsed.deinit();
     const json_file: JsonContext.File = .{ .file_path = chman.path };
     var json_error: JsonContext.Error = undefined;
-    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{}", .{json_error});
-    const channel_items_field = file_obj.getField(&json_error, "channelItems") catch errExit("{}", .{json_error});
-    const channel_items = channel_items_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{f}", .{json_error});
+    const channel_items_field = file_obj.getField(&json_error, "channelItems") catch errExit("{f}", .{json_error});
+    const channel_items = channel_items_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
     const payload = blk: {
         const vs_manifest_channel_id = switch (channel_kind) {
             .release => "Microsoft.VisualStudio.Manifests.VisualStudio",
             .preview => "Microsoft.VisualStudio.Manifests.VisualStudioPreview",
         };
         for (0..channel_items.items.len) |index| {
-            const channel_item_element = channel_items.getElement(&json_error, index) catch errExit("{}", .{json_error});
-            const channel_item = channel_item_element.as(.object, &json_error) catch errExit("{}", .{json_error});
-            const id_field = channel_item.getField(&json_error, "id") catch errExit("{}", .{json_error});
-            const id = id_field.as(.string, &json_error) catch errExit("{}", .{json_error});
+            const channel_item_element = channel_items.getElement(&json_error, index) catch errExit("{f}", .{json_error});
+            const channel_item = channel_item_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
+            const id_field = channel_item.getField(&json_error, "id") catch errExit("{f}", .{json_error});
+            const id = id_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
             if (std.mem.eql(u8, id, vs_manifest_channel_id)) {
-                const payloads_field = channel_item.getField(&json_error, "payloads") catch errExit("{}", .{json_error});
-                const payloads = payloads_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+                const payloads_field = channel_item.getField(&json_error, "payloads") catch errExit("{f}", .{json_error});
+                const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
                 if (payloads.items.len != 1) errExit(
                     "{s}: channelItem with id \"{s}\" has {} payloads instead of 1",
                     .{ chman.path, id, payloads.items.len },
                 );
                 const payload_element = payloads.getElement(&json_error, 0) catch unreachable;
-                const payload_object = payload_element.as(.object, &json_error) catch errExit("{}", .{json_error});
+                const payload_object = payload_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
                 break :blk PayloadJson.init(payload_object);
             }
         }
@@ -2855,16 +2844,16 @@ const PayloadJson = struct {
         var err: JsonContext.Error = undefined;
 
         const file_name = blk: {
-            const field = obj.getField(&err, "fileName") catch errExit("{}", .{err});
-            break :blk field.as(.string, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "fileName") catch errExit("{f}", .{err});
+            break :blk field.as(.string, &err) catch errExit("{f}", .{err});
         };
         const sha256: Sha = blk: {
-            const field = obj.getField(&err, "sha256") catch errExit("{}", .{err});
-            const str = field.as(.string, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "sha256") catch errExit("{f}", .{err});
+            const str = field.as(.string, &err) catch errExit("{f}", .{err});
             if (str.len != 64) {
                 const file_path: []const u8 = if (obj.parent_context.getFilePath()) |p| p else "?";
                 errExit(
-                    "{s}: {} value '{s}' is {} chars but expected 64",
+                    "{s}: {f} value '{s}' is {} chars but expected 64",
                     .{ file_path, field, str, str.len },
                 );
             }
@@ -2875,20 +2864,20 @@ const PayloadJson = struct {
             };
         };
         const size: u63 = blk: {
-            const field = obj.getField(&err, "size") catch errExit("{}", .{err});
-            const size = field.as(.integer, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "size") catch errExit("{f}", .{err});
+            const size = field.as(.integer, &err) catch errExit("{f}", .{err});
             if (size < 0) {
                 const file_path: []const u8 = if (obj.parent_context.getFilePath()) |p| p else "?";
                 errExit(
-                    "{s}: {} size {} is negative",
+                    "{s}: {f} size {} is negative",
                     .{ file_path, field, size },
                 );
             }
             break :blk @intCast(size);
         };
         const url = blk: {
-            const field = obj.getField(&err, "url") catch errExit("{}", .{err});
-            break :blk field.as(.string, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "url") catch errExit("{f}", .{err});
+            break :blk field.as(.string, &err) catch errExit("{f}", .{err});
         };
 
         return .{
@@ -3070,7 +3059,7 @@ fn resolveChannelManifestUrlToFile(
     out_path: []const u8,
 ) !void {
     // TODO: progres report
-    log.info("resolving URL '{}'...", .{uri});
+    log.info("resolving URL '{f}'...", .{uri});
 
     var client = std.http.Client{ .allocator = scratch };
     defer client.deinit();
@@ -3080,43 +3069,44 @@ fn resolveChannelManifestUrlToFile(
         error.UnexpectedCharacter,
         error.InvalidFormat,
         error.InvalidPort,
-        error.HttpProxyMissingHost,
+        error.UriMissingHost,
+        error.UriHostTooLong,
         => |e| errExit("init proxy failed with {s}", .{@errorName(e)}),
     };
-    var header_buffer: [8196]u8 = undefined;
-
-    var request = try client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .keep_alive = false,
-        .redirect_behavior = .not_allowed,
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
     });
-    defer request.deinit();
-    try request.send();
-    request.wait() catch |err| switch (err) {
-        error.TooManyHttpRedirects => {
-            if (request.response.location) |redirect_url| {
-                _ = std.Uri.parse(redirect_url) catch |e| errExit(
-                    "failed to parse the redirect url '{s}' with {s}",
-                    .{ redirect_url, @errorName(e) },
-                );
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // TODO: don't download directly to this file, download to a temp file and rename
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                const out_file = try std.fs.cwd().createFile(out_path, .{});
-                defer out_file.close();
-                try out_file.writer().writeAll(redirect_url);
-                return;
-            }
+    defer req.deinit();
+
+    try req.sendBodiless();
+    var redirect_buffer: [8192]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+
+    // Check if we got a redirect response
+    const status_code = @intFromEnum(response.head.status);
+    if (status_code >= 300 and status_code < 400) {
+        // Handle redirect - extract Location header and write to file
+        const location = response.head.location orelse
             errExit("redirect response missing Location header", .{});
-        },
-        else => |e| return e,
-    };
-    errExit("GET '{s}' HTTP status {} \"{s}\"", .{
+        _ = std.Uri.parse(location) catch |e| errExit(
+            "failed to parse the redirect url '{s}' with {s}",
+            .{ location, @errorName(e) },
+        );
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // TODO: don't download directly to this file, download to a temp file and rename
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        const out_file = try std.fs.cwd().createFile(out_path, .{});
+        defer out_file.close();
+        try out_file.writeAll(location);
+        return;
+    }
+
+    errExit("GET '{f}' HTTP status {} \"{s}\"", .{
         uri,
-        @intFromEnum(request.response.status),
-        request.response.status.phrase() orelse "",
+        @intFromEnum(response.head.status),
+        response.head.status.phrase() orelse "",
     });
 }
 
@@ -3198,8 +3188,8 @@ fn fetch(
         size: ?u64 = null,
     },
 ) !Sha {
-    log.info("fetch: {}", .{uri});
-    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {}", .{uri}) catch |e| oom(e);
+    log.info("fetch: {f}", .{uri});
+    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {f}", .{uri}) catch |e| oom(e);
     defer scratch.free(progress_node_name);
     const node = progress_node.start(progress_node_name, 1);
     defer node.end();
@@ -3212,30 +3202,31 @@ fn fetch(
         error.UnexpectedCharacter,
         error.InvalidFormat,
         error.InvalidPort,
-        error.HttpProxyMissingHost,
+        error.UriMissingHost,
+        error.UriHostTooLong,
         => |e| errExit("init proxy failed with {s}", .{@errorName(e)}),
     };
 
-    var header_buffer: [8196]u8 = undefined;
-    var request = try client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .keep_alive = false,
-    });
-    defer request.deinit();
-    try request.send();
-    try request.wait();
-    if (request.response.status != .ok) return errExit(
-        "fetch '{}': HTTP response {} \"{?s}\"",
-        .{ uri, @intFromEnum(request.response.status), request.response.status.phrase() },
+    var req = try client.request(.GET, uri, .{});
+    defer req.deinit();
+
+    try req.sendBodiless();
+    var redirect_buffer: [8192]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+
+    if (response.head.status != .ok) return errExit(
+        "fetch '{f}': HTTP response {} \"{?s}\"",
+        .{ uri, @intFromEnum(response.head.status), response.head.status.phrase() },
     );
 
     const file = try std.fs.cwd().createFile(out_path, .{});
     defer file.close();
+
     const maybe_expected_size = blk: {
-        if (request.response.content_length) |content_length| {
+        if (response.head.content_length) |content_length| {
             if (opt.size) |size| {
                 if (size != content_length) errExit(
-                    "fetch '{}': Content-Length {} != expected size {}",
+                    "fetch '{f}': Content-Length {} != expected size {}",
                     .{ uri, content_length, size },
                 );
             }
@@ -3245,39 +3236,47 @@ fn fetch(
     };
     if (maybe_expected_size) |size| try file.setEndPos(size);
 
+    var transfer_buffer: [8192]u8 = undefined;
+    const body_reader = response.request.reader.bodyReader(
+        &transfer_buffer,
+        response.head.transfer_encoding,
+        response.head.content_length,
+    );
+
     var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
     var total_received: u64 = 0;
 
+    // Read and write body in chunks
     while (true) {
-        var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
-        const len = request.reader().read(&buf) catch |e| std.debug.panic(
-            "fetch '{}': read failed with {s}",
-            .{ uri, @errorName(e) },
-        );
-        if (len == 0) break;
-        total_received += len;
-        if (request.response.content_length) |content_length| {
+        // Fill the body_reader buffer
+        body_reader.fillMore() catch |err| switch (err) {
+            error.ReadFailed => break,
+            else => |e| return e,
+        };
+
+        const buffered = body_reader.buffered();
+        if (buffered.len == 0) break;
+
+        total_received += buffered.len;
+        if (response.head.content_length) |content_length| {
             if (total_received > content_length) errExit(
-                "fetch '{}': read more than Content-Length ({})",
+                "fetch '{f}': read more than Content-Length ({})",
                 .{ uri, content_length },
             );
         }
-        hasher.update(buf[0..len]);
-        // NOTE: not going through a buffered writer since we're writing
-        //       large chunks
-        file.writer().writeAll(buf[0..len]) catch |err| std.debug.panic(
-            "fetch '{}': write {} bytes of HTTP response failed with {s}",
-            .{ uri, len, @errorName(err) },
-        );
+
+        hasher.update(buffered);
+        try file.writeAll(buffered);
+        body_reader.toss(buffered.len);
     }
 
-    if (request.response.content_length) |content_length| {
+    if (response.head.content_length) |content_length| {
         if (total_received != content_length) errExit(
-            "fetch '{}': Content-Length is {} but only read {}",
+            "fetch '{f}': Content-Length is {} but only read {}",
             .{ uri, content_length, total_received },
         );
     } else if (opt.size) |size| if (total_received != size) errExit(
-        "fetch '{}': expected size {} but read {}",
+        "fetch '{f}': expected size {} but read {}",
         .{ uri, size, total_received },
     );
 
@@ -3435,9 +3434,9 @@ fn getPackages(
     defer parsed.deinit();
     const json_file: JsonContext.File = .{ .file_path = vsman.path };
     var json_error: JsonContext.Error = undefined;
-    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{}", .{json_error});
-    const packages_field = file_obj.getField(&json_error, "packages") catch errExit("{}", .{json_error});
-    const packages = packages_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{f}", .{json_error});
+    const packages_field = file_obj.getField(&json_error, "packages") catch errExit("{f}", .{json_error});
+    const packages = packages_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
     const out_packages = allocator.alloc(Package, packages.items.len + extrapkgs.all.len) catch |e| oom(e);
     var out_package_count: usize = 0;
     errdefer {
@@ -3450,15 +3449,15 @@ fn getPackages(
     const payload_count: usize = payload_count_blk: {
         var payload_count: usize = 0;
         for (0..packages.items.len) |pkg_index| {
-            const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{}", .{json_error});
-            const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{}", .{json_error});
-            const id_field = pkg_obj.getField(&json_error, "id") catch errExit("{}", .{json_error});
-            const id = id_field.as(.string, &json_error) catch errExit("{}", .{json_error});
-            const version_field = pkg_obj.getField(&json_error, "version") catch errExit("{}", .{json_error});
-            const version = version_field.as(.string, &json_error) catch errExit("{}", .{json_error});
+            const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{f}", .{json_error});
+            const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
+            const id_field = pkg_obj.getField(&json_error, "id") catch errExit("{f}", .{json_error});
+            const id = id_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
+            const version_field = pkg_obj.getField(&json_error, "version") catch errExit("{f}", .{json_error});
+            const version = version_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
             const language: Language = language_blk: {
                 const language_field = pkg_obj.getOptionalField("language") orelse break :language_blk .neutral;
-                const language = language_field.as(.string, &json_error) catch errExit("{}", .{json_error});
+                const language = language_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
                 const en_us = "en-US";
                 if (std.mem.eql(u8, language, "neutral")) break :language_blk .neutral;
                 if (std.mem.eql(u8, language, en_us)) break :language_blk .en_us;
@@ -3469,7 +3468,7 @@ fn getPackages(
             const payloads_offset = payload_count;
             if (pkg_obj.map.get("payloads")) |payloads_field_node| {
                 const payloads_field: JsonContext.Field = .init(pkg_obj.parent_context, "payloads", payloads_field_node);
-                const payloads = payloads_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+                const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
                 payload_count += payloads.items.len;
             }
             out_packages[pkg_index] = .{
@@ -3513,15 +3512,15 @@ fn getPackages(
 
     for (0..packages.items.len) |pkg_index| {
         std.debug.assert(out_packages[pkg_index].payloads_offset == out_payload_count);
-        const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{}", .{json_error});
-        const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{}", .{json_error});
+        const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{f}", .{json_error});
+        const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
         if (pkg_obj.map.get("payloads")) |payloads_field_node| {
             const payloads_field: JsonContext.Field = .init(pkg_obj.parent_context, "payloads", payloads_field_node);
-            const payloads = payloads_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+            const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
             // payload_count += payloads.items.len;
             for (0..payloads.items.len) |payload_index| {
-                const payload_element = payloads.getElement(&json_error, payload_index) catch errExit("{}", .{json_error});
-                const payload_object = payload_element.as(.object, &json_error) catch errExit("{}", .{json_error});
+                const payload_element = payloads.getElement(&json_error, payload_index) catch errExit("{f}", .{json_error});
+                const payload_object = payload_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
                 const payload_json = PayloadJson.init(payload_object);
                 out_payloads[out_payload_count] = .{
                     .url_decoded = allocUrlPercentDecoded(allocator, payload_json.url) catch |e| oom(e),
