@@ -136,9 +136,11 @@ fn ci(
     const zip_dep = b.dependency("zipcmdline", .{});
     const host_zip_exe = b.addExecutable(.{
         .name = "zip",
-        .root_source_file = zip_dep.path("src/zip.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
+        .root_module = b.createModule(.{
+            .root_source_file = zip_dep.path("src/zip.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
     });
 
     const ci_targets = [_][]const u8{

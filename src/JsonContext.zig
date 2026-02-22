@@ -12,14 +12,7 @@ fn formatParent(self: *const JsonContext, writer: std.io.AnyWriter) anyerror!voi
     if (self.parent) |p| try p.formatParent(writer);
     try self.format_fn(self, writer, .parent);
 }
-pub fn format(
-    self: *const JsonContext,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: std.io.AnyWriter,
-) !void {
-    _ = fmt;
-    _ = options;
+pub fn format(self: *const JsonContext, writer: *std.Io.Writer) !void {
     if (self.parent) |p| try p.formatParent(writer);
     try self.format_fn(self, writer, .self);
 }
@@ -139,28 +132,21 @@ pub const Error = struct {
         self.* = .{ .context = context, .payload = payload };
         return error.Json;
     }
-    pub fn format(
-        self: Error,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: std.io.AnyWriter,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Error, writer: *std.Io.Writer) error{WriteFailed}!void {
         if (self.context.getFilePath()) |file_path| {
             try writer.print("{s}: ", .{file_path});
         }
         switch (self.payload) {
             .unexpected_type => |u| try writer.print(
-                "at {}, expected {s} but got {s}",
+                "at {f}, expected {s} but got {s}",
                 .{ self.context, u.expected.an(), u.actual.an() },
             ),
             .missing_field => |name| try writer.print(
-                "{} is missing field '{s}'",
+                "{f} is missing field '{s}'",
                 .{ self.context, name },
             ),
             .array_index_out_of_bounds => |index| try writer.print(
-                "index {} is out of bounds for {}",
+                "index {} is out of bounds for {f}",
                 .{ index, self.context },
             ),
         }
@@ -245,15 +231,8 @@ pub const Field = struct {
         return json_type.contextFromValue(out_err, &self.context, self.value);
     }
 
-    pub fn format(
-        self: *const Field,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: std.io.AnyWriter,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{}", .{&self.context});
+    pub fn format(self: *const Field, writer: *std.Io.Writer) error{WriteFailed}!void {
+        try writer.print("{f}", .{&self.context});
     }
 
     fn getFilePath2(context: *const JsonContext) ?[]const u8 {
