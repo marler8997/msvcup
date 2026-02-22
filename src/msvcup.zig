@@ -55,7 +55,6 @@ pub fn main() !u8 {
         break :cmd_args_blk .{ cmd, all_args[0 .. all_args.len - 1] };
     };
     if (std.mem.eql(u8, cmd, "install")) return install(arena, args);
-    if (std.mem.eql(u8, cmd, "autoenv")) return autoenv(arena, args);
     if (std.mem.eql(u8, cmd, "list")) return listCommand(arena, args);
     if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(arena, args);
     if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(arena, args);
@@ -74,15 +73,12 @@ fn usage(arena: std.mem.Allocator) !noreturn {
         \\--------------------------------------------------------------------------------
         \\
         \\  list                      | List all PKGS.
-        \\  install PKGS...           | Install the given PKGS, which are of the form:
+        \\  install DIR PKGS...       | Install the given PKGS to the given DIR. PKGS are
+        \\                            | are of the form:
         \\                            |
         \\                            |      <PKG_NAME>-<VERSION>
         \\                            |
         \\                            | installed to {[install_dir]s}.
-        \\  autoenv                   | Creates a directory of executable wrappers that
-        \\      --target-cpu  CPU     | work without being inside a build environment.
-        \\      --out-dir PATH        |
-        \\      PKGS...               |
         \\  list-payloads             | List all the payloads.
         \\
         \\InstallOptions:
@@ -206,6 +202,7 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 
     var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
+    try bw.writer().writeAll("autoenv\n");
     for (msvcup_pkgs.items) |msvcup_pkg| {
         try bw.writer().print("{}\n", .{msvcup_pkg});
     }
@@ -428,9 +425,11 @@ const MsvcupPackage = struct {
     }
     pub fn fromString(pkg: []const u8) union(enum) {
         ok: MsvcupPackage,
+        autoenv,
         unknown_name,
         invalid_version: []const u8,
     } {
+        if (std.mem.eql(u8, pkg, "autoenv")) return .autoenv;
         const kind: MsvcupPackageKind, const version: []const u8 = blk: {
             if (startsWith(u8, pkg, "msvc-")) |version| break :blk .{ .msvc, version };
             if (startsWith(u8, pkg, "sdk-")) |version| break :blk .{ .sdk, version };
@@ -468,15 +467,25 @@ const MsvcupPackage = struct {
     }
 };
 
+fn defaultLockFile(allocator: std.mem.Allocator, install_dir: []const u8) error{OutOfMemory}![]const u8 {
+    return if (std.fs.path.dirname(install_dir)) |dir|
+        try std.fs.path.join(allocator, &.{ dir, "msvcup.lock" })
+    else
+        "msvcup.lock";
+}
+
 fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const Config = struct {
+        install_dir: []const u8,
+        autoenv: bool,
         msvcup_pkgs: []const MsvcupPackage,
-        // install_dir: []const u8,
         lock_file: []const u8,
         manifest_update: ManifestUpdate,
         cache_dir: ?[]const u8,
     };
     const config: Config = blk_config: {
+        var maybe_install_dir: ?[]const u8 = null;
+        var autoenv: bool = false;
         var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
         var maybe_lock_file: ?[]const u8 = null;
         var maybe_manifest_update: ?ManifestUpdate = null;
@@ -486,17 +495,18 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         while (arg_index < args.len) : (arg_index += 1) {
             const arg = args[arg_index];
             if (!std.mem.startsWith(u8, arg, "-")) {
-                switch (MsvcupPackage.fromString(arg)) {
-                    .ok => |pkg| {
-                        insertSorted(
-                            MsvcupPackage,
-                            arena,
-                            &msvcup_pkgs,
-                            pkg,
-                            {},
-                            MsvcupPackage.order,
-                        ) catch |e| oom(e);
-                    },
+                if (maybe_install_dir == null) {
+                    maybe_install_dir = arg;
+                } else switch (MsvcupPackage.fromString(arg)) {
+                    .ok => |pkg| insertSorted(
+                        MsvcupPackage,
+                        arena,
+                        &msvcup_pkgs,
+                        pkg,
+                        {},
+                        MsvcupPackage.order,
+                    ) catch |e| oom(e),
+                    .autoenv => autoenv = true,
                     .unknown_name => errExit("unknown package '{s}'", .{arg}),
                     .invalid_version => |v| errExit("package '{s}' has invalid version '{s}'", .{ arg, v }),
                 }
@@ -522,12 +532,16 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
             std.debug.assert(.lt == MsvcupPackage.order({}, msvcup_pkgs.items[i - 1], msvcup_pkgs.items[i]));
         };
 
+        const install_dir = maybe_install_dir orelse errExit(
+            "cmdline missing DIR to install to",
+            .{},
+        );
+
         break :blk_config .{
+            .install_dir = install_dir,
+            .autoenv = autoenv,
             .msvcup_pkgs = msvcup_pkgs.toOwnedSlice(arena) catch |e| oom(e),
-            .lock_file = maybe_lock_file orelse errExit(
-                "missing cmdline arguments: --lock-file PATH",
-                .{},
-            ),
+            .lock_file = maybe_lock_file orelse try defaultLockFile(arena, install_dir),
             .manifest_update = maybe_manifest_update orelse errExit(
                 "missing one of --manifest-update-off, --manifest-update-daily or --manifest-update-always",
                 .{},
@@ -574,14 +588,18 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
             }
         };
         if (maybe_lock_file_content) |content| {
-            if (checkLockFilePkgs(config.lock_file, content, config.msvcup_pkgs)) |mismatch| {
+            if (checkLockFilePkgs(
+                config.lock_file,
+                content,
+                config.autoenv,
+                config.msvcup_pkgs,
+            )) |mismatch| {
                 std.log.info("{}", .{mismatch});
             } else {
                 const result = try installFromLockFile(
                     scratch,
                     root_node,
-                    config.msvcup_pkgs,
-                    msvcup_dir,
+                    config.install_dir,
                     cache_dir,
                     config.lock_file,
                     content,
@@ -606,6 +624,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     try updateLockFile(
         scratch,
         root_node,
+        config.autoenv,
         config.msvcup_pkgs,
         config.lock_file,
         pkgs,
@@ -622,15 +641,19 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         break :blk try lock_file.readToEndAlloc(arena, std.math.maxInt(usize));
     };
 
-    if (checkLockFilePkgs(config.lock_file, lock_file_content, config.msvcup_pkgs)) |mismatch| errExit(
-        "lock file '{s}' still doesn't match what we're installing even after it's been udpated: {s}",
+    if (checkLockFilePkgs(
+        config.lock_file,
+        lock_file_content,
+        config.autoenv,
+        config.msvcup_pkgs,
+    )) |mismatch| errExit(
+        "lock file '{s}' still doesn't match what we're installing even after it's been updated: {s}",
         .{ config.lock_file, mismatch },
     );
     switch (try installFromLockFile(
         scratch,
         root_node,
-        config.msvcup_pkgs,
-        msvcup_dir,
+        config.install_dir,
         cache_dir,
         config.lock_file,
         lock_file_content,
@@ -669,136 +692,67 @@ const sdk_tools = [_]Tool{
     .{ .name = "mt", .cmake_names = &.{"MT"} },
 };
 
-fn autoenv(arena: std.mem.Allocator, args: []const []const u8) !u8 {
-    const Config = struct {
-        target_cpu: Arch,
-        out_dir: []const u8,
-        pkgs: []const MsvcupPackage,
-    };
-    const config: Config = blk_config: {
-        var maybe_target_cpu: ?Arch = null;
-        var maybe_out_dir: ?[]const u8 = null;
-        var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
+fn updateAutoenv(
+    scratch: std.mem.Allocator,
+    install_path: []const u8,
+    unique_pkgs: *const UniquePackages,
+) !void {
+    const autoenv_path = try std.fs.path.join(scratch, &.{ install_path, "autoenv" });
+    defer scratch.free(autoenv_path);
 
-        var arg_index: usize = 0;
-        while (arg_index < args.len) : (arg_index += 1) {
-            const arg = args[arg_index];
-            if (!std.mem.startsWith(u8, arg, "-")) {
-                switch (MsvcupPackage.fromString(arg)) {
-                    .ok => |pkg| {
-                        insertSorted(
-                            MsvcupPackage,
-                            arena,
-                            &msvcup_pkgs,
-                            pkg,
-                            {},
-                            MsvcupPackage.order,
-                        ) catch |e| oom(e);
-                    },
-                    .unknown_name => errExit("unknown package '{s}'", .{arg}),
-                    .invalid_version => |v| errExit("package '{s}' has invalid version '{s}'", .{ arg, v }),
-                }
-            } else if (std.mem.eql(u8, arg, "--target-cpu")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--target_cpu missing argument", .{});
-                const target_cpu_str = args[arg_index];
-                maybe_target_cpu = Arch.fromString(target_cpu_str) orelse errExit(
-                    "invalid --target-cpu '{s}'",
-                    .{target_cpu_str},
-                );
-            } else if (std.mem.eql(u8, arg, "--out-dir")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--out-dir missing argument", .{});
-                maybe_out_dir = args[arg_index];
-            } else errExit("unknown cmdline argument '{s}'", .{arg});
-        }
-
-        break :blk_config .{
-            .target_cpu = maybe_target_cpu orelse errExit(
-                "missing cmdline arguments: --target-cpu CPU",
-                .{},
-            ),
-            .out_dir = maybe_out_dir orelse errExit(
-                "missing cmdline arguments: --out-dir PATH",
-                .{},
-            ),
-            .pkgs = msvcup_pkgs.toOwnedSlice(arena) catch |e| oom(e),
-        };
-    };
-
-    var out_dir = try std.fs.cwd().makeOpenPath(config.out_dir, .{});
-    defer out_dir.close();
-
-    var maybe_msvc_version: ?StringPool.Val = null;
-    var maybe_sdk_version: ?StringPool.Val = null;
-
-    {
-        var env_file = try out_dir.createFile("env", .{});
-        defer env_file.close();
-        var bw_env_file = std.io.bufferedWriter(env_file.writer());
-        for (config.pkgs) |pkg| {
-            switch (pkg.kind) {
-                .msvc => {
-                    if (maybe_msvc_version) |_| errExit("you can't specify multiple msvc packages", .{});
-                    maybe_msvc_version = pkg.version;
-                },
-                .sdk => {
-                    if (maybe_sdk_version) |_| errExit("you can't specify multiple sdk packages", .{});
-                    maybe_sdk_version = pkg.version;
-                },
-                .msbuild => {},
-                .diasdk => {},
-                .ninja => continue,
-                .cmake => continue,
-            }
-            const vcvars_path = try std.fmt.allocPrint(
-                arena,
-                "C:\\msvcup\\{s}\\vcvars-{s}.bat",
-                .{ pkg, @tagName(config.target_cpu) },
-            );
-            defer arena.free(vcvars_path);
-            std.fs.accessAbsolute(vcvars_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => errExit(
-                    "package '{s}' has no vcvars file '{s}'",
-                    .{ pkg, vcvars_path },
-                ),
-                else => |e| return e,
-            };
-
-            try bw_env_file.writer().print("{s}\n", .{vcvars_path});
-        }
-        try bw_env_file.flush();
+    if (!unique_pkgs.autoenv) {
+        try std.fs.cwd().deleteTree(autoenv_path);
+        return;
     }
 
-    if (maybe_msvc_version) |_| {
+    const install_path_absolute: AbsolutePath = try .init(scratch, install_path);
+    defer install_path_absolute.deinit(scratch);
+
+    var autoenv_dir = try std.fs.cwd().makeOpenPath(autoenv_path, .{});
+    defer autoenv_dir.close();
+    inline for (std.meta.fields(Arch)) |arch_field| {
+        const target_cpu: Arch = @enumFromInt(arch_field.value);
+        var autoenv_arch_dir = try autoenv_dir.makeOpenPath(@tagName(target_cpu), .{});
+        defer autoenv_arch_dir.close();
+        try installAutoenvArch(scratch, &install_path_absolute, unique_pkgs, target_cpu, autoenv_arch_dir);
+    }
+}
+
+fn installAutoenvArch(
+    scratch: std.mem.Allocator,
+    install_path: *const AbsolutePath,
+    unique_pkgs: *const UniquePackages,
+    target_cpu: Arch,
+    out_dir: std.fs.Dir,
+) !void {
+    {
+        var content_buf: [100]u8 = undefined;
+        const content = try std.fmt.bufPrint(&content_buf, "..\\..\\vcvars-{s}.bat\n", .{@tagName(target_cpu)});
+        try updateFile(out_dir, "env", content);
+    }
+
+    if (unique_pkgs.msvc) |_| {
         inline for (msvc_tools) |tool| {
             try updateFile(out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
         }
     }
-    if (maybe_sdk_version) |_| {
+    if (unique_pkgs.sdk) |_| {
         inline for (sdk_tools) |tool| {
             try updateFile(out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
         }
     }
 
     {
-        const cmake = generateToolchainCmake(arena, config.target_cpu, maybe_msvc_version, maybe_sdk_version) catch |e| oom(e);
-        defer arena.free(cmake);
+        const cmake = generateToolchainCmake(scratch, unique_pkgs, target_cpu) catch |e| oom(e);
+        defer scratch.free(cmake);
         try updateFile(out_dir, "toolchain.cmake", cmake);
     }
 
-    const maybe_msvc_install: ?Install = if (maybe_msvc_version) |version| try .init(arena, arena, .msvc, version) else null;
-    defer if (maybe_msvc_install) |i| i.deinit(arena);
-    const maybe_sdk_install: ?Install = if (maybe_sdk_version) |version| try .init(arena, arena, .sdk, version) else null;
-    defer if (maybe_sdk_install) |i| i.deinit(arena);
-
     {
-        const libc_txt = generateLibcTxt(arena, maybe_msvc_install, maybe_sdk_install, config.target_cpu) catch |e| oom(e);
-        defer arena.free(libc_txt);
+        const libc_txt = generateLibcTxt(scratch, install_path, unique_pkgs, target_cpu) catch |e| oom(e);
+        defer scratch.free(libc_txt);
         try updateFile(out_dir, "libc.txt", libc_txt);
     }
-
-    return 0;
 }
 
 fn updateFile(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !void {
@@ -816,6 +770,7 @@ fn updateFile(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !void 
 
 const LockFileMismatch = union(enum) {
     msvc: struct { requested: []const u8, lockfile: []const u8 },
+    autoenv: bool, // lockfile value
     missing_pkg: MsvcupPackage,
     extra_pkg: MsvcupPackage,
     pub fn format(
@@ -831,6 +786,10 @@ const LockFileMismatch = union(enum) {
                 "lock file is for msvc version '{s}' but '{s}' was requested",
                 .{ v.lockfile, v.requested },
             ),
+            .autoenv => |lockfile_value| try writer.print(
+                "lock file {s} autoenv",
+                .{@as([]const u8, if (lockfile_value) "has" else "does not have")},
+            ),
             .missing_pkg => |pkg| try writer.print("lock file is missing package '{}'", .{pkg}),
             .extra_pkg => |pkg| try writer.print("lock file has extra package '{}' that was not given on cmdline", .{pkg}),
         }
@@ -839,17 +798,25 @@ const LockFileMismatch = union(enum) {
 fn checkLockFilePkgs(
     lock_file_path: []const u8,
     lock_file_content: []const u8,
+    autoenv: bool,
     msvcup_pkgs: []const MsvcupPackage,
 ) ?LockFileMismatch {
     std.debug.assert(msvcup_pkgs.len > 0);
     var line_it = std.mem.tokenizeAny(u8, lock_file_content, "\r\n");
     var lineno: u32 = 0;
+    var has_autoenv: bool = false;
     var msvcup_pkg_index: usize = 0;
     var msvcup_pkg_match_count: usize = 0;
     while (line_it.next()) |line| {
         lineno += 1;
         if (line.len == 0) continue;
-        const payload = parseLockFilePayload(lock_file_path, lineno, line);
+        const payload = switch (parseLockFileLine(lock_file_path, lineno, line)) {
+            .autoenv => {
+                has_autoenv = true;
+                continue;
+            },
+            .payload => |payload| payload,
+        };
         while (true) {
             switch (payload.url_kind) {
                 .top_level => |payload_msvcup_pkg| switch (MsvcupPackage.order(
@@ -882,6 +849,7 @@ fn checkLockFilePkgs(
         msvcup_pkg_match_count == 0) return .{
         .missing_pkg = msvcup_pkgs[msvcup_pkg_index],
     };
+    if (autoenv != has_autoenv) return .{ .autoenv = has_autoenv };
     return null;
 }
 
@@ -919,11 +887,18 @@ const LockFilePayload = struct {
         };
     }
 };
-fn parseLockFilePayload(
+
+const LockFileLine = union(enum) {
+    autoenv,
+    payload: LockFilePayload,
+};
+
+fn parseLockFileLine(
     lock_file_path: []const u8,
     lineno: u32,
     line: []const u8,
-) LockFilePayload {
+) LockFileLine {
+    if (std.mem.eql(u8, line, "autoenv")) return .autoenv;
     const msvcup_pkg_end = std.mem.indexOfScalar(u8, line, '|') orelse errExit(
         "{s}:{}: this line has no '|' character separate the pkg/URL/hash '{s}'",
         .{ lock_file_path, lineno, line },
@@ -931,6 +906,7 @@ fn parseLockFilePayload(
     const msvcup_pkg_str = line[0..msvcup_pkg_end];
     const maybe_msvcup_pkg = if (msvcup_pkg_str.len == 0) null else switch (MsvcupPackage.fromString(msvcup_pkg_str)) {
         .ok => |pkg| pkg,
+        .autoenv => @panic("todo"),
         .unknown_name, .invalid_version => errExit(
             "{s}:{}: invalid msvcup pkg '{s}'",
             .{ lock_file_path, lineno, msvcup_pkg_str },
@@ -975,14 +951,14 @@ fn parseLockFilePayload(
                 "{s}:{}: a payload of kind '{s}' should not contain anything after the hash",
                 .{ lock_file_path, lineno, @tagName(install_kind) },
             );
-            return .{
+            return .{ .payload = .{
                 .url_decoded = url_decoded,
                 .sha256 = sha256,
                 .url_kind = .{ .top_level = maybe_msvcup_pkg orelse errExit(
                     "{s}:{}: missing msvcup package",
                     .{ lock_file_path, lineno },
                 ) },
-            };
+            } };
         },
         .cab => {
             if (hash_spec.end == line.len) errExit(
@@ -993,20 +969,25 @@ fn parseLockFilePayload(
                 "{s}:{}: cab payloads should not have an associated msvcup package ('{}' in this case)",
                 .{ lock_file_path, lineno, p },
             );
-            return .{
+            return .{ .payload = .{
                 .url_decoded = url_decoded,
                 .sha256 = sha256,
                 .url_kind = .{ .cab = line[hash_spec.end..] },
-            };
+            } };
         },
     }
 }
 
+const UniquePackages = struct {
+    autoenv: bool = false,
+    msvc: ?StringPool.Val = null,
+    sdk: ?StringPool.Val = null,
+};
+
 fn installFromLockFile(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
-    msvcup_pkgs: []const MsvcupPackage,
-    msvcup_dir: MsvcupDir,
+    install_path: []const u8,
     cache_dir: []const u8,
     lock_file_path: []const u8,
     lock_file_content: []const u8,
@@ -1014,13 +995,23 @@ fn installFromLockFile(
     var line_it = std.mem.tokenizeAny(u8, lock_file_content, "\r\n");
     var lineno: u32 = 0;
     var save_cab_pos: ?struct { lineno: u32, offset: usize } = null;
+
+    var unique_pkgs: UniquePackages = .{};
+
     while (line_it.next()) |line| {
         lineno += 1;
         if (line.len == 0) continue;
-        const parsed = parseLockFilePayload(lock_file_path, lineno, line);
-        if (parsed.hostArchLimit()) |host_arch_limit| {
+        const payload = switch (parseLockFileLine(lock_file_path, lineno, line)) {
+            .autoenv => {
+                if (unique_pkgs.autoenv) errExit("lock file contains multiple 'autoenv' entries", .{});
+                unique_pkgs.autoenv = true;
+                continue;
+            },
+            .payload => |payload| payload,
+        };
+        if (payload.hostArchLimit()) |host_arch_limit| {
             if (native_arch != host_arch_limit) {
-                const name = basenameFromUrl(parsed.url_decoded);
+                const name = basenameFromUrl(payload.url_decoded);
                 std.log.info(
                     "skipping payload '{s}' arch {s} != host arch {s}",
                     .{ name, @tagName(host_arch_limit), if (native_arch) |a| @tagName(a) else "null" },
@@ -1028,28 +1019,41 @@ fn installFromLockFile(
                 continue;
             }
         }
-        switch (parsed.url_kind) {
+        switch (payload.url_kind) {
             .top_level => |payload_msvcup_pkg| {
+                const maybe_version_ref: ?*?StringPool.Val = switch (payload_msvcup_pkg.kind) {
+                    .msvc => &unique_pkgs.msvc,
+                    .sdk => &unique_pkgs.sdk,
+                    .msbuild, .diasdk, .ninja, .cmake => null,
+                };
+                if (maybe_version_ref) |version_ref| {
+                    if (version_ref.*) |v| {
+                        if (!v.eql(payload_msvcup_pkg.version)) {
+                            errExit(
+                                "lock file contains multiple {s} package versions ('{f}' and '{f}')",
+                                .{ @tagName(payload_msvcup_pkg.kind), v, payload_msvcup_pkg.version },
+                            );
+                        }
+                    } else {
+                        version_ref.* = payload_msvcup_pkg.version;
+                    }
+                }
+
                 const cabs_lineno, const cabs: []const u8 = if (save_cab_pos) |pos|
                     .{ pos.lineno, lock_file_content[pos.offset .. line.ptr - lock_file_content.ptr] }
                 else
                     .{ lineno, line[0..0] };
                 save_cab_pos = null;
 
-                const install_path = msvcup_dir.path(
-                    scratch,
-                    &.{payload_msvcup_pkg.poolString().slice},
-                ) catch |e| oom(e);
-                defer scratch.free(install_path);
                 try installPayload(
                     scratch,
                     progress_node,
                     install_path,
                     lock_file_path,
                     cache_dir,
-                    parsed.url_decoded,
-                    parsed.sha256,
-                    parsed.stripRootDir(),
+                    payload.url_decoded,
+                    payload.sha256,
+                    payload.stripRootDir(),
                     cabs_lineno,
                     cabs,
                 );
@@ -1063,73 +1067,28 @@ fn installFromLockFile(
         }
     }
 
-    for (msvcup_pkgs) |msvcup_pkg| {
-        try finishPackage(scratch, msvcup_dir, msvcup_pkg);
-    }
+    try updateVcvars(scratch, install_path, &unique_pkgs);
+    try updateAutoenv(scratch, install_path, &unique_pkgs);
 
     return .success;
 }
 
-const FinishKind = enum { msvc, sdk };
-fn finishPackage(
+fn updateVcvars(
     scratch: std.mem.Allocator,
-    msvcup_dir: MsvcupDir,
-    msvcup_pkg: MsvcupPackage,
+    install_path: []const u8,
+    unique_pkgs: *const UniquePackages,
 ) !void {
-    const finish_kind: FinishKind = switch (msvcup_pkg.kind) {
-        .msvc => .msvc,
-        .sdk => .sdk,
-        .msbuild => return,
-        .diasdk => return,
-        .ninja => return,
-        .cmake => return,
-    };
-
-    const install_path = msvcup_dir.path(scratch, &.{msvcup_pkg.poolString().slice}) catch |e| oom(e);
-    defer scratch.free(install_path);
-
-    const install_version = try queryInstallVersion(scratch, scratch, finish_kind, install_path);
-    std.log.info("{s} install version '{s}'", .{ msvcup_pkg, install_version });
-
-    // first, remove all scripts that are for an SDK that we are no longer including
-    clean_env_blk: {
-        var install_dir = std.fs.cwd().openDir(install_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => break :clean_env_blk,
-            else => |e| return e,
-        };
-        defer install_dir.close();
-        var it = install_dir.iterate();
-        while (try it.next()) |entry| {
-            const action: enum { keep, remove } = blk_action: {
-                const prefix_end = blk: {
-                    const prefix = scanTo(entry.name, 0, '-');
-                    if (!std.mem.eql(u8, prefix.slice, "vcvars")) break :blk_action .keep;
-                    break :blk prefix.end;
-                };
-                const arch_end = blk: {
-                    const arch = scanTo(entry.name, prefix_end, '.');
-                    _ = Arch.fromString(arch.slice) orelse break :blk_action .remove;
-                    break :blk arch.end;
-                };
-                const ext = entry.name[arch_end..];
-                break :blk_action if (std.mem.eql(u8, ext, "bat")) .keep else .remove;
-            };
-            switch (action) {
-                .keep => {},
-                .remove => {
-                    std.log.info("removing '{s}'...", .{entry.name});
-                    try install_dir.deleteFile(entry.name);
-                },
-            }
-        }
-    }
+    const msvc_install_version: ?[]const u8 = if (unique_pkgs.msvc != null) try queryInstallVersion(scratch, scratch, .msvc, install_path) else null;
+    const sdk_install_version: ?[]const u8 = if (unique_pkgs.sdk != null) try queryInstallVersion(scratch, scratch, .sdk, install_path) else null;
+    if (msvc_install_version) |v| std.log.info("MSVC install version '{s}'", .{v});
+    if (sdk_install_version) |v| std.log.info("SDK  install version '{s}'", .{v});
 
     {
         var install_dir = try std.fs.cwd().makeOpenPath(install_path, .{});
         defer install_dir.close();
         inline for (std.meta.fields(Arch)) |arch_field| {
             const arch: Arch = @enumFromInt(arch_field.value);
-            const env_bat = generateVcvarsBat(scratch, finish_kind, install_version, arch) catch |e| oom(e);
+            const env_bat = generateVcvarsBat(scratch, msvc_install_version, sdk_install_version, arch) catch |e| oom(e);
             defer scratch.free(env_bat);
             const env_basename = std.fmt.allocPrint(scratch, "vcvars-{s}.bat", .{@tagName(arch)}) catch |e| oom(e);
             defer scratch.free(env_basename);
@@ -1145,10 +1104,10 @@ fn finishPackage(
 fn queryInstallVersion(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
-    finish_kind: FinishKind,
+    kind: enum { msvc, sdk },
     install_path: []const u8,
 ) ![]u8 {
-    const query_path = switch (finish_kind) {
+    const query_path = switch (kind) {
         .msvc => std.fs.path.join(scratch, &.{ install_path, "VC", "Tools", "MSVC" }) catch |e| oom(e),
         .sdk => std.fs.path.join(scratch, &.{ install_path, "Windows Kits", "10", "Include" }) catch |e| oom(e),
     };
@@ -1178,60 +1137,71 @@ fn queryInstallVersion(
 
 fn generateVcvarsBat(
     allocator: std.mem.Allocator,
-    finish_kind: FinishKind,
-    install_version: []const u8,
+    msvc_install_version: ?[]const u8,
+    sdk_install_version: ?[]const u8,
     target_arch: Arch,
 ) error{OutOfMemory}![]u8 {
     var bat: std.ArrayListUnmanaged(u8) = .{};
     defer bat.deinit(allocator);
     const writer = bat.writer(allocator);
-    switch (finish_kind) {
-        .msvc => {
-            try writer.print(
-                "set \"INCLUDE=%~dp0VC\\Tools\\MSVC\\{s}\\include;%INCLUDE%\"\n",
-                .{install_version},
-            );
-            try writer.print(
-                "set \"PATH=%~dp0VC\\Tools\\MSVC\\{s}\\bin\\Host{s}\\{s};%PATH%\"\n",
-                .{ install_version, @tagName(Arch.native), @tagName(target_arch) },
-            );
-            try writer.print(
-                "set \"LIB=%~dp0VC\\Tools\\MSVC\\{s}\\lib\\{s};%LIB%\"\n",
-                .{ install_version, @tagName(target_arch) },
-            );
-        },
-        .sdk => {
-            try writer.print(
-                "set \"INCLUDE=%~dp0Windows Kits\\10\\Include\\{s}\\ucrt;" ++
-                    "%~dp0Windows Kits\\10\\Include\\{0s}\\shared;" ++
-                    "%~dp0Windows Kits\\10\\Include\\{0s}\\um;" ++
-                    "%~dp0Windows Kits\\10\\Include\\{0s}\\winrt;" ++
-                    "%~dp0Windows Kits\\10\\Include\\{0s}\\cppwinrt;" ++
-                    "%INCLUDE%\"\n",
-                .{install_version},
-            );
-            try writer.print(
-                "set \"PATH=%~dp0Windows Kits\\10\\bin\\{[version]s}\\{[host_arch]s};" ++
-                    //"%~dp0Windows Kits\\10\\bin\\{[version]s}\\ucrt;\n",
-                    "%PATH%\"\n",
-                .{ .version = install_version, .host_arch = @tagName(Arch.native) },
-            );
-            try writer.print(
-                "set \"LIB=%~dp0Windows Kits\\10\\Lib\\{[version]s}\\ucrt\\{[target_arch]s};" ++
-                    "%~dp0Windows Kits\\10\\Lib\\{[version]s}\\um\\{[target_arch]s};" ++
-                    "%LIB%\"\n",
-                .{ .version = install_version, .target_arch = @tagName(target_arch) },
-            );
-        },
+
+    try writer.writeAll("set \"INCLUDE=");
+    if (msvc_install_version) |install_version| {
+        try writer.print(
+            "%~dp0VC\\Tools\\MSVC\\{s}\\include;",
+            .{install_version},
+        );
     }
+    if (sdk_install_version) |install_version| {
+        try writer.print(
+            "%~dp0Windows Kits\\10\\Include\\{s}\\ucrt;" ++
+                "%~dp0Windows Kits\\10\\Include\\{0s}\\shared;" ++
+                "%~dp0Windows Kits\\10\\Include\\{0s}\\um;" ++
+                "%~dp0Windows Kits\\10\\Include\\{0s}\\winrt;" ++
+                "%~dp0Windows Kits\\10\\Include\\{0s}\\cppwinrt;",
+            .{install_version},
+        );
+    }
+    try writer.writeAll("%INCLUDE%\"\n");
+
+    try writer.writeAll("set \"PATH=");
+    if (msvc_install_version) |install_version| {
+        try writer.print(
+            "%~dp0VC\\Tools\\MSVC\\{s}\\bin\\Host{s}\\{s};",
+            .{ install_version, @tagName(Arch.native), @tagName(target_arch) },
+        );
+    }
+    if (sdk_install_version) |install_version| {
+        try writer.print(
+            "%~dp0Windows Kits\\10\\bin\\{[version]s}\\{[host_arch]s};",
+            .{ .version = install_version, .host_arch = @tagName(Arch.native) },
+        );
+    }
+    try writer.writeAll("%PATH%\"\n");
+
+    try writer.writeAll("set \"LIB=");
+    if (msvc_install_version) |install_version| {
+        try writer.print(
+            "%~dp0VC\\Tools\\MSVC\\{s}\\lib\\{s};",
+            .{ install_version, @tagName(target_arch) },
+        );
+    }
+    if (sdk_install_version) |install_version| {
+        try writer.print(
+            "%~dp0Windows Kits\\10\\Lib\\{[version]s}\\ucrt\\{[target_arch]s};" ++
+                "%~dp0Windows Kits\\10\\Lib\\{[version]s}\\um\\{[target_arch]s};",
+            .{ .version = install_version, .target_arch = @tagName(target_arch) },
+        );
+    }
+    try writer.writeAll("%LIB%\"\n");
+
     return bat.toOwnedSlice(allocator) catch |e| oom(e);
 }
 
 fn generateToolchainCmake(
     allocator: std.mem.Allocator,
+    unique_pkgs: *const UniquePackages,
     target_cpu: Arch,
-    maybe_msvc_version: ?StringPool.Val,
-    maybe_sdk_version: ?StringPool.Val,
 ) error{OutOfMemory}![]u8 {
     var content: std.ArrayListUnmanaged(u8) = .{};
     defer content.deinit(allocator);
@@ -1247,14 +1217,14 @@ fn generateToolchainCmake(
         try writer.print("set(CMAKE_SYSTEM_PROCESSOR {s})\n", .{processor});
     }
 
-    if (maybe_msvc_version) |_| {
+    if (unique_pkgs.msvc != null) {
         inline for (msvc_tools) |tool| {
             for (tool.cmake_names) |cmake_name| {
                 try writer.print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
             }
         }
     }
-    if (maybe_sdk_version) |_| {
+    if (unique_pkgs.sdk != null) {
         inline for (sdk_tools) |tool| {
             for (tool.cmake_names) |cmake_name| {
                 try writer.print("set(CMAKE_{s} \"${{CMAKE_CURRENT_LIST_DIR}}/{s}.exe\")\n", .{ cmake_name, tool.name });
@@ -1264,55 +1234,51 @@ fn generateToolchainCmake(
     return content.toOwnedSlice(allocator) catch |e| oom(e);
 }
 
-const Install = struct {
-    path: []const u8,
-    install_version: []const u8,
-    pub fn init(
-        allocator: std.mem.Allocator,
-        scratch: std.mem.Allocator,
-        finish_kind: FinishKind,
-        version: StringPool.Val,
-    ) !Install {
-        const path = try std.fmt.allocPrint(allocator, "C:\\msvcup\\{s}-{s}", .{ @tagName(finish_kind), version.slice });
-        errdefer allocator.free(path);
-        const install_version = try queryInstallVersion(allocator, scratch, finish_kind, path);
-        return .{ .path = path, .install_version = install_version };
+const AbsolutePath = struct {
+    slice: []const u8,
+    allocated: bool,
+
+    pub fn init(allocator: std.mem.Allocator, p: []const u8) !AbsolutePath {
+        if (std.fs.path.isAbsolute(p)) return .{ .slice = p, .allocated = false };
+        return .{
+            .slice = try std.fs.realpathAlloc(allocator, p),
+            .allocated = true,
+        };
     }
-    pub fn deinit(self: Install, allocator: std.mem.Allocator) void {
-        allocator.free(self.install_version);
-        allocator.free(self.path);
+    pub fn deinit(p: *const AbsolutePath, allocator: std.mem.Allocator) void {
+        if (p.allocated) allocator.free(p.slice);
     }
 };
 
 fn generateLibcTxt(
     allocator: std.mem.Allocator,
-    maybe_msvc: ?Install,
-    maybe_sdk: ?Install,
+    install_path: *const AbsolutePath,
+    unique_pkgs: *const UniquePackages,
     target_cpu: Arch,
 ) error{OutOfMemory}![]u8 {
     var content: std.ArrayListUnmanaged(u8) = .{};
     defer content.deinit(allocator);
     const writer = content.writer(allocator);
-    if (maybe_msvc) |msvc| {
+    if (unique_pkgs.msvc) |msvc_version| {
         try writer.print(
-            \\sys_include_dir={[root]s}\VC\Tools\MSVC\{[version]s}\include
-            \\msvc_lib_dir={[root]s}\VC\Tools\MSVC\{[version]s}\lib\{[target]s}
+            \\sys_include_dir={[install]s}\VC\Tools\MSVC\{[version]s}\include
+            \\msvc_lib_dir={[install]s}\VC\Tools\MSVC\{[version]s}\lib\{[target]s}
             \\
         , .{
-            .root = msvc.path,
-            .version = msvc.install_version,
+            .install = install_path.slice,
+            .version = msvc_version,
             .target = @tagName(target_cpu),
         });
     }
-    if (maybe_sdk) |sdk| {
+    if (unique_pkgs.sdk) |sdk_version| {
         try writer.print(
-            \\include_dir={[root]s}\Windows Kits\10\Include\{[version]s}\ucrt
-            \\kernel32_lib_dir={[root]s}\Windows Kits\10\lib\{[version]s}\um\{[target]s}
-            \\crt_dir={[root]s}\Windows Kits\10\Lib\{[version]s}\ucrt\{[target]s}
+            \\include_dir={[install]s}\Windows Kits\10\Include\{[version]s}\ucrt
+            \\kernel32_lib_dir={[install]s}\Windows Kits\10\lib\{[version]s}\um\{[target]s}
+            \\crt_dir={[install]s}\Windows Kits\10\Lib\{[version]s}\ucrt\{[target]s}
             \\
         , .{
-            .root = sdk.path,
-            .version = sdk.install_version,
+            .install = install_path.slice,
+            .version = sdk_version,
             .target = @tagName(target_cpu),
         });
     }
@@ -1396,10 +1362,13 @@ fn installPayload(
         while (line_it.next()) |line| {
             lineno += 1;
             if (line.len == 0) continue;
-            const parsed = parseLockFilePayload(lock_file_path, lineno, line);
-            const cab_cache_entry = CacheEntry.alloc(scratch, scratch, cache_dir, parsed.sha256, basenameFromUrl(parsed.url_decoded));
+            const payload = switch (parseLockFileLine(lock_file_path, lineno, line)) {
+                .autoenv => continue,
+                .payload => |payload| payload,
+            };
+            const cab_cache_entry = CacheEntry.alloc(scratch, scratch, cache_dir, payload.sha256, basenameFromUrl(payload.url_decoded));
             defer cab_cache_entry.free(scratch);
-            try fetchPayload(scratch, progress_node, cache_dir, parsed.sha256, parsed.url_decoded, cab_cache_entry.path);
+            try fetchPayload(scratch, progress_node, cache_dir, payload.sha256, payload.url_decoded, cab_cache_entry.path);
         }
     }
     try fetchPayload(scratch, progress_node, cache_dir, sha256, url_decoded, cache_entry.path);
@@ -1412,8 +1381,8 @@ fn installPayload(
     var install_lock = try LockFile.lock(install_lock_path);
     defer install_lock.unlock();
 
-    var install_dir = try std.fs.cwd().openDir(install_dir_path, .{});
-    defer install_dir.close();
+    var install_dir_handle = try std.fs.cwd().openDir(install_dir_path, .{});
+    defer install_dir_handle.close();
 
     const pre_start_data: union(enum) {
         vsix,
@@ -1453,8 +1422,11 @@ fn installPayload(
                 while (line_it.next()) |line| {
                     lineno += 1;
                     if (line.len == 0) continue;
-                    const parsed = parseLockFilePayload(lock_file_path, lineno, line);
-                    const installer_sub_path = switch (parsed.url_kind) {
+                    const payload = switch (parseLockFileLine(lock_file_path, lineno, line)) {
+                        .autoenv => unreachable,
+                        .payload => |payload| payload,
+                    };
+                    const installer_sub_path = switch (payload.url_kind) {
                         .top_level => unreachable,
                         .cab => |path| path,
                     };
@@ -1462,8 +1434,8 @@ fn installPayload(
                         scratch,
                         scratch,
                         cache_dir,
-                        parsed.sha256,
-                        basenameFromUrl(parsed.url_decoded),
+                        payload.sha256,
+                        basenameFromUrl(payload.url_decoded),
                     );
                     defer cab_cache_entry.free(scratch);
                     if (std.fs.path.dirname(installer_sub_path)) |dir| try installer_dir.makePath(dir);
@@ -1480,40 +1452,72 @@ fn installPayload(
     }
 
     {
-        const current_install = try startInstall(scratch, install_dir, current_install_path);
+        const current_install = try startInstall(scratch, install_dir_handle, current_install_path);
         defer current_install.close();
         // this will always starts with the cache basename
         try current_install.writer().print("{s}\n", .{cache_entry.basename});
         switch (pre_start_data) {
-            .vsix => try installPayloadZip(scratch, install_dir_path, cache_entry.path, install_dir, current_install, .vsix, strip_root_dir),
+            .vsix => try installPayloadZip(
+                scratch,
+                cache_entry.path,
+                install_dir_handle,
+                current_install,
+                .vsix,
+                strip_root_dir,
+            ),
             .msi => |msi| {
                 const target_dir = std.fs.path.join(scratch, &.{ msi.staging_dir, "target" }) catch |e| oom(e);
                 defer scratch.free(target_dir);
                 _ = try installDir(
                     scratch,
-                    install_dir_path,
+                    .{ .path = install_dir_path, .handle = install_dir_handle },
                     target_dir,
-                    install_dir,
                     current_install,
                     basenameFromUrl(url_decoded),
                 );
                 try deleteTree(std.fs.cwd(), msi.staging_dir);
             },
-            .zip => try installPayloadZip(scratch, install_dir_path, cache_entry.path, install_dir, current_install, .zip, strip_root_dir),
+            .zip => try installPayloadZip(
+                scratch,
+                cache_entry.path,
+                install_dir_handle,
+                current_install,
+                .zip,
+                strip_root_dir,
+            ),
         }
     }
 
     try endInstall(scratch, installed_manifest_path, current_install_path);
 }
 
+fn normalizePathSeps(path: []u8) void {
+    for (path) |*char| char.* = switch (char.*) {
+        '/' => '\\',
+        else => |other| other,
+    };
+}
+
 fn populateStagingMsi(scratch: std.mem.Allocator, msi_file_path: []const u8, staging_dir: []const u8) !void {
-    const target_dir_arg = std.mem.concat(scratch, u8, &.{ "TARGETDIR=", staging_dir }) catch |e| oom(e);
+    // msi has problem with paths that contain forward slaces
+    const msi_path_fixed = try scratch.dupe(u8, msi_file_path);
+    defer scratch.free(msi_path_fixed);
+    normalizePathSeps(msi_path_fixed);
+
+    // at least some MSI files require TARGETDIR to be an absolute path
+    // also, realpath requires the directory to exist to work
+    try std.fs.cwd().makePath(staging_dir);
+    const staging_dir_abs = try std.fs.cwd().realpathAlloc(scratch, staging_dir);
+    defer scratch.free(staging_dir_abs);
+    normalizePathSeps(staging_dir_abs);
+
+    const target_dir_arg = try std.mem.concat(scratch, u8, &.{ "TARGETDIR=", staging_dir_abs });
     defer scratch.free(target_dir_arg);
     std.log.info("running msiexec for '{s}'...", .{msi_file_path});
     const argv = [_][]const u8{
         "msiexec.exe",
         "/a",
-        msi_file_path,
+        msi_path_fixed,
         "/quiet",
         "/qn",
         //"/?",
@@ -1549,7 +1553,6 @@ fn populateStagingMsi(scratch: std.mem.Allocator, msi_file_path: []const u8, sta
 
 fn installPayloadZip(
     scratch: std.mem.Allocator,
-    install_dir_path: []const u8,
     cache_path: []const u8,
     install_dir: std.fs.Dir,
     installing_manifest: std.fs.File,
@@ -1623,28 +1626,26 @@ fn installPayloadZip(
                     );
                     last_root_dir = root_dir;
                     std.debug.assert(sub_path_decoded[root_dir.len] == std.fs.path.sep);
-                    const sub_path = sub_path_decoded[root_dir.len..];
+                    const sub_path = sub_path_decoded[root_dir.len + 1 ..];
                     std.debug.assert(sub_path.len > 0);
                     break :blk sub_path;
                 }
                 break :blk sub_path_decoded;
             };
 
-            const install_path = std.fs.path.join(scratch, &.{ install_dir_path, sub_path }) catch |e| oom(e);
-            defer scratch.free(install_path);
-            switch (try updateInstallingManifest(install_dir, installing_manifest, install_path)) {
+            switch (try updateInstallingManifest(install_dir, installing_manifest, sub_path)) {
                 .already_installed => {
                     // TODO: for zip, we could probably just take a CRC of the current file and compre
                     //       it to our expected CRC
-                    @panic("todo: check if this file is the same!");
+                    std.debug.panic("'{s}' already installed (TODO: check if it's the same)", .{sub_path});
                 },
                 .ready => {
-                    const file = try install_dir.createFile(install_path, .{});
+                    const file = try install_dir.createFile(sub_path, .{});
                     defer file.close();
                     const crc = try zip.extract(entry, payload_file.seekableStream(), file.writer());
                     if (crc != entry.crc32) std.debug.panic(
                         "file '{s}' expected CRC32 0x{x} but got 0x{x}",
-                        .{ install_path, entry.crc32, crc },
+                        .{ sub_path, entry.crc32, crc },
                     );
                 },
             }
@@ -1657,7 +1658,7 @@ fn updateInstallingManifest(
     installing_manifest: std.fs.File,
     install_path: []const u8,
 ) !enum { already_installed, ready } {
-    if (std.fs.cwd().openFile(install_path, .{})) |file| {
+    if (install_dir.openFile(install_path, .{})) |file| {
         defer file.close();
         try installing_manifest.writer().print("add {s}\n", .{install_path});
         return .already_installed;
@@ -1718,11 +1719,15 @@ fn filesAreIdentical(path1: []const u8, path2: []const u8) !bool {
     }
 }
 
+const OpenDir = struct {
+    path: []const u8,
+    handle: std.fs.Dir,
+};
+
 fn installDir(
     scratch: std.mem.Allocator,
-    install_dir_path: []const u8,
+    install_dir: OpenDir,
     source_dir_path: []const u8,
-    install_dir: std.fs.Dir,
     installing_manifest: std.fs.File,
     root_exclude: []const u8,
 ) !struct { root_excluded: bool } {
@@ -1743,11 +1748,11 @@ fn installDir(
             .directory => continue, // ignore directories
             else => |kind| std.debug.panic("unsupported file type {s} '{s}'", .{ @tagName(kind), entry.path }),
         }
-        const install_path = std.fs.path.join(scratch, &.{ install_dir_path, entry.path }) catch |e| oom(e);
+        const install_path = std.fs.path.join(scratch, &.{ install_dir.path, entry.path }) catch |e| oom(e);
         defer scratch.free(install_path);
         const source_path = std.fs.path.join(scratch, &.{ source_dir_path, entry.path }) catch |e| oom(e);
         defer scratch.free(source_path);
-        switch (try updateInstallingManifest(install_dir, installing_manifest, install_path)) {
+        switch (try updateInstallingManifest(install_dir.handle, installing_manifest, entry.path)) {
             .already_installed => {
                 if (!try filesAreIdentical(source_path, install_path)) {
                     std.log.err("file conflict!", .{});
@@ -1978,6 +1983,7 @@ const InstallPackage = struct {
 fn updateLockFile(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
+    autoenv: bool,
     msvcup_pkgs: []const MsvcupPackage,
     lock_file_path: []const u8,
     pkgs: Packages,
@@ -2307,6 +2313,9 @@ fn updateLockFile(
     //     try bw.writer().print("sdk {s}\n", .{sdk_version});
     // }
     // try bw.writer().writeAll("payloads:\n");
+    if (autoenv) {
+        try bw.writer().writeAll("autoenv\n");
+    }
     for (payloads, 0..) |install_payload, payload_cab_offsets_index| {
         const payload = pkgs.payloads[install_payload.index.int()];
         _ = uriFromUrlDecoded(payload.url_decoded) catch errExit(
