@@ -468,7 +468,7 @@ const MsvcupPackage = struct {
 };
 
 fn defaultLockFile(allocator: std.mem.Allocator, install_dir: []const u8) error{OutOfMemory}![]const u8 {
-    const dir = std.mem.trimRight(u8, install_dir, "/\\");
+    const dir = std.mem.trimRight(u8, install_dir, "\\/");
     return try std.fmt.allocPrint(allocator, "{s}.lock", .{dir});
 }
 
