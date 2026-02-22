@@ -1050,8 +1050,8 @@ fn installFromLockFile(
                     if (version_ref.*) |v| {
                         if (!v.eql(payload_msvcup_pkg.version)) {
                             errExit(
-                                "lock file contains multiple {s} package versions ('{f}' and '{f}')",
-                                .{ @tagName(payload_msvcup_pkg.kind), v, payload_msvcup_pkg.version },
+                                "lock file contains multiple {t} package versions ('{f}' and '{f}')",
+                                .{ payload_msvcup_pkg.kind, v, payload_msvcup_pkg.version },
                             );
                         }
                     } else {
@@ -1602,93 +1602,98 @@ fn installPayloadZip(
     var payload_file = try std.fs.cwd().openFile(cache_path, .{});
     defer payload_file.close();
 
+    var read_buffer: [4096]u8 = undefined;
+    var reader = payload_file.reader(&read_buffer);
+
     var last_root_dir: ?[]const u8 = null;
 
-    {
-        var zip_it = try zip.Iterator.init(payload_file.seekableStream());
-        while (try zip_it.next()) |entry| {
-            var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const filename = filename_buf[0..entry.filename_len];
-            try payload_file.seekableStream().seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
-            const len = try payload_file.reader().readAll(filename);
-            if (len != filename.len)
-                return error.ZipBadFileOffset;
-            const other_sep = switch (std.fs.path.sep) {
-                '/' => '\\',
-                '\\' => '/',
-                else => @compileError("todo"),
-            };
-            for (filename) |*c| {
-                if (c.* == other_sep) c.* = std.fs.path.sep;
+    var zip_it = try std.zip.Iterator.init(&reader);
+    while (try zip_it.next()) |entry| {
+        var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const filename = filename_buf[0..entry.filename_len];
+        try reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        try reader.interface.readSliceAll(filename);
+        const other_sep = switch (std.fs.path.sep) {
+            '/' => '\\',
+            '\\' => '/',
+            else => @compileError("todo"),
+        };
+        for (filename) |*c| {
+            if (c.* == other_sep) c.* = std.fs.path.sep;
+        }
+        if (filename.len == 0) return error.ZipEmptyFilename;
+        if (filename[0] == std.fs.path.sep) return error.ZipAbsoluteFilename;
+        {
+            var it = std.mem.splitScalar(u8, filename, std.fs.path.sep);
+            while (it.next()) |part| {
+                if (std.mem.eql(u8, part, ".")) return error.ZipFilenameContainsDot;
+                if (std.mem.eql(u8, part, "..")) return error.ZipFilenameContainsDots;
             }
-            if (filename.len == 0) return error.ZipEmptyFilename;
-            if (filename[0] == std.fs.path.sep) return error.ZipAbsoluteFilename;
-            {
-                var it = std.mem.splitScalar(u8, filename, std.fs.path.sep);
-                while (it.next()) |part| {
-                    if (std.mem.eql(u8, part, ".")) return error.ZipFilenameContainsDot;
-                    if (std.mem.eql(u8, part, "..")) return error.ZipFilenameContainsDots;
-                }
-            }
+        }
 
-            const prefix: []const u8 = switch (kind) {
-                .vsix => "Contents" ++ std.fs.path.sep_str,
-                .zip => "",
-            };
-            if (!std.ascii.startsWithIgnoreCase(filename, prefix)) {
-                // log.info("ignore '{s}'", .{filename});
-                continue;
-            }
-            if (filename[filename.len - 1] == std.fs.path.sep) {
-                // log.info("ignore directory '{s}'", .{filename});
-                continue;
-            }
+        const prefix: []const u8 = switch (kind) {
+            .vsix => "Contents" ++ std.fs.path.sep_str,
+            .zip => "",
+        };
+        if (!std.ascii.startsWithIgnoreCase(filename, prefix)) {
+            // log.info("ignore '{s}'", .{filename});
+            continue;
+        }
+        if (filename[filename.len - 1] == std.fs.path.sep) {
+            // log.info("ignore directory '{s}'", .{filename});
+            continue;
+        }
 
-            // for some reason, the VSIX filenames can be URL percent encoded?!?
-            const sub_path_encoded = filename[prefix.len..];
-            const sub_path_decoded = allocUrlPercentDecoded(scratch, sub_path_encoded) catch |e| oom(e);
-            defer scratch.free(sub_path_decoded);
+        // for some reason, the VSIX filenames can be URL percent encoded?!?
+        const sub_path_encoded = filename[prefix.len..];
+        const sub_path_decoded = allocUrlPercentDecoded(scratch, sub_path_encoded) catch |e| oom(e);
+        defer scratch.free(sub_path_decoded);
 
-            const sub_path = blk: {
-                if (strip_root_dir) {
-                    const root_dir_end = std.mem.indexOfScalar(
-                        u8,
-                        sub_path_decoded,
-                        std.fs.path.sep,
-                    ) orelse std.debug.panic(
-                        "no root dir to strip from  '{s}'",
-                        .{sub_path_decoded},
-                    );
-                    const root_dir = sub_path_decoded[0..root_dir_end];
-                    if (last_root_dir) |last| if (!std.mem.eql(u8, last, root_dir)) std.debug.panic(
-                        "root dir has changed from '{s}' to '{s}', cannot strip",
-                        .{ last, root_dir },
-                    );
-                    last_root_dir = root_dir;
-                    std.debug.assert(sub_path_decoded[root_dir.len] == std.fs.path.sep);
-                    const sub_path = sub_path_decoded[root_dir.len + 1 ..];
-                    std.debug.assert(sub_path.len > 0);
-                    break :blk sub_path;
-                }
-                break :blk sub_path_decoded;
-            };
-
-            switch (try updateInstallingManifest(install_dir, installing_manifest, sub_path)) {
-                .already_installed => {
-                    // TODO: for zip, we could probably just take a CRC of the current file and compre
-                    //       it to our expected CRC
-                    std.debug.panic("'{s}' already installed (TODO: check if it's the same)", .{sub_path});
-                },
-                .ready => {
-                    const file = try install_dir.createFile(sub_path, .{});
-                    defer file.close();
-                    const crc = try zip.extract(entry, payload_file.seekableStream(), file.writer());
-                    if (crc != entry.crc32) std.debug.panic(
-                        "file '{s}' expected CRC32 0x{x} but got 0x{x}",
-                        .{ sub_path, entry.crc32, crc },
-                    );
-                },
+        const sub_path = blk: {
+            if (strip_root_dir) {
+                const root_dir_end = std.mem.indexOfScalar(
+                    u8,
+                    sub_path_decoded,
+                    std.fs.path.sep,
+                ) orelse std.debug.panic(
+                    "no root dir to strip from  '{s}'",
+                    .{sub_path_decoded},
+                );
+                const root_dir = sub_path_decoded[0..root_dir_end];
+                if (last_root_dir) |last| if (!std.mem.eql(u8, last, root_dir)) std.debug.panic(
+                    "root dir has changed from '{s}' to '{s}', cannot strip",
+                    .{ last, root_dir },
+                );
+                last_root_dir = root_dir;
+                std.debug.assert(sub_path_decoded[root_dir.len] == std.fs.path.sep);
+                const sub_path = sub_path_decoded[root_dir.len + 1 ..];
+                std.debug.assert(sub_path.len > 0);
+                break :blk sub_path;
             }
+            break :blk sub_path_decoded;
+        };
+
+        switch (try updateInstallingManifest(install_dir, installing_manifest, sub_path)) {
+            .already_installed => {
+                // TODO: for zip, we could probably just take a CRC of the current file and compre
+                //       it to our expected CRC
+                std.debug.panic("'{s}' already installed (TODO: check if it's the same)", .{sub_path});
+            },
+            .ready => {
+                const file = try install_dir.createFile(sub_path, .{});
+                defer file.close();
+                var write_buffer: [1024]u8 = undefined;
+                var file_writer = file.writer(&write_buffer);
+                const crc = zip.extract(entry, zip_it.input, &file_writer.interface) catch |err| switch (err) {
+                    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                    // error.WriteFailed => return file_writer.err.?,
+                    else => |e| return e,
+                };
+                if (crc != entry.crc32) std.debug.panic(
+                    "file '{s}' expected CRC32 0x{x} but got 0x{x}",
+                    .{ sub_path, entry.crc32, crc },
+                );
+            },
         }
     }
 }
@@ -3142,42 +3147,44 @@ fn resolveChannelManifestUrlToFile(
         error.UnexpectedCharacter,
         error.InvalidFormat,
         error.InvalidPort,
-        error.HttpProxyMissingHost,
+        error.UriMissingHost,
+        error.UriHostTooLong,
         => |e| errExit("init proxy failed with {s}", .{@errorName(e)}),
     };
-    var header_buffer: [8196]u8 = undefined;
-
-    var request = try client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .keep_alive = false,
-        .redirect_behavior = .not_allowed,
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
     });
-    defer request.deinit();
-    try request.send();
-    request.wait() catch |err| switch (err) {
-        error.TooManyHttpRedirects => {
-            if (request.response.location) |redirect_url| {
-                _ = std.Uri.parse(redirect_url) catch |e| errExit(
-                    "failed to parse the redirect url '{s}' with {s}",
-                    .{ redirect_url, @errorName(e) },
-                );
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // TODO: don't download directly to this file, download to a temp file and rename
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                const out_file = try std.fs.cwd().createFile(out_path, .{});
-                defer out_file.close();
-                try out_file.writer().writeAll(redirect_url);
-                return;
-            }
-        },
-        else => |e| return e,
-    };
-    errExit("GET '{s}' HTTP status {} \"{s}\"", .{
+    defer req.deinit();
+
+    try req.sendBodiless();
+    var redirect_buffer: [8192]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+
+    // Check if we got a redirect response
+    const status_code = @intFromEnum(response.head.status);
+    if (status_code >= 300 and status_code < 400) {
+        // Handle redirect - extract Location header and write to file
+        const location = response.head.location orelse
+            errExit("redirect response missing Location header", .{});
+        _ = std.Uri.parse(location) catch |e| errExit(
+            "failed to parse the redirect url '{s}' with {s}",
+            .{ location, @errorName(e) },
+        );
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // TODO: don't download directly to this file, download to a temp file and rename
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        const out_file = try std.fs.cwd().createFile(out_path, .{});
+        defer out_file.close();
+        try out_file.writeAll(location);
+        return;
+    }
+
+    errExit("GET '{f}' HTTP status {} \"{s}\"", .{
         uri,
-        @intFromEnum(request.response.status),
-        request.response.status.phrase() orelse "",
+        @intFromEnum(response.head.status),
+        response.head.status.phrase() orelse "",
     });
 }
 
@@ -3273,27 +3280,28 @@ fn fetch(
         error.UnexpectedCharacter,
         error.InvalidFormat,
         error.InvalidPort,
-        error.HttpProxyMissingHost,
+        error.UriMissingHost,
+        error.UriHostTooLong,
         => |e| errExit("init proxy failed with {s}", .{@errorName(e)}),
     };
 
-    var header_buffer: [8196]u8 = undefined;
-    var request = try client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .keep_alive = false,
-    });
-    defer request.deinit();
-    try request.send();
-    try request.wait();
-    if (request.response.status != .ok) return errExit(
-        "fetch '{}': HTTP response {} \"{?s}\"",
-        .{ uri, @intFromEnum(request.response.status), request.response.status.phrase() },
+    var req = try client.request(.GET, uri, .{});
+    defer req.deinit();
+
+    try req.sendBodiless();
+    var redirect_buffer: [8192]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+
+    if (response.head.status != .ok) return errExit(
+        "fetch '{f}': HTTP response {} \"{?s}\"",
+        .{ uri, @intFromEnum(response.head.status), response.head.status.phrase() },
     );
 
     const file = try std.fs.cwd().createFile(out_path, .{});
     defer file.close();
+
     const maybe_expected_size = blk: {
-        if (request.response.content_length) |content_length| {
+        if (response.head.content_length) |content_length| {
             if (opt.size) |size| {
                 if (size != content_length) errExit(
                     "fetch '{f}': Content-Length {} != expected size {}",
@@ -3306,33 +3314,41 @@ fn fetch(
     };
     if (maybe_expected_size) |size| try file.setEndPos(size);
 
+    var transfer_buffer: [8192]u8 = undefined;
+    const body_reader = response.request.reader.bodyReader(
+        &transfer_buffer,
+        response.head.transfer_encoding,
+        response.head.content_length,
+    );
+
     var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
     var total_received: u64 = 0;
 
+    // Read and write body in chunks
     while (true) {
-        var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
-        const len = request.reader().read(&buf) catch |e| std.debug.panic(
-            "fetch '{}': read failed with {s}",
-            .{ uri, @errorName(e) },
-        );
-        if (len == 0) break;
-        total_received += len;
-        if (request.response.content_length) |content_length| {
+        // Fill the body_reader buffer
+        body_reader.fillMore() catch |err| switch (err) {
+            error.ReadFailed => break,
+            else => |e| return e,
+        };
+
+        const buffered = body_reader.buffered();
+        if (buffered.len == 0) break;
+
+        total_received += buffered.len;
+        if (response.head.content_length) |content_length| {
             if (total_received > content_length) errExit(
                 "fetch '{f}': read more than Content-Length ({})",
                 .{ uri, content_length },
             );
         }
-        hasher.update(buf[0..len]);
-        // NOTE: not going through a buffered writer since we're writing
-        //       large chunks
-        file.writer().writeAll(buf[0..len]) catch |err| std.debug.panic(
-            "fetch '{}': write {} bytes of HTTP response failed with {s}",
-            .{ uri, len, @errorName(err) },
-        );
+
+        hasher.update(buffered);
+        try file.writeAll(buffered);
+        body_reader.toss(buffered.len);
     }
 
-    if (request.response.content_length) |content_length| {
+    if (response.head.content_length) |content_length| {
         if (total_received != content_length) errExit(
             "fetch '{f}': Content-Length is {} but only read {}",
             .{ uri, content_length, total_received },

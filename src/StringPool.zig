@@ -10,14 +10,7 @@ pub const Val = struct {
     pub fn eql(self: Val, other: Val) bool {
         return self.slice.ptr == other.slice.ptr;
     }
-    pub fn format(
-        self: @This(),
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: @This(), writer: *std.Io.Writer) error{WriteFailed}!void {
         return writer.writeAll(self.slice);
     }
 };
