@@ -17,7 +17,7 @@ The Visual Studio Installer manages thousands of components, modifies the regist
 - for CMake projects, see [examples/cmake/build.bat](examples/cmake/build.bat)
 - for "handmade" style projects, see [examples/handmade/build.bat](examples/handmade/build.bat)
 
-These examples contain batch scripts that download msvcup, install an MSVC/SDK, and then compile "hello.c".
+These examples contain batch scripts that download msvcup, install an MSVC/SDK, and then compile "hello.c". The cmake `build.bat` is also project agnostic, meaning it can be used to build most CMAKE projects with no changes.
 
 After downloading msvcup, the example will install the toolchain and an SDK with a command like this:
 
