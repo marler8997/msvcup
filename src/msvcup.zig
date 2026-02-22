@@ -64,7 +64,9 @@ pub fn main() !u8 {
 
 fn usage(arena: std.mem.Allocator) !noreturn {
     const msvcup_dir: MsvcupDir = try .alloc(arena);
-    try std.io.getStdErr().writer().print(
+    var stderr_buf: [1000]u8 = undefined;
+    var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+    stderr.interface.print(
         \\msvcup version {[version]s}
         \\
         \\Usage: msvcup COMMAND ARGS...
@@ -94,7 +96,8 @@ fn usage(arena: std.mem.Allocator) !noreturn {
             .version = @embedFile("version"),
             .install_dir = msvcup_dir.root_path,
         },
-    );
+    ) catch return stderr.err.?;
+    stderr.interface.flush() catch return stderr.err.?;
     std.process.exit(0xff);
 }
 
@@ -201,12 +204,14 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         }
     }
 
-    var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
-    try bw.writer().writeAll("autoenv\n");
+    var stdout_buf: [2000]u8 = undefined;
+    var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+    const w = &stdout.interface;
+    w.writeAll("autoenv\n") catch return stdout.err.?;
     for (msvcup_pkgs.items) |msvcup_pkg| {
-        try bw.writer().print("{}\n", .{msvcup_pkg});
+        w.print("{f}\n", .{msvcup_pkg}) catch return stdout.err.?;
     }
-    try bw.flush();
+    w.flush() catch return stdout.err.?;
     return 0;
 }
 
@@ -258,14 +263,16 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         }
     }
 
-    var bw = std.io.bufferedWriter(std.io.getStdOut().writer());
+    var stdout_buf: [2000]u8 = undefined;
+    var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+    const w = &stdout.interface;
     for (payload_indices.items) |payload_index| {
         const pkg_index = pkgs.pkgIndexFromPayloadIndex(payload_index);
         const payload = &pkgs.payloads[payload_index.int()];
         const pkg = &pkgs.slice[pkg_index.int()];
-        try bw.writer().print("{s} ({s})\n", .{ payload.file_name, pkg.id });
+        w.print("{s} ({s})\n", .{ payload.file_name, pkg.id }) catch return stdout.err.?;
     }
-    try bw.flush();
+    w.flush() catch return stdout.err.?;
     return 0;
 }
 
@@ -332,8 +339,10 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
         const sha256 = try fetch(root_node, scratch, uri, cache_path, .{});
         try finishCacheFetch(scratch, cache_dir, config.url, sha256, cache_path);
-        try std.io.getStdOut().writer().print("{f}", .{sha256});
-        try std.io.getStdOut().writer().writeAll("\n");
+        var stdout_buf: [80]u8 = undefined;
+        var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+        stdout.interface.print("{f}\n", .{sha256}) catch return stdout.err.?;
+        stdout.interface.flush() catch return stdout.err.?;
     }
     return 0;
 }
@@ -364,7 +373,8 @@ const Sha = struct {
         std.debug.assert(64 == (std.fmt.bufPrint(&buf, "{f}", .{sha}) catch unreachable).len);
         return buf;
     }
-    pub fn format(
+    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
+    pub fn formatLegacy(
         value: Sha,
         comptime fmt: []const u8,
         options: std.fmt.FormatOptions,
@@ -373,6 +383,9 @@ const Sha = struct {
         _ = fmt;
         _ = options;
         try writer.print("{f}", .{std.fmt.fmtSliceHexLower(&value.bytes)});
+    }
+    pub fn formatNew(value: Sha, writer: *std.Io.Writer) error{WriteFailed}!void {
+        try writer.print("{x}", .{&value.bytes});
     }
 };
 
@@ -446,7 +459,7 @@ const MsvcupPackage = struct {
     }
     pub fn poolString(self: MsvcupPackage) StringPool.Val {
         var buf: [100]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "{}", .{self}) catch @panic("version too long");
+        const name = std.fmt.bufPrint(&buf, "{f}", .{self}) catch @panic("version too long");
         return global.string_pool.add(name) catch |e| oom(e);
     }
     pub fn order(_: void, lhs: MsvcupPackage, rhs: MsvcupPackage) std.math.Order {
@@ -455,7 +468,8 @@ const MsvcupPackage = struct {
             .eq => orderDottedNumeric({}, lhs.version.slice, rhs.version.slice),
         };
     }
-    pub fn format(
+    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
+    pub fn formatLegacy(
         self: MsvcupPackage,
         comptime fmt: []const u8,
         options: std.fmt.FormatOptions,
@@ -464,6 +478,9 @@ const MsvcupPackage = struct {
         _ = fmt;
         _ = options;
         try writer.print("{s}-{s}", .{ @tagName(self.kind), self.version.slice });
+    }
+    pub fn formatNew(self: MsvcupPackage, writer: *std.Io.Writer) error{WriteFailed}!void {
+        try writer.print("{t}-{s}", .{ self.kind, self.version.slice });
     }
 };
 
@@ -592,7 +609,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 config.autoenv,
                 config.msvcup_pkgs,
             )) |mismatch| {
-                std.log.info("{}", .{mismatch});
+                std.log.info("{f}", .{mismatch});
             } else {
                 const result = try installFromLockFile(
                     scratch,
@@ -645,7 +662,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         config.autoenv,
         config.msvcup_pkgs,
     )) |mismatch| errExit(
-        "lock file '{s}' still doesn't match what we're installing even after it's been updated: {s}",
+        "lock file '{s}' still doesn't match what we're installing even after it's been updated: {f}",
         .{ config.lock_file, mismatch },
     );
     switch (try installFromLockFile(
@@ -762,7 +779,7 @@ fn updateFile(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !void 
     if (needs_update) {
         var file = try dir.createFile(sub_path, .{});
         defer file.close();
-        try file.writer().writeAll(content);
+        try file.writeAll(content);
     }
 }
 
@@ -771,7 +788,12 @@ const LockFileMismatch = union(enum) {
     autoenv: bool, // lockfile value
     missing_pkg: MsvcupPackage,
     extra_pkg: MsvcupPackage,
-    pub fn format(
+
+    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
+    pub fn formatNew(self: LockFileMismatch, writer: *std.Io.Writer) error{WriteFailed}!void {
+        try self.formatLegacy("", .{}, writer);
+    }
+    pub fn formatLegacy(
         self: LockFileMismatch,
         comptime fmt: []const u8,
         options: std.fmt.FormatOptions,
@@ -788,8 +810,8 @@ const LockFileMismatch = union(enum) {
                 "lock file {s} autoenv",
                 .{@as([]const u8, if (lockfile_value) "has" else "does not have")},
             ),
-            .missing_pkg => |pkg| try writer.print("lock file is missing package '{}'", .{pkg}),
-            .extra_pkg => |pkg| try writer.print("lock file has extra package '{}' that was not given on cmdline", .{pkg}),
+            .missing_pkg => |pkg| try writer.print("lock file is missing package '{f}'", .{pkg}),
+            .extra_pkg => |pkg| try writer.print("lock file has extra package '{f}' that was not given on cmdline", .{pkg}),
         }
     }
 };
@@ -964,7 +986,7 @@ fn parseLockFileLine(
                 .{ lock_file_path, lineno },
             );
             if (maybe_msvcup_pkg) |p| errExit(
-                "{s}:{}: cab payloads should not have an associated msvcup package ('{}' in this case)",
+                "{s}:{}: cab payloads should not have an associated msvcup package ('{f}' in this case)",
                 .{ lock_file_path, lineno, p },
             );
             return .{ .payload = .{
@@ -1254,37 +1276,36 @@ fn generateLibcTxt(
     unique_pkgs: *const UniquePackages,
     target_cpu: Arch,
 ) error{OutOfMemory}![]u8 {
-    var content: std.ArrayListUnmanaged(u8) = .{};
-    defer content.deinit(allocator);
-    const writer = content.writer(allocator);
+    var aw: std15.Io.Writer.Allocating = try .initCapacity(allocator, 1000);
+    defer aw.deinit();
     if (unique_pkgs.msvc) |msvc_version| {
-        try writer.print(
+        aw.writer.print(
             \\sys_include_dir={[install]s}\VC\Tools\MSVC\{[version]s}\include
             \\msvc_lib_dir={[install]s}\VC\Tools\MSVC\{[version]s}\lib\{[target]s}
             \\
         , .{
             .install = install_path.slice,
-            .version = msvc_version,
+            .version = msvc_version.slice,
             .target = @tagName(target_cpu),
-        });
+        }) catch return error.OutOfMemory;
     }
     if (unique_pkgs.sdk) |sdk_version| {
-        try writer.print(
+        aw.writer.print(
             \\include_dir={[install]s}\Windows Kits\10\Include\{[version]s}\ucrt
             \\kernel32_lib_dir={[install]s}\Windows Kits\10\lib\{[version]s}\um\{[target]s}
             \\crt_dir={[install]s}\Windows Kits\10\Lib\{[version]s}\ucrt\{[target]s}
             \\
         , .{
             .install = install_path.slice,
-            .version = sdk_version,
+            .version = sdk_version.slice,
             .target = @tagName(target_cpu),
-        });
+        }) catch return error.OutOfMemory;
     }
-    try writer.writeAll(
+    aw.writer.writeAll(
         \\gcc_dir=
         \\
-    );
-    return content.toOwnedSlice(allocator) catch |e| oom(e);
+    ) catch return error.OutOfMemory;
+    return aw.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 const CacheEntry = struct {
@@ -1297,7 +1318,7 @@ const CacheEntry = struct {
         sha256: Sha,
         name: []const u8,
     ) CacheEntry {
-        const cache_basename = std.fmt.allocPrint(scratch, "{s}-{s}", .{ sha256, name }) catch |e| oom(e);
+        const cache_basename = std.fmt.allocPrint(scratch, "{f}-{s}", .{ sha256, name }) catch |e| oom(e);
         defer scratch.free(cache_basename);
         const path = std.fs.path.join(allocator, &.{ cache_dir, cache_basename }) catch |e| oom(e);
         const new_basename = path[path.len - cache_basename.len ..];
@@ -1347,7 +1368,7 @@ fn installPayload(
     const installed_manifest_path = std.fs.path.join(scratch, &.{ install_dir_path, "install", installed_basename }) catch |e| oom(e);
     defer scratch.free(installed_manifest_path);
     if (std.fs.cwd().access(installed_manifest_path, .{})) {
-        log.info("ALREADY INSTALLED | {s} {s}", .{ basenameFromUrl(url_decoded), &sha256 });
+        log.info("ALREADY INSTALLED | {s} {f}", .{ basenameFromUrl(url_decoded), sha256 });
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -1450,16 +1471,22 @@ fn installPayload(
     }
 
     {
-        const current_install = try startInstall(scratch, install_dir_handle, current_install_path);
-        defer current_install.close();
+        const current_install_file = try startInstall(scratch, install_dir_handle, current_install_path);
+        defer current_install_file.close();
+        var write_buf: [1000]u8 = undefined;
+        var file_writer: File15.Writer = .init(current_install_file, &write_buf);
+        var writer: FileWriter = .{
+            .error_ref = &file_writer.err,
+            .interface = &file_writer.interface,
+        };
         // this will always starts with the cache basename
-        try current_install.writer().print("{s}\n", .{cache_entry.basename});
+        try writer.printFlush("{s}\n", .{cache_entry.basename});
         switch (pre_start_data) {
             .vsix => try installPayloadZip(
                 scratch,
                 cache_entry.path,
                 install_dir_handle,
-                current_install,
+                &writer,
                 .vsix,
                 strip_root_dir,
             ),
@@ -1470,7 +1497,7 @@ fn installPayload(
                     scratch,
                     .{ .path = install_dir_path, .handle = install_dir_handle },
                     target_dir,
-                    current_install,
+                    &writer,
                     basenameFromUrl(url_decoded),
                 );
                 try deleteTree(std.fs.cwd(), msi.staging_dir);
@@ -1479,7 +1506,7 @@ fn installPayload(
                 scratch,
                 cache_entry.path,
                 install_dir_handle,
-                current_install,
+                &writer,
                 .zip,
                 strip_root_dir,
             ),
@@ -1488,6 +1515,19 @@ fn installPayload(
 
     try endInstall(scratch, installed_manifest_path, current_install_path);
 }
+
+const FileWriter = struct {
+    error_ref: *?std.fs.File.WriteError,
+    interface: *std15.Io.Writer,
+    fn printFlush(
+        file_writer: *const FileWriter,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) std.fs.File.WriteError!void {
+        file_writer.interface.print(fmt, args) catch return file_writer.error_ref.*.?;
+        file_writer.interface.flush() catch return file_writer.error_ref.*.?;
+    }
+};
 
 fn normalizePathSeps(path: []u8) void {
     for (path) |*char| char.* = switch (char.*) {
@@ -1533,8 +1573,9 @@ fn populateStagingMsi(scratch: std.mem.Allocator, msi_file_path: []const u8, sta
     switch (result.term) {
         .Exited => |exit_code| {
             if (exit_code != 0) {
-                try std.io.getStdErr().writer().writeAll(result.stdout);
-                try std.io.getStdErr().writer().writeAll(result.stderr);
+                var stderr: File15.Writer = .init(stderrFile(), &.{});
+                stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
+                stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
                 errExit(
                     "msiexec for '{s}' failed with exit code {} (output stdout={} bytes stderr={} bytes)",
                     .{ msi_file_path, exit_code, result.stdout.len, result.stderr.len },
@@ -1542,8 +1583,9 @@ fn populateStagingMsi(scratch: std.mem.Allocator, msi_file_path: []const u8, sta
             }
         },
         inline else => |e| {
-            try std.io.getStdErr().writer().writeAll(result.stdout);
-            try std.io.getStdErr().writer().writeAll(result.stderr);
+            var stderr: File15.Writer = .init(stderrFile(), &.{});
+            stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
+            stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
             errExit("msiexec for '{s}' terminated with {}", .{ msi_file_path, e });
         },
     }
@@ -1553,7 +1595,7 @@ fn installPayloadZip(
     scratch: std.mem.Allocator,
     cache_path: []const u8,
     install_dir: std.fs.Dir,
-    installing_manifest: std.fs.File,
+    installing_manifest: *const FileWriter,
     kind: enum { vsix, zip },
     strip_root_dir: bool,
 ) !void {
@@ -1653,16 +1695,16 @@ fn installPayloadZip(
 
 fn updateInstallingManifest(
     install_dir: std.fs.Dir,
-    installing_manifest: std.fs.File,
+    installing_manifest: *const FileWriter,
     install_path: []const u8,
 ) !enum { already_installed, ready } {
     if (install_dir.openFile(install_path, .{})) |file| {
         defer file.close();
-        try installing_manifest.writer().print("add {s}\n", .{install_path});
+        try installing_manifest.printFlush("add {s}\n", .{install_path});
         return .already_installed;
     } else |err| switch (err) {
         error.FileNotFound => {
-            try installing_manifest.writer().print("new {s}\n", .{install_path});
+            try installing_manifest.printFlush("new {s}\n", .{install_path});
             if (std.fs.path.dirname(install_path)) |d| try install_dir.makePath(d);
             return .ready;
         },
@@ -1726,7 +1768,7 @@ fn installDir(
     scratch: std.mem.Allocator,
     install_dir: OpenDir,
     source_dir_path: []const u8,
-    installing_manifest: std.fs.File,
+    installing_manifest: *const FileWriter,
     root_exclude: []const u8,
 ) !struct { root_excluded: bool } {
     var source_dir = try std.fs.cwd().openDir(source_dir_path, .{ .iterate = true });
@@ -1781,7 +1823,7 @@ pub fn deleteTree(dir: std.fs.Dir, sub_path: []const u8) !void {
             switch (err) {
                 error.FileBusy => {
                     std.log.warn("path '{s}' is busy (attempt {}), will retry", .{ sub_path, attempt });
-                    std.time.sleep(std.time.ns_per_ms * 100); // sleep for 100 ms
+                    std.Thread.sleep(std.time.ns_per_ms * 100); // sleep for 100 ms
                 },
                 else => |e| return e,
             }
@@ -1849,7 +1891,9 @@ fn endInstall(
     {
         const installed_manifest = try std.fs.cwd().createFile(installed_manifest_path_tmp, .{});
         defer installed_manifest.close();
-        var bw = std.io.bufferedWriter(installed_manifest.writer());
+        var buf: [8192]u8 = undefined;
+        var file_writer: File15.Writer = .init(installed_manifest, &buf);
+        const w = &file_writer.interface;
 
         const content = blk: {
             const current_install_file = try std.fs.cwd().openFile(current_install_path, .{});
@@ -1874,16 +1918,16 @@ fn endInstall(
             if (line.len == 0) continue;
             if (std.mem.startsWith(u8, line, "new ")) {
                 const sub_path = line[4..];
-                try bw.writer().print("{s}\n", .{sub_path});
+                w.print("{s}\n", .{sub_path}) catch return file_writer.err.?;
             } else if (std.mem.startsWith(u8, line, "add ")) {
                 const sub_path = line[4..];
-                try bw.writer().print("{s}\n", .{sub_path});
+                w.print("{s}\n", .{sub_path}) catch return file_writer.err.?;
             } else std.debug.panic(
                 "{s}:{}: line did not start with 'new ' nor 'add ': '{s}'",
                 .{ current_install_path, lineno, line },
             );
         }
-        try bw.flush();
+        w.flush() catch return file_writer.err.?;
     }
     try std.fs.cwd().deleteFile(current_install_path);
     try std.fs.cwd().rename(installed_manifest_path_tmp, installed_manifest_path);
@@ -1977,6 +2021,8 @@ const InstallPackage = struct {
         return PackageIndex.order(pkgs, lhs.index, rhs.index);
     }
 };
+
+const CabOffset = struct { cab_offset: usize };
 
 fn updateLockFile(
     scratch: std.mem.Allocator,
@@ -2213,7 +2259,6 @@ fn updateLockFile(
 
     var cabs: std.ArrayListUnmanaged(PayloadIndex) = .{};
     defer cabs.deinit(scratch);
-    const CabOffset = struct { cab_offset: usize };
     var payload_cab_offsets: []CabOffset = scratch.alloc(CabOffset, payloads.len) catch |e| oom(e);
     defer scratch.free(payload_cab_offsets);
 
@@ -2305,14 +2350,29 @@ fn updateLockFile(
     if (std.fs.path.dirname(lock_file_path)) |dir| try std.fs.cwd().makePath(dir);
     const lock_file = try std.fs.cwd().createFile(lock_file_path, .{});
     defer lock_file.close();
-    var bw = std.io.bufferedWriter(lock_file.writer());
-    // try bw.writer().print("msvc {s}\n", .{msvc_version});
-    // for (sdk_versions) |sdk_version| {
-    //     try bw.writer().print("sdk {s}\n", .{sdk_version});
-    // }
-    // try bw.writer().writeAll("payloads:\n");
+    var write_buf: [8192]u8 = undefined;
+    var lock_file_writer: File15.Writer = .init(lock_file, &write_buf);
+    writeLockFile(
+        autoenv,
+        pkgs,
+        payloads,
+        cabs.items,
+        payload_cab_offsets,
+        &lock_file_writer.interface,
+    ) catch |err| switch (err) {
+        error.WriteFailed => return lock_file_writer.err.?,
+    };
+}
+fn writeLockFile(
+    autoenv: bool,
+    pkgs: Packages,
+    payloads: []const InstallPayload,
+    cabs: []const PayloadIndex,
+    payload_cab_offsets: []const CabOffset,
+    writer: *std15.Io.Writer,
+) error{WriteFailed}!void {
     if (autoenv) {
-        try bw.writer().writeAll("autoenv\n");
+        try writer.writeAll("autoenv\n");
     }
     for (payloads, 0..) |install_payload, payload_cab_offsets_index| {
         const payload = pkgs.payloads[install_payload.index.int()];
@@ -2324,23 +2384,19 @@ fn updateLockFile(
             "unable to determine the payload kind from url '{s}'",
             .{payload.url_decoded},
         );
-        const pkg_index = pkgs.pkgIndexFromPayloadIndex(install_payload.index);
-        const pkg = &pkgs.slice[pkg_index.int()];
-        _ = pkg;
-
         const cabs_start = payload_cab_offsets[payload_cab_offsets_index].cab_offset;
         const cabs_limit = if (payload_cab_offsets_index + 1 >= payload_cab_offsets.len)
-            cabs.items.len
+            cabs.len
         else
             payload_cab_offsets[payload_cab_offsets_index + 1].cab_offset;
-        for (cabs.items[cabs_start..cabs_limit]) |cab_payload_index| {
+        for (cabs[cabs_start..cabs_limit]) |cab_payload_index| {
             const cab_payload = pkgs.payloads[cab_payload_index.int()];
             std.debug.assert(.cab == getLockFileUrlKind(cab_payload.url_decoded).?);
-            try writePayload(bw.writer(), null, .cab, cab_payload.url_decoded, cab_payload.sha256, cab_payload.file_name);
+            try writePayload(writer, null, .cab, cab_payload.url_decoded, cab_payload.sha256, cab_payload.file_name);
         }
-        try writePayload(bw.writer(), install_payload.target, url_kind, payload.url_decoded, payload.sha256, payload.file_name);
+        try writePayload(writer, install_payload.target, url_kind, payload.url_decoded, payload.sha256, payload.file_name);
     }
-    try bw.flush();
+    try writer.flush();
 }
 
 fn indexOfCab(msi_content: []const u8, pos: usize) ?usize {
@@ -2389,9 +2445,15 @@ fn writePayload(
 
     const sha_hex = sha256.toHex();
     if (std.ascii.indexOfIgnoreCase(url, &sha_hex)) |hash_index| {
-        try writer.print("{s}|{s}|{d}{s}{s}\n", .{ target_str, url, hash_index, space, out_file_name });
+        try writer.print(
+            "{s}|{s}|{d}{s}{s}\n",
+            .{ target_str, url, hash_index, space, out_file_name },
+        );
     } else {
-        try writer.print("{s}|{s}|{s}{s}{s}\n", .{ target_str, url, sha256, space, std.fs.path.basenameWindows(out_file_name) });
+        try writer.print(
+            "{s}|{s}|{f}{s}{s}\n",
+            .{ target_str, url, sha256, space, std.fs.path.basenameWindows(out_file_name) },
+        );
     }
 }
 
@@ -2809,28 +2871,28 @@ fn vsManifestPayloadFromChManifest(
     defer parsed.deinit();
     const json_file: JsonContext.File = .{ .file_path = chman.path };
     var json_error: JsonContext.Error = undefined;
-    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{}", .{json_error});
-    const channel_items_field = file_obj.getField(&json_error, "channelItems") catch errExit("{}", .{json_error});
-    const channel_items = channel_items_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{f}", .{json_error});
+    const channel_items_field = file_obj.getField(&json_error, "channelItems") catch errExit("{f}", .{json_error});
+    const channel_items = channel_items_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
     const payload = blk: {
         const vs_manifest_channel_id = switch (channel_kind) {
             .release => "Microsoft.VisualStudio.Manifests.VisualStudio",
             .preview => "Microsoft.VisualStudio.Manifests.VisualStudioPreview",
         };
         for (0..channel_items.items.len) |index| {
-            const channel_item_element = channel_items.getElement(&json_error, index) catch errExit("{}", .{json_error});
-            const channel_item = channel_item_element.as(.object, &json_error) catch errExit("{}", .{json_error});
-            const id_field = channel_item.getField(&json_error, "id") catch errExit("{}", .{json_error});
-            const id = id_field.as(.string, &json_error) catch errExit("{}", .{json_error});
+            const channel_item_element = channel_items.getElement(&json_error, index) catch errExit("{f}", .{json_error});
+            const channel_item = channel_item_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
+            const id_field = channel_item.getField(&json_error, "id") catch errExit("{f}", .{json_error});
+            const id = id_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
             if (std.mem.eql(u8, id, vs_manifest_channel_id)) {
-                const payloads_field = channel_item.getField(&json_error, "payloads") catch errExit("{}", .{json_error});
-                const payloads = payloads_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+                const payloads_field = channel_item.getField(&json_error, "payloads") catch errExit("{f}", .{json_error});
+                const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
                 if (payloads.items.len != 1) errExit(
                     "{s}: channelItem with id \"{s}\" has {} payloads instead of 1",
                     .{ chman.path, id, payloads.items.len },
                 );
                 const payload_element = payloads.getElement(&json_error, 0) catch unreachable;
-                const payload_object = payload_element.as(.object, &json_error) catch errExit("{}", .{json_error});
+                const payload_object = payload_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
                 break :blk PayloadJson.init(payload_object);
             }
         }
@@ -2855,16 +2917,16 @@ const PayloadJson = struct {
         var err: JsonContext.Error = undefined;
 
         const file_name = blk: {
-            const field = obj.getField(&err, "fileName") catch errExit("{}", .{err});
-            break :blk field.as(.string, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "fileName") catch errExit("{f}", .{err});
+            break :blk field.as(.string, &err) catch errExit("{f}", .{err});
         };
         const sha256: Sha = blk: {
-            const field = obj.getField(&err, "sha256") catch errExit("{}", .{err});
-            const str = field.as(.string, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "sha256") catch errExit("{f}", .{err});
+            const str = field.as(.string, &err) catch errExit("{f}", .{err});
             if (str.len != 64) {
                 const file_path: []const u8 = if (obj.parent_context.getFilePath()) |p| p else "?";
                 errExit(
-                    "{s}: {} value '{s}' is {} chars but expected 64",
+                    "{s}: {f} value '{s}' is {} chars but expected 64",
                     .{ file_path, field, str, str.len },
                 );
             }
@@ -2875,20 +2937,20 @@ const PayloadJson = struct {
             };
         };
         const size: u63 = blk: {
-            const field = obj.getField(&err, "size") catch errExit("{}", .{err});
-            const size = field.as(.integer, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "size") catch errExit("{f}", .{err});
+            const size = field.as(.integer, &err) catch errExit("{f}", .{err});
             if (size < 0) {
                 const file_path: []const u8 = if (obj.parent_context.getFilePath()) |p| p else "?";
                 errExit(
-                    "{s}: {} size {} is negative",
+                    "{s}: {f} size {} is negative",
                     .{ file_path, field, size },
                 );
             }
             break :blk @intCast(size);
         };
         const url = blk: {
-            const field = obj.getField(&err, "url") catch errExit("{}", .{err});
-            break :blk field.as(.string, &err) catch errExit("{}", .{err});
+            const field = obj.getField(&err, "url") catch errExit("{f}", .{err});
+            break :blk field.as(.string, &err) catch errExit("{f}", .{err});
         };
 
         return .{
@@ -3070,7 +3132,7 @@ fn resolveChannelManifestUrlToFile(
     out_path: []const u8,
 ) !void {
     // TODO: progres report
-    log.info("resolving URL '{}'...", .{uri});
+    log.info("resolving URL '{f}'...", .{uri});
 
     var client = std.http.Client{ .allocator = scratch };
     defer client.deinit();
@@ -3109,7 +3171,6 @@ fn resolveChannelManifestUrlToFile(
                 try out_file.writer().writeAll(redirect_url);
                 return;
             }
-            errExit("redirect response missing Location header", .{});
         },
         else => |e| return e,
     };
@@ -3198,8 +3259,8 @@ fn fetch(
         size: ?u64 = null,
     },
 ) !Sha {
-    log.info("fetch: {}", .{uri});
-    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {}", .{uri}) catch |e| oom(e);
+    log.info("fetch: {f}", .{uri});
+    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {f}", .{uri}) catch |e| oom(e);
     defer scratch.free(progress_node_name);
     const node = progress_node.start(progress_node_name, 1);
     defer node.end();
@@ -3235,7 +3296,7 @@ fn fetch(
         if (request.response.content_length) |content_length| {
             if (opt.size) |size| {
                 if (size != content_length) errExit(
-                    "fetch '{}': Content-Length {} != expected size {}",
+                    "fetch '{f}': Content-Length {} != expected size {}",
                     .{ uri, content_length, size },
                 );
             }
@@ -3258,7 +3319,7 @@ fn fetch(
         total_received += len;
         if (request.response.content_length) |content_length| {
             if (total_received > content_length) errExit(
-                "fetch '{}': read more than Content-Length ({})",
+                "fetch '{f}': read more than Content-Length ({})",
                 .{ uri, content_length },
             );
         }
@@ -3273,11 +3334,11 @@ fn fetch(
 
     if (request.response.content_length) |content_length| {
         if (total_received != content_length) errExit(
-            "fetch '{}': Content-Length is {} but only read {}",
+            "fetch '{f}': Content-Length is {} but only read {}",
             .{ uri, content_length, total_received },
         );
     } else if (opt.size) |size| if (total_received != size) errExit(
-        "fetch '{}': expected size {} but read {}",
+        "fetch '{f}': expected size {} but read {}",
         .{ uri, size, total_received },
     );
 
@@ -3435,9 +3496,9 @@ fn getPackages(
     defer parsed.deinit();
     const json_file: JsonContext.File = .{ .file_path = vsman.path };
     var json_error: JsonContext.Error = undefined;
-    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{}", .{json_error});
-    const packages_field = file_obj.getField(&json_error, "packages") catch errExit("{}", .{json_error});
-    const packages = packages_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{f}", .{json_error});
+    const packages_field = file_obj.getField(&json_error, "packages") catch errExit("{f}", .{json_error});
+    const packages = packages_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
     const out_packages = allocator.alloc(Package, packages.items.len + extrapkgs.all.len) catch |e| oom(e);
     var out_package_count: usize = 0;
     errdefer {
@@ -3450,15 +3511,15 @@ fn getPackages(
     const payload_count: usize = payload_count_blk: {
         var payload_count: usize = 0;
         for (0..packages.items.len) |pkg_index| {
-            const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{}", .{json_error});
-            const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{}", .{json_error});
-            const id_field = pkg_obj.getField(&json_error, "id") catch errExit("{}", .{json_error});
-            const id = id_field.as(.string, &json_error) catch errExit("{}", .{json_error});
-            const version_field = pkg_obj.getField(&json_error, "version") catch errExit("{}", .{json_error});
-            const version = version_field.as(.string, &json_error) catch errExit("{}", .{json_error});
+            const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{f}", .{json_error});
+            const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
+            const id_field = pkg_obj.getField(&json_error, "id") catch errExit("{f}", .{json_error});
+            const id = id_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
+            const version_field = pkg_obj.getField(&json_error, "version") catch errExit("{f}", .{json_error});
+            const version = version_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
             const language: Language = language_blk: {
                 const language_field = pkg_obj.getOptionalField("language") orelse break :language_blk .neutral;
-                const language = language_field.as(.string, &json_error) catch errExit("{}", .{json_error});
+                const language = language_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
                 const en_us = "en-US";
                 if (std.mem.eql(u8, language, "neutral")) break :language_blk .neutral;
                 if (std.mem.eql(u8, language, en_us)) break :language_blk .en_us;
@@ -3469,7 +3530,7 @@ fn getPackages(
             const payloads_offset = payload_count;
             if (pkg_obj.map.get("payloads")) |payloads_field_node| {
                 const payloads_field: JsonContext.Field = .init(pkg_obj.parent_context, "payloads", payloads_field_node);
-                const payloads = payloads_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+                const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
                 payload_count += payloads.items.len;
             }
             out_packages[pkg_index] = .{
@@ -3513,15 +3574,15 @@ fn getPackages(
 
     for (0..packages.items.len) |pkg_index| {
         std.debug.assert(out_packages[pkg_index].payloads_offset == out_payload_count);
-        const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{}", .{json_error});
-        const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{}", .{json_error});
+        const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{f}", .{json_error});
+        const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
         if (pkg_obj.map.get("payloads")) |payloads_field_node| {
             const payloads_field: JsonContext.Field = .init(pkg_obj.parent_context, "payloads", payloads_field_node);
-            const payloads = payloads_field.as(.array, &json_error) catch errExit("{}", .{json_error});
+            const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
             // payload_count += payloads.items.len;
             for (0..payloads.items.len) |payload_index| {
-                const payload_element = payloads.getElement(&json_error, payload_index) catch errExit("{}", .{json_error});
-                const payload_object = payload_element.as(.object, &json_error) catch errExit("{}", .{json_error});
+                const payload_element = payloads.getElement(&json_error, payload_index) catch errExit("{f}", .{json_error});
+                const payload_object = payload_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
                 const payload_json = PayloadJson.init(payload_object);
                 out_payloads[out_payload_count] = .{
                     .url_decoded = allocUrlPercentDecoded(allocator, payload_json.url) catch |e| oom(e),
@@ -3685,16 +3746,33 @@ fn insertSorted(
     }
 }
 
+pub fn stdoutFile() std.fs.File {
+    return if (zig_atleast_15) std.fs.File.stdout() else std.io.getStdOut();
+}
+pub fn stderrFile() std.fs.File {
+    return if (zig_atleast_15) std.fs.File.stderr() else std.io.getStdErr();
+}
+
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
-    log.err(fmt, args);
+    var stderr_buf: [1000]u8 = undefined;
+    var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+    const writer = &stderr.interface;
+    writer.print(fmt, args) catch |e| std.debug.panic(
+        "error {s} printing another error to stdout",
+        .{@errorName(e)},
+    );
     std.process.exit(0xff);
 }
 fn oom(e: error{OutOfMemory}) noreturn {
     @panic(@errorName(e));
 }
 
+const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+const File15 = if (zig_atleast_15) std.fs.File else std15.fs.File15;
+
 const builtin = @import("builtin");
 const std = @import("std");
+const std15 = if (zig_atleast_15) std else @import("std15");
 const extrapkgs = @import("extrapkgs");
 const ChannelKind = @import("channelkind.zig").ChannelKind;
 const Arch = @import("arch.zig").Arch;

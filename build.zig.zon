@@ -8,6 +8,11 @@
             .url = "git+https://github.com/marler8997/zipcmdline#3dfca786a489d117e4b72ea10ffb4bbd9fc2dd72",
             .hash = "12201a08d7eff7619c8eb8284691a3ff959861b4bdd87216f180ed136672fb4ea26f",
         },
+        .iobackport = .{
+            .url = "git+https://github.com/marler8997/zig-io-backport#362d6c3802e4c9e043619350238f8488debe6432",
+            .hash = "iobackport-0.0.0-KeWQeMWcAwBt3oa_7_WJMEO6gSGDShGSM_s7lpdARWeL",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
