@@ -1,18 +1,27 @@
 const JsonContext = @This();
 
 parent: ?*const JsonContext,
-format_fn: *const fn (*const JsonContext, std.io.AnyWriter, FormatDepth) anyerror!void,
+format_fn: *const fn (*const JsonContext, FormatFnWriter, FormatDepth) FormatFnError!void,
 get_file_path_fn: *const fn (*const JsonContext) ?[]const u8,
+
+const FormatFnWriter = if (zig_atleast_15) *std.Io.Writer else std.io.AnyWriter;
+const FormatFnError = if (zig_atleast_15) error{WriteFailed} else anyerror;
 
 pub fn getFilePath(self: *const JsonContext) ?[]const u8 {
     if (self.get_file_path_fn(self)) |p| return p;
     return (self.parent orelse return null).getFilePath();
 }
-fn formatParent(self: *const JsonContext, writer: std.io.AnyWriter) anyerror!void {
+fn formatParent(self: *const JsonContext, writer: FormatFnWriter) FormatFnError!void {
     if (self.parent) |p| try p.formatParent(writer);
     try self.format_fn(self, writer, .parent);
 }
-pub fn format(
+
+pub const format = if (zig_atleast_15) formatNew else formatLegacy;
+pub fn formatNew(self: *const JsonContext, writer: *std15.Io.Writer) !void {
+    if (self.parent) |p| try p.formatParent(writer);
+    try self.format_fn(self, writer, .self);
+}
+pub fn formatLegacy(
     self: *const JsonContext,
     comptime fmt: []const u8,
     options: std.fmt.FormatOptions,
@@ -139,11 +148,15 @@ pub const Error = struct {
         self.* = .{ .context = context, .payload = payload };
         return error.Json;
     }
-    pub fn format(
+    pub const format = if (zig_atleast_15) Error.formatNew else Error.formatLegacy;
+    pub fn formatNew(self: Error, writer: *std15.Io.Writer) error{WriteFailed}!void {
+        try self.formatLegacy("", .{}, writer);
+    }
+    pub fn formatLegacy(
         self: Error,
         comptime fmt: []const u8,
         options: std.fmt.FormatOptions,
-        writer: std.io.AnyWriter,
+        writer: anytype,
     ) !void {
         _ = fmt;
         _ = options;
@@ -152,15 +165,15 @@ pub const Error = struct {
         }
         switch (self.payload) {
             .unexpected_type => |u| try writer.print(
-                "at {}, expected {s} but got {s}",
+                "at {f}, expected {s} but got {s}",
                 .{ self.context, u.expected.an(), u.actual.an() },
             ),
             .missing_field => |name| try writer.print(
-                "{} is missing field '{s}'",
+                "{f} is missing field '{s}'",
                 .{ self.context, name },
             ),
             .array_index_out_of_bounds => |index| try writer.print(
-                "index {} is out of bounds for {}",
+                "index {} is out of bounds for {f}",
                 .{ index, self.context },
             ),
         }
@@ -190,7 +203,7 @@ pub const File = struct {
         const self: *const File = @alignCast(@fieldParentPtr("context", context));
         return self.file_path;
     }
-    fn format2(context: *const JsonContext, writer: std.io.AnyWriter, depth: FormatDepth) anyerror!void {
+    fn format2(context: *const JsonContext, writer: FormatFnWriter, depth: FormatDepth) FormatFnError!void {
         _ = context;
         switch (depth) {
             .self => try writer.writeAll("the file's root value"),
@@ -245,11 +258,15 @@ pub const Field = struct {
         return json_type.contextFromValue(out_err, &self.context, self.value);
     }
 
-    pub fn format(
+    pub const format = if (zig_atleast_15) Field.formatNew else Field.formatLegacy;
+    pub fn formatNew(self: *const Field, writer: *std15.Io.Writer) error{WriteFailed}!void {
+        try writer.print("{f}", .{&self.context});
+    }
+    pub fn formatLegacy(
         self: *const Field,
         comptime fmt: []const u8,
         options: std.fmt.FormatOptions,
-        writer: std.io.AnyWriter,
+        writer: anytype,
     ) !void {
         _ = fmt;
         _ = options;
@@ -260,7 +277,7 @@ pub const Field = struct {
         _ = context;
         return null;
     }
-    fn format2(context: *const JsonContext, writer: std.io.AnyWriter, depth: FormatDepth) anyerror!void {
+    fn format2(context: *const JsonContext, writer: FormatFnWriter, depth: FormatDepth) FormatFnError!void {
         const self: *const Field = @alignCast(@fieldParentPtr("context", context));
         _ = depth;
         try writer.print(".{s}", .{self.name});
@@ -313,11 +330,14 @@ pub const Element = struct {
         _ = context;
         return null;
     }
-    fn format2(context: *const JsonContext, writer: std.io.AnyWriter, depth: FormatDepth) anyerror!void {
+    fn format2(context: *const JsonContext, writer: FormatFnWriter, depth: FormatDepth) FormatFnError!void {
         const self: *const Element = @alignCast(@fieldParentPtr("context", context));
         _ = depth;
         try writer.print("[{}]", .{self.index});
     }
 };
 
+const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+
 const std = @import("std");
+const std15 = if (zig_atleast_15) std else @import("std15");

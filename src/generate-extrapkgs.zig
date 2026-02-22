@@ -1,3 +1,9 @@
+const Payload = struct {
+    url: []const u8,
+    sha: []const u8,
+    ex: extra.Payload,
+};
+
 pub fn main() !void {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
@@ -8,11 +14,6 @@ pub fn main() !void {
     const in_path = all_args[0];
     const out_path = all_args[1];
 
-    const Payload = struct {
-        url: []const u8,
-        sha: []const u8,
-        ex: extra.Payload,
-    };
     var payloads: std.ArrayListUnmanaged(Payload) = .{};
 
     const in = try std.fs.cwd().readFileAlloc(arena, in_path, std.math.maxInt(usize));
@@ -42,9 +43,13 @@ pub fn main() !void {
 
     var out_file = try std.fs.cwd().createFile(out_path, .{});
     defer out_file.close();
-    var buffered_writer = std.io.bufferedWriter(out_file.writer());
-    const writer = &buffered_writer.writer();
-
+    var out_file_buf: [1000]u8 = undefined;
+    var out_file_writer: File15.Writer = .init(out_file, &out_file_buf);
+    writeCode(payloads.items, &out_file_writer.interface) catch |err| switch (err) {
+        error.WriteFailed => return out_file_writer.err.?,
+    };
+}
+fn writeCode(payloads: []const Payload, writer: *std15.Io.Writer) error{WriteFailed}!void {
     try writer.writeAll(
         \\pub const Payload = struct {
         \\    url: []const u8,
@@ -60,7 +65,7 @@ pub fn main() !void {
     var end_pkg: []const u8 = "pub const all = [_]Package{";
     var current_pkg: ?extra.Package = null;
     var payload_sep: FirstOnce("", ", ") = .{};
-    for (payloads.items) |payload| {
+    for (payloads) |payload| {
         if (!equalsPackage(payload.ex.package, current_pkg)) {
             try writer.print(
                 "{s}.{{ .id = \"{s}-{s}\", .payloads = &.{{",
@@ -76,7 +81,7 @@ pub fn main() !void {
         try writer.print("}}", .{});
     }
     try writer.print("{s}}};\n", .{end_pkg});
-    try buffered_writer.flush();
+    try writer.flush();
 }
 
 fn FirstOnce(comptime first: []const u8, comptime separator: []const u8) type {
@@ -103,5 +108,10 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(0xff);
 }
 
+pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+
 const std = @import("std");
+const std15 = if (zig_atleast_15) std else @import("std15");
 const extra = @import("extra.zig");
+
+const File15 = if (zig_atleast_15) std.fs.File else std15.fs.File15;

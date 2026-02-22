@@ -33,6 +33,11 @@ pub fn build(b: *std.Build) !void {
                 .single_threaded = true,
             }),
         });
+        if (!zig_atleast_15) {
+            if (b.lazyDependency("iobackport", .{})) |iobackport| {
+                generate_exe.root_module.addImport("std15", iobackport.module("std15"));
+            }
+        }
         const run = b.addRunArtifact(generate_exe);
         run.addFileArg(b.path("extrapkgs.lock"));
         break :blk b.createModule(.{
@@ -56,6 +61,11 @@ pub fn build(b: *std.Build) !void {
             },
         }),
     });
+    if (!zig_atleast_15) {
+        if (b.lazyDependency("iobackport", .{})) |iobackport| {
+            msvcup.root_module.addImport("std15", iobackport.module("std15"));
+        }
+    }
     b.installArtifact(msvcup);
 
     {
@@ -83,7 +93,7 @@ pub fn build(b: *std.Build) !void {
 }
 
 fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
-    return b.addExecutable(.{
+    const exe = b.addExecutable(.{
         .name = "autoenv",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/autoenv.zig"),
@@ -101,6 +111,12 @@ fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
             .pic = true,
         }),
     });
+    if (!zig_atleast_15) {
+        if (b.lazyDependency("iobackport", .{})) |iobackport| {
+            exe.root_module.addImport("std15", iobackport.module("std15"));
+        }
+    }
+    return exe;
 }
 
 fn addTests(b: *std.Build, msvcup: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
@@ -136,9 +152,11 @@ fn ci(
     const zip_dep = b.dependency("zipcmdline", .{});
     const host_zip_exe = b.addExecutable(.{
         .name = "zip",
-        .root_source_file = zip_dep.path("src/zip.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
+        .root_module = b.createModule(.{
+            .root_source_file = zip_dep.path("src/zip.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
     });
 
     const ci_targets = [_][]const u8{
@@ -185,6 +203,11 @@ fn ci(
                 },
             }),
         });
+        if (!zig_atleast_15) {
+            if (b.lazyDependency("iobackport", .{})) |iobackport| {
+                msvcup_exe.root_module.addImport("std15", iobackport.module("std15"));
+            }
+        }
         install_exes.dependOn(
             &b.addInstallArtifact(msvcup_exe, .{ .dest_dir = .{ .override = target_dest_dir } }).step,
         );
@@ -254,6 +277,8 @@ fn makeCiArchiveStep(
     tar.step.dependOn(install_exes);
     return &tar.step;
 }
+
+pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
 
 const builtin = @import("builtin");
 const std = @import("std");
