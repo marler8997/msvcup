@@ -22,38 +22,28 @@ These examples contain batch scripts that download msvcup, install an MSVC/SDK, 
 After downloading msvcup, the example will install the toolchain and an SDK with a command like this:
 
 ```batch
-> msvcup install --lock-file msvcup.lock msvc-14.44.17.14 sdk-10.0.22621.7
+> msvcup install msvc autoenv msvc-14.44.17.14 sdk-10.0.22621.7
 ```
 
-All packages are installed to `C:\msvcup` so this would create the following directories:
+That command would install the 3 packages "autoenv", "msvc-14.44.17.14" and "sdk-10.0.22621.7" to the "msvc" directory. It also creates a lock file named "msvc.lock" alongside that msvc directory. This lock file contains all the packages and payloads along with URL's and hashes for everything msvcup installs. This lock file is meant to be commited to source control and its content is a hashable representation of all the content msvcup installs along with the entirety of all info msvcup requires to download everything.
 
-- `C:\msvcup\msvc-14.44.17.14` and
-- `C:\msvcup\sdk-10.0.22621.7`
-
-You can query the latest packages/versions using `msvcup list`.
+Use the `msvcup list` command to query the available packages/versions. Also note that msvcup caches everything it downloads into a global directory. Deleting the install directory and re-installing should require no network access.
 
 ## Visual Studio Command Prompts
 
-Each package includes a vcvars script for each target architecture:
+The install directory will include the following 4 vcvars files:
 
 - `vcvars-x64.bat`
 - `vcvars-arm64.bat`
 - `vcvars-x86.bat`
 - `vcvars-arm.bat`
 
-These scripts add extra environment variables like a "Visual Studio Command Prompt" would.
+These scripts update the `INCLUDE`, `PATH` and `LIB` environment variables which is what transforms your shell into a "Visual Studio Command Prompt".
 
-msvcup can also create an "automatic environment" directory which enables using the toolchain/sdk outside a special command prompt, e.g.
-
-```batch
-> msvcup autoenv --target-cpu x64 --out-dir autoenv-x64 msvc-14.44.17.14 sdk-10.0.22621.7
-```
-
-This generates a directory with wrapper executables (`cl.exe`, `link.exe`, etc) that can be invoked in a normal command prompt along with toolchain files for CMake/Zig.
+Note that if you include the "autoenv" package, your install directory will include `autoenv/$ARCH` subdirectories which enables using the toolchain/sdk outside a special command prompt.  It works by installing wrapper executables (`cl.exe`, `link.exe`, etc) that will initialize the environment variables before forwarding to the underlying executables, and also includes toolchain files for CMake/Zig.
 
 ## Additional Features
 
-- **Lock file**: All components and URLs are saved before install, enabling reproducible builds via source control.
 - **Install metadata**: Every installed file is tracked in `<package>/install`. This allows msvcup to detect file conflicts and allows the user to query which component(s) installed which files.
 - **Download cache**: Packages are cached in `C:\msvcup\cache`. Failed installs can be retried without network access.
 

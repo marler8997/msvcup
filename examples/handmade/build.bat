@@ -31,7 +31,7 @@
 
 @if not exist %~dp0msvcup.exe (
     echo msvcup.exe: installing...
-    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_02_07/msvcup-%MSVCUP_ARCH%-windows.zip
+    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_02_21/msvcup-%MSVCUP_ARCH%-windows.zip
     tar -C%~dp0 -xf %~dp0msvcup.zip
     del %~dp0msvcup.zip
 ) else (
@@ -39,17 +39,9 @@
 )
 @if not exist %~dp0msvcup.exe exit /b 1
 
-set MSVC=msvc-14.44.17.14
-set SDK=sdk-10.0.22621.7
-
-%~dp0msvcup.exe install --lock-file %~dp0msvcup.lock --manifest-update-off %MSVC% %SDK%
-@if %errorlevel% neq 0 (exit /b %errorlevel%)
-
-@REM @if not exist %~dp0autoenv mkdir %~dp0autoenv
-@REM @if not exist %~dp0autoenv\%TARGET_CPU% mkdir %~dp0autoenv\%TARGET_CPU%
-%~dp0msvcup.exe autoenv --target-cpu %TARGET_CPU% --out-dir %~dp0autoenv\%TARGET_CPU% %MSVC% %SDK%
+%~dp0msvcup.exe install %~dp0msvc --manifest-update-off autoenv msvc-14.44.17.14 sdk-10.0.22621.7
 @if %errorlevel% neq 0 (exit /b %errorlevel%)
 
 @if not exist %~dp0out mkdir %~dp0out
 @if not exist %~dp0out\%TARGET_CPU% mkdir %~dp0out\%TARGET_CPU%
-%~dp0autoenv\%TARGET_CPU%\cl /Fo%~dp0out\%TARGET_CPU%\ /Fe%~dp0out\%TARGET_CPU%\hello.exe %~dp0hello.c
+%~dp0msvc\autoenv\%TARGET_CPU%\cl /Fo%~dp0out\%TARGET_CPU%\ /Fe%~dp0out\%TARGET_CPU%\hello.exe %~dp0hello.c
