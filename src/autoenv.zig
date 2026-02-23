@@ -345,7 +345,7 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     var stderr_buf: [1000]u8 = undefined;
     var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
     const maybe_err: ?File15.WriteError = blk: {
-        stderr.interface.print(fmt, args) catch break :blk stderr.err.?;
+        stderr.interface.print(fmt ++ "\n", args) catch break :blk stderr.err.?;
         stderr.interface.flush() catch break :blk stderr.err.?;
         break :blk null;
     };
