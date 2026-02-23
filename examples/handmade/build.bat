@@ -31,7 +31,7 @@
 
 @if not exist %~dp0msvcup.exe (
     echo msvcup.exe: installing...
-    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_02_21/msvcup-%MSVCUP_ARCH%-windows.zip
+    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_02_22/msvcup-%MSVCUP_ARCH%-windows.zip
     tar -C%~dp0 -xf %~dp0msvcup.zip
     del %~dp0msvcup.zip
 ) else (
