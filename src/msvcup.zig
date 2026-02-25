@@ -3342,8 +3342,8 @@ fn fetch(
         size: ?u64 = null,
     },
 ) !Sha {
-    log.info("fetch: {f}", .{uri});
-    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {f}", .{uri}) catch |e| oom(e);
+    log.info("fetch: {}", .{uri});
+    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {}", .{uri}) catch |e| oom(e);
     defer scratch.free(progress_node_name);
     const node = progress_node.start(progress_node_name, 1);
     defer node.end();
