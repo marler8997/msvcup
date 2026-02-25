@@ -57,6 +57,7 @@ pub fn main() !u8 {
     if (std.mem.eql(u8, cmd, "install")) return install(arena, args);
     if (std.mem.eql(u8, cmd, "list")) return listCommand(arena, args);
     if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(arena, args);
+    if (std.mem.eql(u8, cmd, "msi")) return msiCommand(arena, args);
     if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(arena, args);
     log.err("unknown command '{s}'", .{cmd});
     return 0xff;
@@ -82,6 +83,7 @@ fn usage(arena: std.mem.Allocator) !noreturn {
         \\                            |
         \\                            | installed to {[install_dir]s}.
         \\  list-payloads             | List all the payloads.
+        \\  msi MSI DIR               | Invoke builtin msi installer.
         \\
         \\InstallOptions:
         \\--------------------------------------------------------------------------------
@@ -90,6 +92,7 @@ fn usage(arena: std.mem.Allocator) !noreturn {
         \\                            | if it's already been downloaded. This option will
         \\                            | control whether it's updated to the latest, OPT
         \\                            | can be set to "off", "daily", or "always".
+        \\  --msiexec                 | use msiexec.exe rather than builtin msi installer
         \\
     ,
         .{
@@ -273,6 +276,48 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         w.print("{s} ({s})\n", .{ payload.file_name, pkg.id }) catch return stdout.err.?;
     }
     w.flush() catch return stdout.err.?;
+    return 0;
+}
+
+fn msiCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+    const root_node = std.Progress.start(.{ .root_name = "msvcup msi" });
+    defer root_node.end();
+
+    const msi_path, const install_path = blk: {
+        var maybe_msi_path: ?[]const u8 = null;
+        var maybe_install_path: ?[]const u8 = null;
+
+        var arg_index: usize = 0;
+        while (arg_index < args.len) : (arg_index += 1) {
+            const arg = args[arg_index];
+            if (!std.mem.startsWith(u8, arg, "-")) {
+                if (maybe_msi_path == null) {
+                    maybe_msi_path = arg;
+                } else if (maybe_install_path == null) {
+                    maybe_install_path = arg;
+                } else errExit("too many cmdline args, expected only MSI_FILE and INSTALL_DIR", .{});
+            } else errExit("unknown cmdline argument '{s}'", .{arg});
+        }
+        break :blk .{
+            maybe_msi_path orelse errExit("missing cmdline args MSI_FILE and INSTALL_DIR", .{}),
+            maybe_install_path orelse errExit("missing cmdline arg INSTALL_DIR", .{}),
+        };
+    };
+
+    const msi_content = blk: {
+        const file = std.fs.cwd().openFile(msi_path, .{}) catch |err| errExit(
+            "open '{s}' failed with {s}",
+            .{ msi_path, @errorName(err) },
+        );
+        defer file.close();
+        break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
+    };
+    // defer arena.free(msi_content);
+    try @import("msi").install(arena, .{
+        .cabs_dir = std.fs.path.dirname(msi_path) orelse ".",
+        .msi_content = msi_content,
+        .install_path = install_path,
+    });
     return 0;
 }
 
@@ -497,6 +542,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         lock_file: []const u8,
         manifest_update: ManifestUpdate,
         cache_dir: ?[]const u8,
+        msiexec: bool = false,
     };
     const config: Config = blk_config: {
         var maybe_install_dir: ?[]const u8 = null;
@@ -505,6 +551,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         var maybe_lock_file: ?[]const u8 = null;
         var maybe_manifest_update: ?ManifestUpdate = null;
         var cache_dir: ?[]const u8 = null;
+        var msiexec: bool = false;
 
         var arg_index: usize = 0;
         while (arg_index < args.len) : (arg_index += 1) {
@@ -539,6 +586,8 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 arg_index += 1;
                 if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
                 cache_dir = args[arg_index];
+            } else if (std.mem.eql(u8, arg, "--msiexec")) {
+                msiexec = true;
             } else errExit("unknown cmdline argument '{s}'", .{arg});
         }
 
@@ -562,6 +611,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 .{},
             ),
             .cache_dir = cache_dir,
+            .msiexec = msiexec,
         };
     };
 
@@ -618,6 +668,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                     cache_dir,
                     config.lock_file,
                     content,
+                    .{ .msiexec = config.msiexec },
                 );
                 scratch_instance.reset();
                 switch (result) {
@@ -672,6 +723,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         cache_dir,
         config.lock_file,
         lock_file_content,
+        .{ .msiexec = config.msiexec },
     )) {
         .success => return 0,
         .version_mismatch => @panic("lock file version mismatch even after update"),
@@ -716,7 +768,7 @@ fn updateAutoenv(
     defer scratch.free(autoenv_path);
 
     if (!unique_pkgs.autoenv) {
-        try std.fs.cwd().deleteTree(autoenv_path);
+        try deleteTree(std.fs.cwd(), autoenv_path);
         return;
     }
 
@@ -1011,6 +1063,7 @@ fn installFromLockFile(
     cache_dir: []const u8,
     lock_file_path: []const u8,
     lock_file_content: []const u8,
+    named: struct { msiexec: bool },
 ) !enum { success, version_mismatch } {
     var line_it = std.mem.tokenizeAny(u8, lock_file_content, "\r\n");
     var lineno: u32 = 0;
@@ -1076,6 +1129,7 @@ fn installFromLockFile(
                     payload.stripRootDir(),
                     cabs_lineno,
                     cabs,
+                    .{ .msiexec = named.msiexec },
                 );
             },
             .cab => {
@@ -1341,6 +1395,9 @@ fn installPayload(
     strip_root_dir: bool,
     cabs_lineno: u32,
     cabs: []const u8,
+    named: struct {
+        msiexec: bool,
+    },
 ) !void {
     const install_kind: enum { vsix, msi, zip } = blk: {
         switch (getLockFileUrlKind(url_decoded) orelse errExit(
@@ -1463,7 +1520,7 @@ fn installPayload(
             }
             const target_dir = std.fs.path.join(scratch, &.{ msi.staging_dir, "target" }) catch |e| oom(e);
             defer scratch.free(target_dir);
-            try populateStagingMsi(scratch, msi_copy, target_dir);
+            try populateStagingMsi(scratch, msi_copy, target_dir, .{ .msiexec = named.msiexec });
             std.log.info("removing '{s}'...", .{installer_path});
             try deleteTree(std.fs.cwd(), installer_path);
         },
@@ -1536,7 +1593,33 @@ fn normalizePathSeps(path: []u8) void {
     };
 }
 
-fn populateStagingMsi(scratch: std.mem.Allocator, msi_file_path: []const u8, staging_dir: []const u8) !void {
+fn populateStagingMsi(
+    scratch: std.mem.Allocator,
+    msi_file_path: []const u8,
+    staging_dir: []const u8,
+    named: struct { msiexec: bool },
+) !void {
+    if (!named.msiexec) {
+        const msi_content = blk: {
+            const file = std.fs.cwd().openFile(msi_file_path, .{}) catch |err| errExit(
+                "open '{s}' failed with {s}",
+                .{ msi_file_path, @errorName(err) },
+            );
+            defer file.close();
+            break :blk try file.readToEndAlloc(scratch, std.math.maxInt(usize));
+        };
+        defer scratch.free(msi_content);
+        @import("msi").install(scratch, .{
+            .cabs_dir = std.fs.path.dirname(msi_file_path) orelse ".",
+            .msi_content = msi_content,
+            .install_path = staging_dir,
+        }) catch |err| {
+            std.log.err("failed to install msi \"{s}\" (error={s}). On windows, try the --msiexec flag to fallback to using the system msi installer. If that works, please file an issue that includes the name of this msi and the contents of your lock file. ", .{ std.fs.path.basename(msi_file_path), @errorName(err) });
+            return err;
+        };
+        return;
+    }
+
     // msi has problem with paths that contain forward slaces
     const msi_path_fixed = try scratch.dupe(u8, msi_file_path);
     defer scratch.free(msi_path_fixed);

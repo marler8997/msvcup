@@ -13,6 +13,10 @@
             .hash = "iobackport-0.0.0-KeWQeM2cAwD7vFsnLotvEbiqc0cwH7XEKV6s4ZFGe8Ad",
             .lazy = true,
         },
+        .msi = .{
+            .url = "git+https://github.com/marler8997/msi#8f5e9dd9f8f5cd5e516e7d5289a869fd5566b8d5",
+            .hash = "msi-0.0.1-gv4weidmEgCZXCMoAJvJvnXo-1P0YcgzBJwdSTAzvpO4",
+        },
     },
     .paths = .{
         "build.zig",

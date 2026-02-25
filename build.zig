@@ -45,6 +45,10 @@ pub fn build(b: *std.Build) !void {
         });
     };
 
+    const msi = b.dependency("msi", .{}).module("msi");
+    // msi includes the decompression code which we need to be fast
+    msi.optimize = .ReleaseFast;
+
     const msvcup = b.addExecutable(.{
         .name = "msvcup",
         .root_module = b.createModule(.{
@@ -58,6 +62,7 @@ pub fn build(b: *std.Build) !void {
                 .{ .name = "autoenv_exe", .module = b.createModule(.{
                     .root_source_file = addAutoenvExe(b, autoenv_cpu).getEmittedBin(),
                 }) },
+                .{ .name = "msi", .module = msi },
             },
         }),
     });
@@ -89,7 +94,7 @@ pub fn build(b: *std.Build) !void {
     const ci_step = b.step("ci", "The build/test step to run on the CI");
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(test_step);
-    try ci(b, release_version_embed, extrapkgs_mod, autoenv_cpu, ci_step);
+    try ci(b, release_version_embed, msi, extrapkgs_mod, autoenv_cpu, ci_step);
 }
 
 fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
@@ -145,6 +150,7 @@ fn makeCalVersion() ![11]u8 {
 fn ci(
     b: *std.Build,
     release_version_embed: *std.Build.Module,
+    msi: *std.Build.Module,
     extrapkgs_mod: *std.Build.Module,
     autoenv_cpu: Arch,
     ci_step: *std.Build.Step,
@@ -200,6 +206,7 @@ fn ci(
                     .{ .name = "autoenv_exe", .module = b.createModule(.{
                         .root_source_file = addAutoenvExe(b, autoenv_cpu).getEmittedBin(),
                     }) },
+                    .{ .name = "msi", .module = msi },
                 },
             }),
         });
