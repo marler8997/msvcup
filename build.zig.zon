@@ -2,11 +2,11 @@
     .name = .msvcup,
     .fingerprint = 0xbd52518ef5381747,
     .version = "0.0.0",
-    .minimum_zig_version = "0.14.1",
+    .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .zipcmdline = .{
-            .url = "git+https://github.com/marler8997/zipcmdline#3dfca786a489d117e4b72ea10ffb4bbd9fc2dd72",
-            .hash = "12201a08d7eff7619c8eb8284691a3ff959861b4bdd87216f180ed136672fb4ea26f",
+            .url = "git+https://github.com/marler8997/zipcmdline#a6de65875023c52d2f56f21a31c6487266f8105f",
+            .hash = "zipcmdline-0.0.0-DFii07hmAwCFNhtMpml64Pj_hr8kN4WesClygZErQHsk",
         },
         .iobackport = .{
             .url = "git+https://github.com/marler8997/zig-io-backport#2ce586882e0257f45f48a4d67e6b76defa0e45f1",
