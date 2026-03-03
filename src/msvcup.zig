@@ -2422,7 +2422,7 @@ fn updateLockFile(
                             if (pkg_payload_index == install_payload.index.int()) continue;
                             const pkg_payload = &pkgs.payloads[pkg_payload_index];
                             if (std.mem.endsWith(u8, pkg_payload.file_name, ".cab")) {
-                                const cab_payload = std.fs.path.basename(pkg_payload.file_name);
+                                const cab_payload = std.fs.path.basenameWindows(pkg_payload.file_name);
                                 if (index + 4 < cab_payload.len) continue;
                                 const cab_msi = msi_content[index + 4 - cab_payload.len ..][0..cab_payload.len];
                                 if (std.ascii.indexOfIgnoreCase(cab_payload, cab_msi)) |_| {
