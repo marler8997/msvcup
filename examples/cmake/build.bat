@@ -31,7 +31,7 @@
 
 @if not exist %~dp0msvcup.exe (
     echo msvcup.exe: installing...
-    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_02_24/msvcup-%MSVCUP_ARCH%-windows.zip
+    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_03_02/msvcup-%MSVCUP_ARCH%-windows.zip
     tar -C%~dp0 -xf %~dp0msvcup.zip
     del %~dp0msvcup.zip
 ) else (
@@ -43,7 +43,7 @@
 @if %errorlevel% neq 0 (exit /b %errorlevel%)
 
 @if not exist %~dp0out\%TARGET_CPU%\build.ninja (
-    %~dp0msvc\bin\cmake.exe -S %~dp0 -B %~dp0out/%TARGET_CPU% -DCMAKE_TOOLCHAIN_FILE=%~dp0/msvc/autoenv/%TARGET_CPU%/toolchain.cmake -GNinja -DCMAKE_MAKE_PROGRAM=%~dp0msvc\ninja.exe
+    %~dp0msvc\bin\cmake.exe -S %~dp0 -B %~dp0out/%TARGET_CPU% -DCMAKE_TOOLCHAIN_FILE=%~dp0/msvc/autoenv/%TARGET_CPU%/toolchain-cross.cmake -GNinja -DCMAKE_MAKE_PROGRAM=%~dp0msvc\ninja.exe
     @if %errorlevel% neq 0 (exit /b %errorlevel%)
 )
 @if not exist %~dp0out\%TARGET_CPU%\build.ninja exit /b 1
