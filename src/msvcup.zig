@@ -760,6 +760,7 @@ fn updateAutoenv(
     scratch: std.mem.Allocator,
     install_path: []const u8,
     unique_pkgs: *const UniquePackages,
+    install_versions: *const InstallVersions,
 ) !void {
     const autoenv_path = try std.fs.path.join(scratch, &.{ install_path, "autoenv" });
     defer scratch.free(autoenv_path);
@@ -778,14 +779,27 @@ fn updateAutoenv(
         const target_cpu: Arch = @enumFromInt(arch_field.value);
         var autoenv_arch_dir = try autoenv_dir.makeOpenPath(@tagName(target_cpu), .{});
         defer autoenv_arch_dir.close();
-        try installAutoenvArch(scratch, &install_path_absolute, unique_pkgs, target_cpu, autoenv_arch_dir);
+        try installAutoenvArch(
+            scratch,
+            &install_path_absolute,
+            unique_pkgs,
+            install_versions,
+            target_cpu,
+            autoenv_arch_dir,
+        );
     }
 }
+
+const InstallVersions = struct {
+    msvc: ?[]const u8,
+    sdk: ?[]const u8,
+};
 
 fn installAutoenvArch(
     scratch: std.mem.Allocator,
     install_path: *const AbsolutePath,
     unique_pkgs: *const UniquePackages,
+    install_versions: *const InstallVersions,
     target_cpu: Arch,
     out_dir: std.fs.Dir,
 ) !void {
@@ -825,7 +839,7 @@ fn installAutoenvArch(
     }
 
     {
-        const libc_txt = generateLibcTxt(scratch, install_path, unique_pkgs, target_cpu) catch |e| oom(e);
+        const libc_txt = generateLibcTxt(scratch, install_path, install_versions, target_cpu) catch |e| oom(e);
         defer scratch.free(libc_txt);
         try updateFile(out_dir, "libc.txt", libc_txt);
     }
@@ -1150,8 +1164,15 @@ fn installFromLockFile(
         }
     }
 
-    try updateVcvars(scratch, install_path, &unique_pkgs);
-    try updateAutoenv(scratch, install_path, &unique_pkgs);
+    const install_versions: InstallVersions = .{
+        .msvc = if (unique_pkgs.msvc != null) try queryInstallVersion(scratch, scratch, .msvc, install_path) else null,
+        .sdk = if (unique_pkgs.sdk != null) try queryInstallVersion(scratch, scratch, .sdk, install_path) else null,
+    };
+    if (install_versions.msvc) |v| std.log.info("MSVC install version '{s}'", .{v});
+    if (install_versions.sdk) |v| std.log.info("SDK  install version '{s}'", .{v});
+
+    try updateVcvars(scratch, install_path, &install_versions);
+    try updateAutoenv(scratch, install_path, &unique_pkgs, &install_versions);
 
     return .success;
 }
@@ -1159,24 +1180,17 @@ fn installFromLockFile(
 fn updateVcvars(
     scratch: std.mem.Allocator,
     install_path: []const u8,
-    unique_pkgs: *const UniquePackages,
+    install_versions: *const InstallVersions,
 ) !void {
-    const msvc_install_version: ?[]const u8 = if (unique_pkgs.msvc != null) try queryInstallVersion(scratch, scratch, .msvc, install_path) else null;
-    const sdk_install_version: ?[]const u8 = if (unique_pkgs.sdk != null) try queryInstallVersion(scratch, scratch, .sdk, install_path) else null;
-    if (msvc_install_version) |v| std.log.info("MSVC install version '{s}'", .{v});
-    if (sdk_install_version) |v| std.log.info("SDK  install version '{s}'", .{v});
-
-    {
-        var install_dir = try std.fs.cwd().makeOpenPath(install_path, .{});
-        defer install_dir.close();
-        inline for (std.meta.fields(Arch)) |arch_field| {
-            const arch: Arch = @enumFromInt(arch_field.value);
-            const env_bat = generateVcvarsBat(scratch, msvc_install_version, sdk_install_version, arch) catch |e| oom(e);
-            defer scratch.free(env_bat);
-            const env_basename = std.fmt.allocPrint(scratch, "vcvars-{s}.bat", .{@tagName(arch)}) catch |e| oom(e);
-            defer scratch.free(env_basename);
-            try updateFile(install_dir, env_basename, env_bat);
-        }
+    var install_dir = try std.fs.cwd().makeOpenPath(install_path, .{});
+    defer install_dir.close();
+    inline for (std.meta.fields(Arch)) |arch_field| {
+        const arch: Arch = @enumFromInt(arch_field.value);
+        const env_bat = generateVcvarsBat(scratch, install_versions, arch) catch |e| oom(e);
+        defer scratch.free(env_bat);
+        const env_basename = std.fmt.allocPrint(scratch, "vcvars-{s}.bat", .{@tagName(arch)}) catch |e| oom(e);
+        defer scratch.free(env_basename);
+        try updateFile(install_dir, env_basename, env_bat);
     }
 }
 
@@ -1220,8 +1234,7 @@ fn queryInstallVersion(
 
 fn generateVcvarsBat(
     allocator: std.mem.Allocator,
-    msvc_install_version: ?[]const u8,
-    sdk_install_version: ?[]const u8,
+    install_versions: *const InstallVersions,
     target_arch: Arch,
 ) error{OutOfMemory}![]u8 {
     var bat: std.ArrayListUnmanaged(u8) = .{};
@@ -1229,13 +1242,13 @@ fn generateVcvarsBat(
     const writer = bat.writer(allocator);
 
     try writer.writeAll("set \"INCLUDE=");
-    if (msvc_install_version) |install_version| {
+    if (install_versions.msvc) |install_version| {
         try writer.print(
             "%~dp0VC\\Tools\\MSVC\\{s}\\include;",
             .{install_version},
         );
     }
-    if (sdk_install_version) |install_version| {
+    if (install_versions.sdk) |install_version| {
         try writer.print(
             "%~dp0Windows Kits\\10\\Include\\{s}\\ucrt;" ++
                 "%~dp0Windows Kits\\10\\Include\\{0s}\\shared;" ++
@@ -1248,13 +1261,13 @@ fn generateVcvarsBat(
     try writer.writeAll("%INCLUDE%\"\n");
 
     try writer.writeAll("set \"PATH=");
-    if (msvc_install_version) |install_version| {
+    if (install_versions.msvc) |install_version| {
         try writer.print(
             "%~dp0VC\\Tools\\MSVC\\{s}\\bin\\Host{s}\\{s};",
             .{ install_version, @tagName(Arch.native), @tagName(target_arch) },
         );
     }
-    if (sdk_install_version) |install_version| {
+    if (install_versions.sdk) |install_version| {
         try writer.print(
             "%~dp0Windows Kits\\10\\bin\\{[version]s}\\{[host_arch]s};",
             .{ .version = install_version, .host_arch = @tagName(Arch.native) },
@@ -1263,13 +1276,13 @@ fn generateVcvarsBat(
     try writer.writeAll("%PATH%\"\n");
 
     try writer.writeAll("set \"LIB=");
-    if (msvc_install_version) |install_version| {
+    if (install_versions.msvc) |install_version| {
         try writer.print(
             "%~dp0VC\\Tools\\MSVC\\{s}\\lib\\{s};",
             .{ install_version, @tagName(target_arch) },
         );
     }
-    if (sdk_install_version) |install_version| {
+    if (install_versions.sdk) |install_version| {
         try writer.print(
             "%~dp0Windows Kits\\10\\Lib\\{[version]s}\\ucrt\\{[target_arch]s};" ++
                 "%~dp0Windows Kits\\10\\Lib\\{[version]s}\\um\\{[target_arch]s};",
@@ -1344,23 +1357,23 @@ const AbsolutePath = struct {
 fn generateLibcTxt(
     allocator: std.mem.Allocator,
     install_path: *const AbsolutePath,
-    unique_pkgs: *const UniquePackages,
+    install_versions: *const InstallVersions,
     target_cpu: Arch,
 ) error{OutOfMemory}![]u8 {
     var aw: std15.Io.Writer.Allocating = try .initCapacity(allocator, 1000);
     defer aw.deinit();
-    if (unique_pkgs.msvc) |msvc_version| {
+    if (install_versions.msvc) |msvc_version| {
         aw.writer.print(
             \\sys_include_dir={[install]s}\VC\Tools\MSVC\{[version]s}\include
             \\msvc_lib_dir={[install]s}\VC\Tools\MSVC\{[version]s}\lib\{[target]s}
             \\
         , .{
             .install = install_path.slice,
-            .version = msvc_version.slice,
+            .version = msvc_version,
             .target = @tagName(target_cpu),
         }) catch return error.OutOfMemory;
     }
-    if (unique_pkgs.sdk) |sdk_version| {
+    if (install_versions.sdk) |sdk_version| {
         aw.writer.print(
             \\include_dir={[install]s}\Windows Kits\10\Include\{[version]s}\ucrt
             \\kernel32_lib_dir={[install]s}\Windows Kits\10\lib\{[version]s}\um\{[target]s}
@@ -1368,7 +1381,7 @@ fn generateLibcTxt(
             \\
         , .{
             .install = install_path.slice,
-            .version = sdk_version.slice,
+            .version = sdk_version,
             .target = @tagName(target_cpu),
         }) catch return error.OutOfMemory;
     }
