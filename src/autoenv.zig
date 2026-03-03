@@ -20,7 +20,7 @@ pub fn main() !u8 {
 
     const self_exe_file = getImagePathName() orelse @panic("no image path name");
     const self_exe_paths = splitDirBasename(self_exe_file) orelse errExit(
-        "self exe path '{}' has no parent directory",
+        "self exe path '{f}' has no parent directory",
         .{std.unicode.fmtUtf16Le(self_exe_file)},
     );
     std.debug.assert(self_exe_paths.basename.len > 0);
@@ -71,8 +71,9 @@ pub fn main() !u8 {
     //     fatal error C1090: PDB API call failed, error code '23': (0x000006BA)
     const use_job = !std.mem.eql(u16, self_exe_paths.basename, L("cl.exe"));
 
-    const CREATE_SUSPENDED = 0x00000004;
-    const create_process_flags: u32 = if (use_job) CREATE_SUSPENDED else 0;
+    const create_process_flags: win32.CreateProcessFlags = .{
+        .create_suspended = use_job,
+    };
     if (0 == win32.kernel32.CreateProcessW(
         // L(exe_basename),
         exe,
@@ -322,7 +323,7 @@ fn findExe(allocator: std.mem.Allocator, exe_basename: []const u16) !?[:0]u16 {
             free_candidate = false;
             return candidate_slice;
         } else |err| switch (err) {
-            error.FileNotFound, error.PermissionDenied => {},
+            error.FileNotFound, error.AccessDenied => {},
             error.Unexpected => |e| return e,
         }
     }
@@ -379,14 +380,7 @@ pub fn fmtError(error_code: win32.Win32Error) FormatError(300) {
 pub fn FormatError(comptime max_len: usize) type {
     return struct {
         error_code: win32.Win32Error,
-        pub fn format(
-            self: @This(),
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) @TypeOf(writer).Error!void {
-            _ = fmt;
-            _ = options;
+        pub fn format(self: @This(), writer: *std.Io.Writer) error{WriteFailed}!void {
             try writer.print("{} (", .{@intFromEnum(self.error_code)});
             var buf: [max_len]u8 = undefined;
             const len = FormatMessageA(
