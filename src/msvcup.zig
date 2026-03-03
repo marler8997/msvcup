@@ -809,10 +809,22 @@ fn installAutoenvArch(
         }
     }
 
+    // cleanup this file from an old version of msvcup
+    out_dir.deleteFile("toolchain.cmake") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
     {
-        const cmake = generateToolchainCmake(scratch, unique_pkgs, target_cpu) catch |e| oom(e);
+        const cmake = generateToolchainCmake(scratch, unique_pkgs, target_cpu, .native) catch |e| oom(e);
         defer scratch.free(cmake);
-        try updateFile(out_dir, "toolchain.cmake", cmake);
+        try updateFile(out_dir, "toolchain-native.cmake", cmake);
+    }
+
+    {
+        const cmake = generateToolchainCmake(scratch, unique_pkgs, target_cpu, .cross) catch |e| oom(e);
+        defer scratch.free(cmake);
+        try updateFile(out_dir, "toolchain-cross.cmake", cmake);
     }
 
     {
@@ -1276,19 +1288,27 @@ fn generateToolchainCmake(
     allocator: std.mem.Allocator,
     unique_pkgs: *const UniquePackages,
     target_cpu: Arch,
+    variant: enum { native, cross },
 ) error{OutOfMemory}![]u8 {
     var content: std.ArrayListUnmanaged(u8) = .{};
     defer content.deinit(allocator);
     const writer = content.writer(allocator);
 
-    try writer.writeAll("set(CMAKE_SYSTEM_NAME Windows)\n");
-    if (switch (target_cpu) {
-        .x64 => "AMD64",
-        .x86 => "X86",
-        .arm => null,
-        .arm64 => "ARM64",
-    }) |processor| {
-        try writer.print("set(CMAKE_SYSTEM_PROCESSOR {s})\n", .{processor});
+    switch (variant) {
+        .native => {},
+        .cross => {
+            try writer.writeAll("# settings CMAKE_SYSTEM_NAME and/or CMAKE_SYSTEM_PROCESSOR in a\n");
+            try writer.writeAll("# toolchain file also sets CMAKE_CROSSCOMPILING to TRUE\n");
+            try writer.writeAll("set(CMAKE_SYSTEM_NAME Windows)\n");
+            if (switch (target_cpu) {
+                .x64 => "AMD64",
+                .x86 => "X86",
+                .arm => null,
+                .arm64 => "ARM64",
+            }) |processor| {
+                try writer.print("set(CMAKE_SYSTEM_PROCESSOR {s})\n", .{processor});
+            }
+        },
     }
 
     if (unique_pkgs.msvc != null) {
