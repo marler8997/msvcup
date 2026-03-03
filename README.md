@@ -45,7 +45,7 @@ Note that if you include the "autoenv" package, your install directory will incl
 ## Additional Features
 
 - **Install metadata**: Every installed file is tracked in `<package>/install`. This allows msvcup to detect file conflicts and allows the user to query which component(s) installed which files.
-- **Download cache**: Packages are cached in `C:\msvcup\cache`. Failed installs can be retried without network access.
+- **Download cache**: Packages are cached in `%localappdata%\msvcup\cache`. Failed installs can be retried without network access.
 
 ## Acknowledgements
 

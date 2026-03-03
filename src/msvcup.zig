@@ -108,10 +108,7 @@ const MsvcupDir = struct {
     root_path: []const u8,
     pub fn alloc(allocator: std.mem.Allocator) !MsvcupDir {
         return .{
-            .root_path = switch (builtin.os.tag) {
-                .windows => "C:\\msvcup",
-                else => try std.fs.getAppDataDir(allocator, "msvcup"),
-            },
+            .root_path = try std.fs.getAppDataDir(allocator, "msvcup"),
         };
     }
     pub fn path(self: MsvcupDir, allocator: std.mem.Allocator, sub_path_tuple: anytype) error{OutOfMemory}![]const u8 {
@@ -3465,10 +3462,10 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
 // Download Vs Manifest
 // TODO: URL Resolution!
 // For sure, I want to track the history of ALL the resolutions for the URLs!
-// c:\msvcup\channel-manifest-url\release\latest
-// c:\msvcup\channel-manifest-url\release\?
-// c:\msvcup\channel-manifest-url\release\1
-// c:\msvcup\channel-manifest-url\preview\
+// channel-manifest-url\release\latest
+// channel-manifest-url\release\?
+// channel-manifest-url\release\1
+// channel-manifest-url\preview\
 
 const Range = struct { start: usize, limit: usize };
 
@@ -3723,13 +3720,6 @@ fn isValidVersion(version: []const u8) bool {
 
 fn startsWith(comptime T: type, s: []const T, needle: []const T) ?[]const T {
     return if (std.mem.startsWith(T, s, needle)) s[needle.len..] else null;
-}
-
-fn getDefaultInstallDir() []const u8 {
-    if (builtin.os.tag == .windows) {
-        return "C:\\msvcup";
-    }
-    @panic("todo");
 }
 
 const ManifestUpdate = enum {
