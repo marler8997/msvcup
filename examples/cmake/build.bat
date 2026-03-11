@@ -7,11 +7,9 @@
 @if %REAL_ARCH%==AMD64 (
     set MSVCUP_ARCH=x86_64
     set HOST_CPU=x64
-    set CMAKE_ARCH=x86_64
 ) else if %REAL_ARCH%==ARM64 (
     set MSVCUP_ARCH=aarch64
     set HOST_CPU=arm64
-    set CMAKE_ARCH=arm64
 ) else (
     echo error: unhandled PROCESSOR_ARCHITECTURE "%REAL_ARCH%"
 )
