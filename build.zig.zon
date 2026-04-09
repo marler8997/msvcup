@@ -14,8 +14,8 @@
             .lazy = true,
         },
         .msi = .{
-            .url = "git+https://github.com/marler8997/msi#8f5e9dd9f8f5cd5e516e7d5289a869fd5566b8d5",
-            .hash = "msi-0.0.1-gv4weidmEgCZXCMoAJvJvnXo-1P0YcgzBJwdSTAzvpO4",
+            .url = "git+https://github.com/marler8997/msi#9d9321ffc9f13e347d53b95cf5dcd6468bf1e6c0",
+            .hash = "msi-0.0.1-gv4werhlEgA3Qavb8H4kWa3DwXDDyZz8uEz6QMufXsgh",
         },
     },
     .paths = .{
