@@ -90,11 +90,9 @@ pub fn build(b: *std.Build) !void {
         if (builtin.os.tag == .windows) test_step.dependOn(step);
     }
 
-    const ci_step = b.step("ci", "The build/test step to run on the CI");
-    ci_step.dependOn(b.getInstallStep());
-    ci_step.dependOn(test_step);
-    ci_step.dependOn(&b.addInstallFile(release_version_file, "version-release").step);
-    try ci(b, release_version_embed, msi, extrapkgs_mod, autoenv_cpu, ci_step);
+    const release_step = b.step("release", "Build/archive release executables for all targets and test the native one");
+    release_step.dependOn(&b.addInstallFile(release_version_file, "version-release").step);
+    try addRelease(b, release_version_embed, msi, extrapkgs_mod, autoenv_cpu, release_step);
 }
 
 fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
@@ -141,19 +139,19 @@ fn makeCalVersion() ![11]u8 {
     const formatted = try std.fmt.bufPrint(&buf, "v{d}_{d:0>2}_{d:0>2}", .{
         year_day.year,
         @intFromEnum(month_day.month),
-        month_day.day_index,
+        month_day.day_index + 1,
     });
     std.debug.assert(formatted.len == buf.len);
     return buf;
 }
 
-fn ci(
+fn addRelease(
     b: *std.Build,
     release_version_embed: *std.Build.Module,
     msi: *std.Build.Module,
     extrapkgs_mod: *std.Build.Module,
     autoenv_cpu: Arch,
-    ci_step: *std.Build.Step,
+    release_step: *std.Build.Step,
 ) !void {
     const zip_dep = b.dependency("zipcmdline", .{});
     const host_zip_exe = b.addExecutable(.{
@@ -180,8 +178,8 @@ fn ci(
         "x86_64-windows",
     };
 
-    const make_archive_step = b.step("archive", "Create CI archives");
-    ci_step.dependOn(make_archive_step);
+    const make_archive_step = b.step("archive", "Create release archives");
+    release_step.dependOn(make_archive_step);
 
     for (ci_targets) |ci_target_str| {
         const target = b.resolveTargetQuery(try std.Target.Query.parse(
@@ -192,7 +190,7 @@ fn ci(
         const target_dest_dir: std.Build.InstallDir = .{ .custom = ci_target_str };
 
         const install_exes = b.step(b.fmt("install-{s}", .{ci_target_str}), "");
-        ci_step.dependOn(install_exes);
+        release_step.dependOn(install_exes);
         const msvcup_exe = b.addExecutable(.{
             .name = "msvcup",
             .root_module = b.createModule(.{
@@ -224,7 +222,7 @@ fn ci(
         const os_compatible = (builtin.os.tag == target.result.os.tag);
         const arch_compatible = (builtin.cpu.arch == target.result.cpu.arch);
         if (os_compatible and arch_compatible) {
-            ci_step.dependOn(target_test_step);
+            release_step.dependOn(target_test_step);
         }
 
         if (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
