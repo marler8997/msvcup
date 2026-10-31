@@ -128,6 +128,11 @@ fn addTests(b: *std.Build, msvcup: *std.Build.Step.Compile, test_step: *std.Buil
         run.addArg("list");
         test_step.dependOn(&run.step);
     }
+    {
+        const run = b.addRunArtifact(msvcup);
+        run.addArg("list-payloads");
+        test_step.dependOn(&run.step);
+    }
 }
 
 fn makeCalVersion() ![11]u8 {

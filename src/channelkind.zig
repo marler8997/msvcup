@@ -8,4 +8,10 @@ pub const ChannelKind = enum {
             .preview => "https://aka.ms/vs/17/pre/channel",
         };
     }
+    pub fn name(self: ChannelKind) []const u8 {
+        return switch (self) {
+            .release => "vs17-release",
+            .preview => "vs17-preview",
+        };
+    }
 };

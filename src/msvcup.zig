@@ -44,12 +44,16 @@ pub fn main() !u8 {
             while (true) : (arg_index += 1) {
                 if (arg_index == all_args.len) try usage(arena);
                 const arg = all_args[arg_index];
+                if (isHelpArg(arg)) return help(arena, for (all_args[arg_index + 1 ..]) |a| {
+                    if (!std.mem.startsWith(u8, a, "-")) break a;
+                } else null);
                 if (!std.mem.startsWith(u8, arg, "-")) break :cmd_arg_index_blk arg_index;
                 errExit("TODO: add support for specifying options before command", .{});
             }
         };
         const cmd = all_args[cmd_arg_index];
         for (cmd_arg_index + 1..all_args.len) |i| {
+            if (isHelpArg(all_args[i])) return help(arena, cmd);
             all_args[i - 1] = all_args[i];
         }
         break :cmd_args_blk .{ cmd, all_args[0 .. all_args.len - 1] };
@@ -67,7 +71,36 @@ fn usage(arena: std.mem.Allocator) !noreturn {
     const msvcup_dir: MsvcupDir = try .alloc(arena);
     var stderr_buf: [1000]u8 = undefined;
     var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
-    stderr.interface.print(
+    writeUsage(&stderr.interface, msvcup_dir) catch return stderr.err.?;
+    std.process.exit(0xff);
+}
+
+fn isHelpArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
+}
+
+/// Called when a help option appears anywhere in the args. Prints the detailed
+/// help for the command if there is one and it has detailed help, otherwise
+/// the main usage.
+fn help(arena: std.mem.Allocator, cmd: ?[]const u8) !u8 {
+    const detailed: ?[]const u8 = if (cmd) |c|
+        (if (std.mem.eql(u8, c, "list-payloads")) list_payloads_help else null)
+    else
+        null;
+    var stdout_buf: [1000]u8 = undefined;
+    var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+    if (detailed) |text| {
+        stdout.interface.writeAll(text) catch return stdout.err.?;
+        stdout.interface.flush() catch return stdout.err.?;
+    } else {
+        const msvcup_dir: MsvcupDir = try .alloc(arena);
+        writeUsage(&stdout.interface, msvcup_dir) catch return stdout.err.?;
+    }
+    return 0;
+}
+
+fn writeUsage(w: *std15.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!void {
+    try w.print(
         \\msvcup version {[version]s}
         \\
         \\Usage: msvcup COMMAND ARGS...
@@ -82,7 +115,7 @@ fn usage(arena: std.mem.Allocator) !noreturn {
         \\                            |      <PKG_NAME>-<VERSION>
         \\                            |
         \\                            | installed to {[install_dir]s}.
-        \\  list-payloads             | List all the payloads.
+        \\  list-payloads             | List all payloads and their msvcup package.
         \\  msi MSI DIR               | Invoke builtin msi installer.
         \\
         \\InstallOptions:
@@ -99,9 +132,8 @@ fn usage(arena: std.mem.Allocator) !noreturn {
             .version = @embedFile("version"),
             .install_dir = msvcup_dir.root_path,
         },
-    ) catch return stderr.err.?;
-    stderr.interface.flush() catch return stderr.err.?;
-    std.process.exit(0xff);
+    );
+    try w.flush();
 }
 
 const MsvcupDir = struct {
@@ -215,10 +247,51 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     return 0;
 }
 
-fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
-    if (args.len != 0) errExit("list-payloads does not take any arguments", .{});
+const list_payloads_help =
+    \\Usage: msvcup list-payloads
+    \\
+    \\Lists every payload in the Visual Studio manifest (plus msvcup's builtin
+    \\extra packages) along with the msvcup package that owns it, one payload
+    \\per line, sorted by package id and then by the name in the payload url.
+    \\
+    \\Line format:
+    \\
+    \\    OWNER ATTRIBUTE...
+    \\
+    \\  OWNER      The msvcup package the payload belongs to (e.g. msvc-14.44.17.14),
+    \\             or '-' if msvcup doesn't select it directly. A '-' payload can
+    \\             still be installed, the .cab files of a selected .msi are found
+    \\             by scanning the .msi at install time. A payload belongs to at
+    \\             most one msvcup package.
+    \\  ATTRIBUTE  NAME=VALUE pairs describing the payload, in this order:
+    \\
+    \\               channel   where the payload comes from, i.e. vs17-release,
+    \\                         or 'extra' for msvcup's builtin packages (ninja/cmake)
+    \\               lang      the package language (e.g. neutral, en-US, de-DE)
+    \\               id        the package id
+    \\               version   the package version
+    \\               fileName  the payload file name
+    \\
+    \\             If a NAME=VALUE pair contains whitespace, the entire pair is
+    \\             wrapped in double quotes, i.e. "fileName=Installers\Some File.msi".
+    \\
+    \\Columns are separated by one or more spaces (OWNER is padded for
+    \\readability). The output is meant to be diffed, e.g. to see how a change to
+    \\payload selection affects which payloads are installed.
+    \\
+    \\Example:
+    \\
+    \\  sdk-10.0.22621.7     channel=vs17-release lang=neutral id=Win11SDK_10.0.22621 version=10.0.22621.7 "fileName=Installers\Windows SDK Desktop Headers x64-x86_en-us.msi"
+    \\
+;
 
-    const root_node = std.Progress.start(.{ .root_name = "msvcup list-versions" });
+fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+    for (args) |arg| {
+        errExit("list-payloads: unknown argument '{s}' (see 'msvcup list-payloads --help')", .{arg});
+    }
+    const channel: ChannelKind = .release;
+
+    const root_node = std.Progress.start(.{ .root_name = "msvcup list-payloads" });
     defer root_node.end();
 
     var scratch_instance: ScratchAllocator = .init();
@@ -226,17 +299,15 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
     const msvcup_dir: MsvcupDir = try .alloc(arena);
 
-    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
+    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, channel, .off);
     defer vsman.freeConst(arena);
     scratch_instance.reset();
-
-    var payload_indices: std.ArrayListUnmanaged(PayloadIndex) = .{};
 
     const pkgs = try getPackages(arena, scratch, vsman);
     // defer arena.free(pkgs);
     scratch_instance.reset();
 
-    for (pkgs.slice, 0..) |pkg, pkg_index| {
+    for (pkgs.slice) |pkg| {
         switch (pkg.language) {
             .neutral => {},
             .en_us => {},
@@ -250,30 +321,103 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
             ),
             else => {},
         }
-        const payload_range = pkgs.payloadRangeFromPkgIndex(.fromInt(pkg_index));
-        for (payload_range.start..payload_range.limit) |payload_index| {
-            insertSorted(
-                PayloadIndex,
-                arena,
-                &payload_indices,
-                .fromInt(payload_index),
-                pkgs.payloads,
-                PayloadIndex.order,
-            ) catch |e| oom(e);
-        }
     }
 
-    var stdout_buf: [2000]u8 = undefined;
+    // Every payload in the manifest, sorted by package id and then by payload, so
+    // the output is stable and diffable across changes to the selection logic.
+    const sorted = arena.alloc(PayloadIndex, pkgs.payloads.len) catch |e| oom(e);
+    for (sorted, 0..) |*p, i| p.* = .fromInt(i);
+    std.sort.pdq(PayloadIndex, sorted, &pkgs, PayloadListingOrder.lessThan);
+
+    var stdout_buf: [4096]u8 = undefined;
     var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
     const w = &stdout.interface;
-    for (payload_indices.items) |payload_index| {
-        const pkg_index = pkgs.pkgIndexFromPayloadIndex(payload_index);
+    for (sorted) |payload_index| {
+        const pkg = &pkgs.slice[pkgs.pkgIndexFromPayloadIndex(payload_index).int()];
         const payload = &pkgs.payloads[payload_index.int()];
-        const pkg = &pkgs.slice[pkg_index.int()];
-        w.print("{s} ({s})\n", .{ payload.file_name, pkg.id }) catch return stdout.err.?;
+        const owner: []const u8 = if (payloadOwner(pkg, payload)) |o| o.poolString().slice else "-";
+        writePayloadListing(w, owner, switch (pkg.source) {
+            .manifest => channel.name(),
+            .extra => "extra",
+        }, pkg, payload) catch return stdout.err.?;
     }
     w.flush() catch return stdout.err.?;
     return 0;
+}
+
+fn writePayloadListing(
+    w: *std15.Io.Writer,
+    owner: []const u8,
+    channel_name: []const u8,
+    pkg: *const Package,
+    payload: *const Payload,
+) error{WriteFailed}!void {
+    try w.print("{s: <20}", .{owner});
+    try writeListingAttr(w, "channel", channel_name, pkg, payload);
+    try writeListingAttr(w, "lang", pkg.language.name(), pkg, payload);
+    try writeListingAttr(w, "id", pkg.id, pkg, payload);
+    try writeListingAttr(w, "version", pkg.version, pkg, payload);
+    try writeListingAttr(w, "fileName", payload.file_name, pkg, payload);
+    try w.writeByte('\n');
+}
+
+fn writeListingAttr(
+    w: *std15.Io.Writer,
+    name: []const u8,
+    value: []const u8,
+    pkg: *const Package,
+    payload: *const Payload,
+) error{WriteFailed}!void {
+    // we don't support escaping, so fail loudly if a value ever needs it
+    if (std.mem.indexOfAny(u8, value, "\"\r\n")) |_| std.debug.panic(
+        "package '{s}' payload '{s}' has a {s} value that contains a quote or newline: '{s}'",
+        .{ pkg.id, payload.file_name, name, value },
+    );
+    const quote: []const u8 = if (std.mem.indexOfAny(u8, value, " \t")) |_| "\"" else "";
+    try w.print(" {s}{s}={s}{s}", .{ quote, name, value, quote });
+}
+
+const PayloadListingOrder = struct {
+    fn lessThan(pkgs: *const Packages, lhs: PayloadIndex, rhs: PayloadIndex) bool {
+        const lhs_pkg = &pkgs.slice[pkgs.pkgIndexFromPayloadIndex(lhs).int()];
+        const rhs_pkg = &pkgs.slice[pkgs.pkgIndexFromPayloadIndex(rhs).int()];
+        switch (orderDottedAlphabetical({}, lhs_pkg.id, rhs_pkg.id)) {
+            .lt => return true,
+            .gt => return false,
+            .eq => {},
+        }
+        return PayloadIndex.order(pkgs.payloads, lhs, rhs) == .lt;
+    }
+};
+
+/// Returns the msvcup package that the given payload belongs to, if any. A
+/// payload can belong to at most one msvcup package. This is only used to list
+/// payloads and must be kept in sync with the selection in updateLockFile, which
+/// also attaches the .cab files of each selected .msi.
+fn payloadOwner(pkg: *const Package, payload: *const Payload) ?MsvcupPackage {
+    switch (pkg.language) {
+        .neutral, .en_us => {},
+        .other => return null,
+    }
+    const by_id: ?MsvcupPackage = if (getInstallPkg(pkg.id)) |install_pkg| switch (install_pkg) {
+        .msvc => |version| .initStr(.msvc, version),
+        .msbuild => |version| .initStr(.msbuild, version),
+        .diasdk => .initStr(.diasdk, pkg.version),
+        .ninja => |version| .initStr(.ninja, version),
+        .cmake => |version| .initStr(.cmake, version),
+    } else null;
+    const by_payload: ?MsvcupPackage = switch (identifyPayload(payload.file_name)) {
+        .unknown => null,
+        .sdk => .initStr(.sdk, pkg.version),
+    };
+    if (by_id) |id_owner| {
+        if (by_payload) |payload_owner| std.debug.panic(
+            "payload '{s}' of package '{s}' belongs to multiple msvcup packages '{f}' and '{f}'",
+            .{ payload.file_name, pkg.id, id_owner, payload_owner },
+        );
+        return id_owner;
+    }
+    return by_payload;
 }
 
 fn msiCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
@@ -2841,12 +2985,31 @@ fn getLockFileUrlKind(url: []const u8) ?LockFileUrlKind {
     return null;
 }
 
-const Language = enum { neutral, en_us, other };
+const Language = union(enum) {
+    neutral,
+    en_us,
+    /// a key from other_languages
+    other: []const u8,
+    pub fn name(self: Language) []const u8 {
+        return switch (self) {
+            .neutral => "neutral",
+            .en_us => "en-US",
+            .other => |n| n,
+        };
+    }
+};
+const PackageSource = enum {
+    /// from the visual studio channel manifest
+    manifest,
+    /// from msvcup's builtin extra packages (i.e. ninja/cmake)
+    extra,
+};
 const Package = struct {
     id: []const u8,
     version: []const u8,
     payloads_offset: usize,
     language: Language,
+    source: PackageSource,
 };
 const Payload = struct {
     url_decoded: []const u8,
@@ -3636,7 +3799,7 @@ fn getPackages(
                 const en_us = "en-US";
                 if (std.mem.eql(u8, language, "neutral")) break :language_blk .neutral;
                 if (std.mem.eql(u8, language, en_us)) break :language_blk .en_us;
-                if (other_languages.get(language)) |_| break :language_blk .other;
+                if (other_languages.getIndex(language)) |i| break :language_blk .{ .other = other_languages.keys()[i] };
                 if (std.ascii.eqlIgnoreCase(language, en_us)) std.debug.panic("new {s} casing '{s}'", .{ en_us, language });
                 std.debug.panic("unknown language '{s}'", .{language});
             };
@@ -3651,6 +3814,7 @@ fn getPackages(
                 // TODO: maybe we should have a string pool for versions?
                 .version = allocator.dupe(u8, version) catch |e| oom(e),
                 .language = language,
+                .source = .manifest,
                 .payloads_offset = payloads_offset,
             };
             out_package_count += 1;
@@ -3666,6 +3830,7 @@ fn getPackages(
                     else => unreachable,
                 }) catch |e| oom(e),
                 .language = .neutral,
+                .source = .extra,
                 .payloads_offset = payload_count,
             };
             out_package_count += 1;
