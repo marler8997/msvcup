@@ -1,0 +1,50 @@
+# Selects which manifest payloads belong to which msvcup package. The format is
+# documented above parseBuiltinRecipes in msvcup.zig.
+
+# contains vcruntime.h
+msvc-{version} id=Microsoft.VC.{version}.CRT.Headers.base
+# contains the Visual C++ runtime libraries, i.e.
+#     vcruntime140.dll and msvcp140.dll - Essential C++ runtime components
+#     concrt140.dll - Concurrency runtime for parallel programming
+#     vccorlib140.dll - Core library components
+# it also contains debug versions, which are files ending in "d.dll"
+msvc-{version} id=Microsoft.VC.{version}.CRT.Redist.{arch}.base
+# contains libcmt.lib
+msvc-{version} id=Microsoft.VC.{version}.CRT.{arch}.Desktop.base
+msvc-{version} id=Microsoft.VC.{version}.CRT.{arch}.Desktop.debug.base
+# contains oldnames.lib
+msvc-{version} id=Microsoft.VC.{version}.CRT.{arch}.Store.base
+# contains cl.exe
+msvc-{version} id=Microsoft.VC.{version}.Tools.Host{arch}.Target{arch}.base
+# contains clui.dll required by cl.exe
+msvc-{version} id=Microsoft.VC.{version}.Tools.Host{arch}.Target{arch}.Res.base
+
+# contains the "Universal CRT" headers, libraries and sources
+sdk-{version} version={version} "fileName=Installers\Universal CRT Headers Libraries and Sources-*"
+# contains the headers in "Windows Kits\10\Include\VERSION" subdirectories
+# 'shared', 'um' and 'winrt'
+sdk-{version} version={version} "fileName=Installers\Windows SDK Desktop Headers *"
+# contains a bunch of ".lib" file in the um directory
+sdk-{version} version={version} "fileName=Installers\Windows SDK Desktop Libs *"
+# includes tools like signtool.exe
+sdk-{version} version={version} "fileName=Installers\Windows SDK Signing Tools-*"
+# contains cppwinrt and winrt headers
+sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Headers-*"
+# contains a bunch of core windows ".lib" files like ntdll, kernel32, etc, but also
+# others like the DirectX libraries.
+sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Libs-*"
+# contains a bunch of executables like dxc.exe, fxc.exe, inspect.exe, certmgr.exe,
+# cppwinrt.exe, mc.exe, midl.exe, mt.exe, rc.exe
+sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Tools-*"
+
+# NOTE: we're assuming these packages are currently at version 170
+msbuild-170 id=Microsoft.Build
+msbuild-170 id=Microsoft.Build.Arm64
+# right now only v170 really works
+msbuild-170 id=Microsoft.VisualStudio.VC.MSBuild.v170
+msbuild-170 id=Microsoft.VisualStudio.VC.MSBuild.v170.*
+
+diasdk-{version} id=Microsoft.VisualCpp.DIA.SDK version={version}
+
+ninja-{version} id=ninja-{version}
+cmake-{version} id=cmake-{version}
