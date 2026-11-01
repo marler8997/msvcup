@@ -70,7 +70,7 @@ pub fn main() !u8 {
 fn usage(arena: std.mem.Allocator) !noreturn {
     const msvcup_dir: MsvcupDir = try .alloc(arena);
     var stderr_buf: [1000]u8 = undefined;
-    var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+    var stderr: File15.Writer = .initStreaming(stderrFile(), &stderr_buf);
     writeUsage(&stderr.interface, msvcup_dir) catch return stderr.err.?;
     std.process.exit(0xff);
 }
@@ -88,7 +88,7 @@ fn help(arena: std.mem.Allocator, cmd: ?[]const u8) !u8 {
     else
         null;
     var stdout_buf: [1000]u8 = undefined;
-    var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
     if (detailed) |text| {
         stdout.interface.writeAll(text) catch return stdout.err.?;
         stdout.interface.flush() catch return stdout.err.?;
@@ -237,7 +237,7 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 
     var stdout_buf: [2000]u8 = undefined;
-    var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
     const w = &stdout.interface;
     w.writeAll("autoenv\n") catch return stdout.err.?;
     for (msvcup_pkgs.items) |msvcup_pkg| {
@@ -330,7 +330,7 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     std.sort.pdq(PayloadIndex, sorted, &pkgs, PayloadListingOrder.lessThan);
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
     const w = &stdout.interface;
     for (sorted) |payload_index| {
         const pkg = &pkgs.slice[pkgs.pkgIndexFromPayloadIndex(payload_index).int()];
@@ -526,7 +526,7 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         const sha256 = try fetch(root_node, scratch, uri, cache_path, .{});
         try finishCacheFetch(scratch, cache_dir, config.url, sha256, cache_path);
         var stdout_buf: [80]u8 = undefined;
-        var stdout: File15.Writer = .init(stdoutFile(), &stdout_buf);
+        var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
         stdout.interface.print("{f}\n", .{sha256}) catch return stdout.err.?;
         stdout.interface.flush() catch return stdout.err.?;
     }
@@ -1830,7 +1830,7 @@ fn populateStagingMsi(
     switch (result.term) {
         .Exited => |exit_code| {
             if (exit_code != 0) {
-                var stderr: File15.Writer = .init(stderrFile(), &.{});
+                var stderr: File15.Writer = .initStreaming(stderrFile(), &.{});
                 stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
                 stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
                 errExit(
@@ -1840,7 +1840,7 @@ fn populateStagingMsi(
             }
         },
         inline else => |e| {
-            var stderr: File15.Writer = .init(stderrFile(), &.{});
+            var stderr: File15.Writer = .initStreaming(stderrFile(), &.{});
             stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
             stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
             errExit("msiexec for '{s}' terminated with {}", .{ msi_file_path, e });
@@ -4026,7 +4026,7 @@ pub fn stderrFile() std.fs.File {
 
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     var stderr_buf: [1000]u8 = undefined;
-    var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+    var stderr: File15.Writer = .initStreaming(stderrFile(), &stderr_buf);
     const maybe_err: ?File15.WriteError = blk: {
         stderr.interface.print(fmt ++ "\n", args) catch break :blk stderr.err.?;
         stderr.interface.flush() catch break :blk stderr.err.?;
