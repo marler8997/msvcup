@@ -177,6 +177,8 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     // TODO: accept the "--manifest-update-*" arguments
     if (args.len != 0) errExit("the 'list-versions' command does not take any arguments", .{});
 
+    const recipes = parseBuiltinRecipes(arena);
+
     const root_node = std.Progress.start(.{ .root_name = "msvcup list-versions" });
     defer root_node.end();
 
@@ -194,45 +196,11 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     scratch_instance.reset();
 
     var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
-    for (pkgs.slice, 0..) |pkg, pkg_index| {
-        switch (identifyPackage(pkg.id)) {
-            .unknown => {},
-            .unexpected => |u| try std.debug.panic(
-                "unexpected package id '{s}' (expected {s} at offset {} '{s}')\n",
-                .{ pkg.id, @tagName(u.expected), u.offset, pkg.id[u.offset..] },
-            ),
-            .msvc_version_something => {},
-            .msvc_version_tools_something => {},
-            .msvc_version_host_target => |p| {
-                const msvcup_pkg: MsvcupPackage = .initStr(.msvc, p.build_version);
-                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
-            },
-            .msbuild => |version| {
-                const msvcup_pkg: MsvcupPackage = .initStr(.msbuild, version);
-                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
-            },
-            .diasdk => {
-                const msvcup_pkg: MsvcupPackage = .initStr(.diasdk, pkg.version);
-                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
-            },
-            .ninja => |version| {
-                const msvcup_pkg: MsvcupPackage = .initStr(.ninja, version);
-                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
-            },
-            .cmake => |version| {
-                const msvcup_pkg: MsvcupPackage = .initStr(.cmake, version);
-                insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
-            },
-        }
-
-        for (pkgs.payloadsFromPkgIndex(.fromInt(pkg_index))) |payload| {
-            switch (identifyPayload(payload.file_name)) {
-                .unknown => {},
-                .sdk => {
-                    const msvcup_pkg: MsvcupPackage = .initStr(.sdk, pkg.version);
-                    insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
-                },
-            }
+    for (pkgs.slice, 0..) |*pkg, pkg_index| {
+        for (pkgs.payloadsFromPkgIndex(.fromInt(pkg_index))) |*payload| {
+            const owner = recipeOwner(&recipes, pkg, payload) orelse continue;
+            const msvcup_pkg: MsvcupPackage = .initStr(owner.rule.package, owner.package_version);
+            insertSorted(MsvcupPackage, arena, &msvcup_pkgs, msvcup_pkg, {}, MsvcupPackage.order) catch |e| oom(e);
         }
     }
 
@@ -291,6 +259,8 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
     const channel: ChannelKind = .release;
 
+    const recipes = parseBuiltinRecipes(arena);
+
     const root_node = std.Progress.start(.{ .root_name = "msvcup list-payloads" });
     defer root_node.end();
 
@@ -307,22 +277,6 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     // defer arena.free(pkgs);
     scratch_instance.reset();
 
-    for (pkgs.slice) |pkg| {
-        switch (pkg.language) {
-            .neutral => {},
-            .en_us => {},
-            .other => continue,
-        }
-        // just a sanity check
-        switch (identifyPackage(pkg.id)) {
-            .unexpected => |u| try std.debug.panic(
-                "unexpected package id '{s}' (expected {s} at offset {} '{s}')\n",
-                .{ pkg.id, @tagName(u.expected), u.offset, pkg.id[u.offset..] },
-            ),
-            else => {},
-        }
-    }
-
     // Every payload in the manifest, sorted by package id and then by payload, so
     // the output is stable and diffable across changes to the selection logic.
     const sorted = arena.alloc(PayloadIndex, pkgs.payloads.len) catch |e| oom(e);
@@ -335,7 +289,10 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     for (sorted) |payload_index| {
         const pkg = &pkgs.slice[pkgs.pkgIndexFromPayloadIndex(payload_index).int()];
         const payload = &pkgs.payloads[payload_index.int()];
-        const owner: []const u8 = if (payloadOwner(pkg, payload)) |o| o.poolString().slice else "-";
+        const owner: []const u8 = if (recipeOwner(&recipes, pkg, payload)) |o|
+            MsvcupPackage.initStr(o.rule.package, o.package_version).poolString().slice
+        else
+            "-";
         writePayloadListing(w, owner, switch (pkg.source) {
             .manifest => channel.name(),
             .extra => "extra",
@@ -390,34 +347,62 @@ const PayloadListingOrder = struct {
     }
 };
 
+// TODO: expose this documentation in a follow-up when we expose the ability to
+//       read/add recipes
+//
+// Recipes select which manifest payloads belong to which msvcup package.
+//
+// Each rule is one line, an owner followed by predicates that must all match:
+//
+//     OWNER NAME=PATTERN...
+//
+// OWNER is PACKAGE-VERSION where VERSION is either a literal or {version}, which
+// takes the value captured by the {version} in one of the patterns. NAME is one of
+// the attributes shown by "msvcup list-payloads": id, version or fileName. A
+// NAME=PATTERN containing whitespace is wrapped in double quotes.
+//
+// Patterns must match the whole value and are case sensitive, except for:
+//
+//     *          any characters, including none, only at the end of a pattern
+//     {version}  digits separated by dots, i.e. 14.44.17.14
+//     {arch}     x64, x86, arm or arm64, in any case
+//
+// Placeholders consume as much as they can, there's no backtracking.
+//
+// Lines starting with # are comments.
+//
+// Only payloads of neutral and en-US packages can match. A payload can belong to at
+// most one msvcup package, it's an error if more than one rule matches it.
+fn parseBuiltinRecipes(arena: std.mem.Allocator) Recipes {
+    var diagnostic: Recipes.Diagnostic = .{};
+    return Recipes.parse(arena, @embedFile("recipes.txt"), &diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => |e| oom(e),
+        error.InvalidRecipes => std.debug.panic(
+            "builtin recipes.txt:{}: {s}",
+            .{ diagnostic.line, diagnostic.message },
+        ),
+    };
+}
+
 /// Returns the msvcup package that the given payload belongs to, if any. A
-/// payload can belong to at most one msvcup package. This is only used to list
-/// payloads and must be kept in sync with the selection in updateLockFile, which
-/// also attaches the .cab files of each selected .msi.
-fn payloadOwner(pkg: *const Package, payload: *const Payload) ?MsvcupPackage {
+/// payload can belong to at most one msvcup package.
+fn recipeOwner(recipes: *const Recipes, pkg: *const Package, payload: *const Payload) ?Recipes.Match.One {
     switch (pkg.language) {
         .neutral, .en_us => {},
         .other => return null,
     }
-    const by_id: ?MsvcupPackage = if (getInstallPkg(pkg.id)) |install_pkg| switch (install_pkg) {
-        .msvc => |version| .initStr(.msvc, version),
-        .msbuild => |version| .initStr(.msbuild, version),
-        .diasdk => .initStr(.diasdk, pkg.version),
-        .ninja => |version| .initStr(.ninja, version),
-        .cmake => |version| .initStr(.cmake, version),
-    } else null;
-    const by_payload: ?MsvcupPackage = switch (identifyPayload(payload.file_name)) {
-        .unknown => null,
-        .sdk => .initStr(.sdk, pkg.version),
+    return switch (recipes.match(.{
+        .id = pkg.id,
+        .version = pkg.version,
+        .file_name = payload.file_name,
+    })) {
+        .none => null,
+        .one => |one| one,
+        .multiple => |rules| std.debug.panic(
+            "payload '{s}' of package '{s}' matches multiple rules, recipes.txt lines {} and {}",
+            .{ payload.file_name, pkg.id, rules[0].line, rules[1].line },
+        ),
     };
-    if (by_id) |id_owner| {
-        if (by_payload) |payload_owner| std.debug.panic(
-            "payload '{s}' of package '{s}' belongs to multiple msvcup packages '{f}' and '{f}'",
-            .{ payload.file_name, pkg.id, id_owner, payload_owner },
-        );
-        return id_owner;
-    }
-    return by_payload;
 }
 
 fn msiCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
@@ -605,17 +590,6 @@ fn finishCacheFetch(
     }
 }
 
-const MsvcupPackageKind = enum {
-    msvc,
-    sdk,
-    msbuild,
-    diasdk,
-    ninja,
-    cmake,
-    pub fn order(_: void, lhs: MsvcupPackageKind, rhs: MsvcupPackageKind) std.math.Order {
-        return std.math.order(@intFromEnum(lhs), @intFromEnum(rhs));
-    }
-};
 const MsvcupPackage = struct {
     kind: MsvcupPackageKind,
     version: StringPool.Val,
@@ -820,6 +794,8 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         }
     }
 
+    const recipes = parseBuiltinRecipes(arena);
+
     const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
     defer vsman.freeConst(arena);
     scratch_instance.reset();
@@ -831,6 +807,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     try updateLockFile(
         scratch,
         root_node,
+        &recipes,
         config.autoenv,
         config.msvcup_pkgs,
         config.lock_file,
@@ -2190,66 +2167,6 @@ fn endInstall(
     try std.fs.cwd().rename(installed_manifest_path_tmp, installed_manifest_path);
 }
 
-// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-// TODO: make this take an array of patterns instead
-//       it would be great to be ale to see which patterns pulled in packages/payloads
-fn getInstallPkg(id: []const u8) ?union(enum) {
-    msvc: []const u8,
-    msbuild: []const u8,
-    diasdk,
-    ninja: []const u8,
-    cmake: []const u8,
-} {
-    return switch (identifyPackage(id)) {
-        .unknown => null,
-        .unexpected => |u| try std.debug.panic(
-            "unexpected package id '{s}' (expected {s} at offset {} '{s}')\n",
-            .{ id, @tagName(u.expected), u.offset, id[u.offset..] },
-        ),
-        .msvc_version_something => |p| {
-            const crt = scanIdPart(id, p.something.ptr - id.ptr);
-            if (!std.mem.eql(u8, crt.slice, "CRT")) return null;
-            // contains vcruntime.h
-            if (std.mem.eql(u8, id[crt.end..], "Headers.base")) return .{ .msvc = p.build_version };
-
-            const after_crt_part = scanIdPart(id, crt.end);
-
-            if (std.mem.eql(u8, after_crt_part.slice, "Redist")) {
-                const arch_part = scanIdPart(id, after_crt_part.end);
-                _ = Arch.fromStringIgnoreCase(arch_part.slice) orelse return null;
-                const after_arch = id[arch_part.end..];
-                // Redist.ARCH.base contains Visual C++ runtime libraries, i.e.
-                //     vcruntime140.dll and msvcp140.dll - Essential C++ runtime components
-                //     concrt140.dll - Concurrency runtime for parallel programming
-                //     vccorlib140.dll - Core library components
-                // it also contains debug versions, which are files ending in "d.dll"
-                if (std.mem.eql(u8, after_arch, "base")) return .{ .msvc = p.build_version };
-            } else {
-                _ = Arch.fromStringIgnoreCase(after_crt_part.slice) orelse return null;
-                const after_arch = id[after_crt_part.end..];
-                // contains libcmt.lib
-                if (std.mem.eql(u8, after_arch, "Desktop.base")) return .{ .msvc = p.build_version };
-                if (std.mem.eql(u8, after_arch, "Desktop.debug.base")) return .{ .msvc = p.build_version };
-                // contains oldnames.lib
-                if (std.mem.eql(u8, after_arch, "Store.base")) return .{ .msvc = p.build_version };
-            }
-            return null;
-        },
-        .msvc_version_tools_something => null,
-        .msvc_version_host_target => |p| {
-            // "base" contains cl.exe
-            if (std.mem.eql(u8, p.name, "base")) return .{ .msvc = p.build_version };
-            // "Res.base" contains clui.dll required by cl.exe
-            if (std.mem.eql(u8, p.name, "Res.base")) return .{ .msvc = p.build_version };
-            return null;
-        },
-        .msbuild => |version| return .{ .msbuild = version },
-        .diasdk => return .diasdk,
-        .ninja => |version| return .{ .ninja = version },
-        .cmake => |version| return .{ .cmake = version },
-    };
-}
-
 const InstallPayload = struct {
     target: MsvcupPackage,
     index: PayloadIndex,
@@ -2264,26 +2181,12 @@ const InstallPayload = struct {
         return PayloadIndex.order(payloads, lhs.index, rhs.index);
     }
 };
-const InstallPackage = struct {
-    target: MsvcupPackage,
-    index: PackageIndex,
-    pub fn init(target: MsvcupPackage, index: usize) InstallPackage {
-        return .{ .target = target, .index = .fromInt(index) };
-    }
-    pub fn order(pkgs: []const Package, lhs: InstallPackage, rhs: InstallPackage) std.math.Order {
-        switch (MsvcupPackage.order({}, lhs.target, rhs.target)) {
-            .lt, .gt => |o| return o,
-            .eq => {},
-        }
-        return PackageIndex.order(pkgs, lhs.index, rhs.index);
-    }
-};
-
 const CabOffset = struct { cab_offset: usize };
 
 fn updateLockFile(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
+    recipes: *const Recipes,
     autoenv: bool,
     msvcup_pkgs: []const MsvcupPackage,
     lock_file_path: []const u8,
@@ -2292,215 +2195,28 @@ fn updateLockFile(
 ) !void {
     const payloads: []const InstallPayload = blk_payloads: {
         var payloads: std.ArrayListUnmanaged(InstallPayload) = .{};
-        var install_pkgs: std.ArrayListUnmanaged(InstallPackage) = .{};
 
-        for (pkgs.slice, 0..) |pkg, pkg_index| {
-            switch (pkg.language) {
-                .neutral => {},
-                .en_us => {},
-                .other => continue,
-            }
-
-            if (getInstallPkg(pkg.id)) |install_pkg| switch (install_pkg) {
-                .msvc => |pkg_msvc_version| for (msvcup_pkgs) |msvcup_pkg| {
-                    if (msvcup_pkg.kind != .msvc) continue;
-                    if (std.mem.eql(u8, msvcup_pkg.version.slice, pkg_msvc_version)) {
-                        insertSorted(
-                            InstallPackage,
-                            scratch,
-                            &install_pkgs,
-                            .init(msvcup_pkg, pkg_index),
-                            pkgs.slice,
-                            InstallPackage.order,
-                        ) catch |e| oom(e);
-                        break;
-                    }
-                },
-                .msbuild => |pkg_msbuild_version| for (msvcup_pkgs) |msvcup_pkg| {
-                    if (msvcup_pkg.kind != .msbuild) continue;
-                    if (!std.mem.eql(u8, msvcup_pkg.version.slice, pkg_msbuild_version)) continue;
-                    insertSorted(
-                        InstallPackage,
-                        scratch,
-                        &install_pkgs,
-                        .init(msvcup_pkg, pkg_index),
-                        pkgs.slice,
-                        InstallPackage.order,
-                    ) catch |e| oom(e);
-                    break;
-                },
-                .diasdk => for (msvcup_pkgs) |msvcup_pkg| {
-                    if (msvcup_pkg.kind != .diasdk) continue;
-                    if (std.mem.eql(u8, msvcup_pkg.version.slice, pkg.version)) {
-                        insertSorted(
-                            InstallPackage,
-                            scratch,
-                            &install_pkgs,
-                            .init(msvcup_pkg, pkg_index),
-                            pkgs.slice,
-                            InstallPackage.order,
-                        ) catch |e| oom(e);
-                        break;
-                    }
-                },
-                .ninja => |pkg_ninja_version| for (msvcup_pkgs) |msvcup_pkg| {
-                    if (msvcup_pkg.kind != .ninja) continue;
-                    if (!std.mem.eql(u8, msvcup_pkg.version.slice, pkg_ninja_version)) continue;
-                    insertSorted(
-                        InstallPackage,
-                        scratch,
-                        &install_pkgs,
-                        .init(msvcup_pkg, pkg_index),
-                        pkgs.slice,
-                        InstallPackage.order,
-                    ) catch |e| oom(e);
-                    break;
-                },
-                .cmake => |pkg_cmake_version| for (msvcup_pkgs) |msvcup_pkg| {
-                    if (msvcup_pkg.kind != .cmake) continue;
-                    if (!std.mem.eql(u8, msvcup_pkg.version.slice, pkg_cmake_version)) continue;
-                    insertSorted(
-                        InstallPackage,
-                        scratch,
-                        &install_pkgs,
-                        .init(msvcup_pkg, pkg_index),
-                        pkgs.slice,
-                        InstallPackage.order,
-                    ) catch |e| oom(e);
-                    break;
-                },
-            };
-
+        for (pkgs.slice, 0..) |*pkg, pkg_index| {
             const payload_range = pkgs.payloadRangeFromPkgIndex(.fromInt(pkg_index));
             for (payload_range.start..payload_range.limit) |payload_index| {
-                const payload = &pkgs.payloads[payload_index];
-                switch (identifyPayload(payload.file_name)) {
-                    .unknown => {},
-                    .sdk => {
-                        for (msvcup_pkgs) |msvcup_pkg| {
-                            if (msvcup_pkg.kind != .sdk) continue;
-                            if (std.mem.eql(u8, pkg.version, msvcup_pkg.version.slice)) {
-                                insertSorted(
-                                    InstallPayload,
-                                    scratch,
-                                    &payloads,
-                                    .init(msvcup_pkg, payload_index),
-                                    pkgs.payloads,
-                                    InstallPayload.order,
-                                ) catch |e| oom(e);
-                                break;
-                            }
-                        }
-                    },
+                const owner = recipeOwner(recipes, pkg, &pkgs.payloads[payload_index]) orelse continue;
+                for (msvcup_pkgs) |msvcup_pkg| {
+                    if (msvcup_pkg.kind != owner.rule.package) continue;
+                    if (!std.mem.eql(u8, msvcup_pkg.version.slice, owner.package_version)) continue;
+                    insertSorted(
+                        InstallPayload,
+                        scratch,
+                        &payloads,
+                        .init(msvcup_pkg, payload_index),
+                        pkgs.payloads,
+                        InstallPayload.order,
+                    ) catch |e| oom(e);
+                    break;
                 }
             }
         }
 
-        // if (msvc_pkgs.items.len == 0) {
-        //     var bw = std.io.bufferedWriter(std.io.getStdErr().writer());
-        //     try bw.writer().print("error: MSVC version '{s}' NOT FOUND, pick one of:\n", .{msvc_version});
-        //     var msvc_versions: std.ArrayListUnmanaged([]const u8) = .{};
-        //     defer msvc_versions.deinit(scratch);
-        //     for (pkgs.slice) |pkg| {
-        //         switch (pkg.language) {
-        //             .neutral => {},
-        //             .en_us => {},
-        //             .other => continue,
-        //         }
-        //         switch (identifyPackage(pkg.id)) {
-        //             .unknown => {},
-        //             .unexpected => {},
-        //             .msvc_version_something => {},
-        //             .msvc_version_tools_something => {},
-        //             .msvc_version_host_target => |p| {
-        //                 insertSorted(
-        //                     []const u8,
-        //                     scratch,
-        //                     &msvc_versions,
-        //                     p.build_version,
-        //                     {},
-        //                     orderDottedNumeric,
-        //                 ) catch |e| oom(e);
-        //             },
-        //         }
-        //     }
-        //     for (msvc_versions.items, 0..) |version, i| {
-        //         const suffix: []const u8 = if (i + 1 == msvc_versions.items.len) " (latest)" else "";
-        //         try bw.writer().print("    {s}{s}\n", .{ version, suffix });
-        //     }
-        //     try bw.flush();
-        //     std.process.exit(0xff);
-        // }
-
-        // ensure all the packages have 1 or more payloads
-        // for (msvcup_pkgs) |msvcup_pkg| switch (msvcup_pkg.kind) {
-        //     .msvc => {
-        //         // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        //         // TODO
-        //     },
-        //     .sdk => |sdk| {
-        //         for (payloads.items) |install_payload| {
-        //             const payload = &pkgs.payloads[install_payload.index.int()];
-        //             switch (identifyPayload(payload.file_name)) {
-        //                 .unknown => {},
-        //                 .sdk => {
-        //                     const pkg_index = pkgs.pkgIndexFromPayloadIndex(install_payload.index);
-        //                     const pkg = &pkgs.slice[pkg_index.int()];
-        //                     if (std.mem.eql(u8, sdk_version, pkg.version)) break;
-        //                 },
-        //             }
-        //         } else {
-        //             var bw = std.io.bufferedWriter(std.io.getStdErr().writer());
-        //             try bw.writer().print("error: --sdk version '{s}' NOT FOUND, pick one of:\n", .{sdk_version});
-        //             var found_sdk_versions: std.ArrayListUnmanaged([]const u8) = .{};
-        //             defer found_sdk_versions.deinit(scratch);
-        //             for (pkgs.slice, 0..) |pkg, pkg_index| {
-        //                 switch (pkg.language) {
-        //                     .neutral => {},
-        //                     .en_us => {},
-        //                     .other => continue,
-        //                 }
-        //                 for (pkgs.payloadsFromPkgIndex(.fromInt(pkg_index))) |payload| {
-        //                     switch (identifyPayload(payload.file_name)) {
-        //                         .unknown => {},
-        //                         .sdk => {
-        //                             insertSorted(
-        //                                 []const u8,
-        //                                 scratch,
-        //                                 &found_sdk_versions,
-        //                                 pkg.version,
-        //                                 {},
-        //                                 orderDottedNumeric,
-        //                             ) catch |e| oom(e);
-        //                         },
-        //                     }
-        //                 }
-        //             }
-        //             for (found_sdk_versions.items, 0..) |version, i| {
-        //                 const suffix: []const u8 = if (i + 1 == found_sdk_versions.items.len) " (latest)" else "";
-        //                 try bw.writer().print("    {s}{s}\n", .{ version, suffix });
-        //             }
-        //             try bw.flush();
-        //             std.process.exit(0xff);
-        //         }
-        //     },
-        // };
-
         log.warn("TODO: add the dependencies for all the packages we've added", .{});
-
-        for (install_pkgs.items) |install_pkg| {
-            const r = pkgs.payloadRangeFromPkgIndex(install_pkg.index);
-            for (r.start..r.limit) |payload_index| {
-                insertSorted(
-                    InstallPayload,
-                    scratch,
-                    &payloads,
-                    .init(install_pkg.target, payload_index),
-                    pkgs.payloads,
-                    InstallPayload.order,
-                ) catch |e| oom(e);
-            }
-        }
 
         break :blk_payloads payloads.toOwnedSlice(scratch) catch |e| oom(e);
     };
@@ -2714,45 +2430,6 @@ fn writePayload(
     }
 }
 
-const PackageId = union(enum) {
-    unknown,
-    unexpected: struct {
-        offset: usize,
-        expected: enum {
-            version,
-            anything,
-            arch,
-            target_arch,
-            end,
-        },
-    },
-    msvc_version_something: struct {
-        build_version: []const u8,
-        something: []const u8,
-    },
-    msvc_version_tools_something: struct {
-        build_version: []const u8,
-        something: []const u8,
-    },
-    msvc_version_host_target: struct {
-        build_version: []const u8,
-        host_arch: Arch,
-        target_arch: Arch,
-        name: []const u8,
-    },
-    msbuild: []const u8, // version
-    diasdk,
-    ninja: []const u8, // version
-    cmake: []const u8, // version
-};
-
-fn isVersionDigit(c: u8) bool {
-    return switch (c) {
-        '0'...'9' => true,
-        else => false,
-    };
-}
-
 const Scan = struct {
     slice: []const u8,
     end: usize,
@@ -2762,9 +2439,6 @@ fn scanTo(s: []const u8, start: usize, to: u8) Scan {
         if (i > start) return .{ .slice = s[start..i], .end = i + 1 };
     }
     return .{ .slice = s[start..], .end = s.len };
-}
-fn scanIdPart(id: []const u8, start: usize) Scan {
-    return scanTo(id, start, '.');
 }
 fn scanIdVersion(id: []const u8, start: usize) Scan {
     var offset = start;
@@ -2792,188 +2466,6 @@ fn scanIdVersion(id: []const u8, start: usize) Scan {
             .end = offset,
         };
     }
-}
-
-fn isDigits(s: []const u8) bool {
-    for (s) |c| switch (c) {
-        '0'...'9' => {},
-        else => return false,
-    };
-    return true;
-}
-
-fn identifyPackage(id: []const u8) PackageId {
-    // NOTE: we're assuming this package is currently at version 170
-    if (std.mem.eql(u8, id, "Microsoft.Build")) return .{ .msbuild = "170" };
-    // NOTE: we're assuming this package is currently at version 170
-    if (std.mem.eql(u8, id, "Microsoft.Build.Arm64")) return .{ .msbuild = "170" };
-    const msbuild_prefix = "Microsoft.VisualStudio.VC.MSBuild.";
-    if (std.mem.startsWith(u8, id, msbuild_prefix)) {
-        const version = scanIdPart(id, msbuild_prefix.len);
-        // if (std.mem.startsWith(u8, version.slice, "v") and isDigits(version.slice[1..])) {
-        //     return .{ .msbuild = version.slice[1..] };
-        // }
-        // right now only v170 really works
-        if (std.mem.eql(u8, version.slice, "v170")) {
-            return .{ .msbuild = "170" };
-        }
-    }
-
-    if (std.mem.eql(u8, id, "Microsoft.VisualCpp.DIA.SDK")) {
-        return .diasdk;
-    }
-
-    const msvc_prefix = "Microsoft.VC.";
-
-    if (std.mem.startsWith(u8, id, msvc_prefix)) {
-        const version = scanIdVersion(id, msvc_prefix.len);
-        if (version.slice.len == 0) return .{ .unexpected = .{
-            .offset = msvc_prefix.len,
-            .expected = .version,
-        } };
-        const tools_part = scanIdPart(id, version.end);
-        if (tools_part.slice.len == 0) return .{ .unexpected = .{
-            .offset = version.end,
-            .expected = .anything,
-        } };
-        if (!std.mem.eql(u8, tools_part.slice, "Tools")) return .{ .msvc_version_something = .{
-            .build_version = version.slice,
-            .something = id[version.end..],
-        } };
-        const host_part = scanIdPart(id, tools_part.end);
-        if (host_part.slice.len == 0) return .{ .unexpected = .{
-            .offset = tools_part.end,
-            .expected = .anything,
-        } };
-        if (!std.mem.startsWith(u8, host_part.slice, "Host")) return .{ .msvc_version_tools_something = .{
-            .build_version = version.slice,
-            .something = id[version.end..],
-        } };
-        const host_arch: Arch = blk: {
-            const arch_str = host_part.slice[4..];
-            break :blk Arch.fromStringIgnoreCase(arch_str) orelse return .{ .unexpected = .{
-                .offset = tools_part.end + 4,
-                .expected = .arch,
-            } };
-        };
-        const target_part = scanIdPart(id, host_part.end);
-        if (!std.mem.startsWith(u8, target_part.slice, "Target")) return .{ .unexpected = .{
-            .offset = host_part.end,
-            .expected = .target_arch,
-        } };
-        const target_arch: Arch = blk: {
-            const arch_str = target_part.slice[6..];
-            break :blk Arch.fromStringIgnoreCase(arch_str) orelse return .{ .unexpected = .{
-                .offset = tools_part.end + 6,
-                .expected = .arch,
-            } };
-        };
-        return .{ .msvc_version_host_target = .{
-            .build_version = version.slice,
-            .host_arch = host_arch,
-            .target_arch = target_arch,
-            .name = id[target_part.end..],
-        } };
-    }
-
-    {
-        const ninja_prefix = "ninja-";
-        if (std.mem.startsWith(u8, id, ninja_prefix)) {
-            const version = scanIdVersion(id, ninja_prefix.len);
-            if (version.slice.len == 0) return .{ .unexpected = .{
-                .offset = ninja_prefix.len,
-                .expected = .version,
-            } };
-            if (version.end != id.len) return .{ .unexpected = .{
-                .offset = version.end,
-                .expected = .end,
-            } };
-            return .{ .ninja = version.slice };
-        }
-    }
-    {
-        const cmake_prefix = "cmake-";
-        if (std.mem.startsWith(u8, id, cmake_prefix)) {
-            const version = scanIdVersion(id, cmake_prefix.len);
-            if (version.slice.len == 0) return .{ .unexpected = .{
-                .offset = cmake_prefix.len,
-                .expected = .version,
-            } };
-            if (version.end != id.len) return .{ .unexpected = .{
-                .offset = version.end,
-                .expected = .end,
-            } };
-            return .{ .cmake = version.slice };
-        }
-    }
-
-    return .unknown;
-}
-
-const sdk11_min_version = "22000";
-
-const PayloadId = enum { unknown, sdk };
-fn identifyPayload(payload_filename: []const u8) PayloadId {
-    const ucrt_prefix = "Installers\\Universal CRT Headers Libraries and Sources-";
-    if (startsWith(u8, payload_filename, ucrt_prefix)) |arch_lang| {
-        // I *think the arch_lang string here is meaningless, the actual arch
-        // in the containing package metadata
-        _ = arch_lang;
-        return .sdk;
-    }
-
-    // contains the headers in "Windows Kits\10\Include\VERSION" subdirectories
-    // 'shared', 'um' and 'winrt'
-    if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK Desktop Headers "))
-        return .sdk;
-    // contains a bunch of ".lib" file in the um directory
-    if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK Desktop Libs "))
-        return .sdk;
-
-    // includes tools like signtool.exe
-    if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK Signing Tools-"))
-        return .sdk;
-
-    // contains cppwinrt and winrt headers
-    if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK for Windows Store Apps Headers-"))
-        return .sdk;
-
-    // contains a bunch of core windows ".lib" files like ntdll, kernel32, etc, but also
-    // others like the DirectX libraries.
-    if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK for Windows Store Apps Libs-"))
-        return .sdk;
-
-    // this package contains a bunch of executables like dxc.exe, fxc.exe, inspect.exe, certmgr.exe,
-    // cppwinrt.exe, mc.exe, midl.exe, mt.exe, rc.exe
-    if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK for Windows Store Apps Tools-"))
-        return .sdk;
-
-    // if (std.mem.startsWith(u8, payload_filename, "Installers\\Windows SDK for Windows Store Apps Headers-"))
-    //     return .sdk;
-
-    // def getSdkInstallers(targets, sdk_include_signing, sdk_pkg):
-    //     installers = getSdkInstallersBase(targets)
-    //     if sdk_include_signing:
-    //         installers += [findSigningInstaller(sdk_pkg)]
-    //     return installers
-
-    // def getSdkInstallersBase(targets):
-    //     pkgs = [
-    //         f"Windows SDK for Windows Store Apps Tools-x86_en-us.msi",
-    //         f"Windows SDK for Windows Store Apps Headers-x86_en-us.msi",
-    //         f"Windows SDK for Windows Store Apps Headers OnecoreUap-x86_en-us.msi",
-    //         f"Windows SDK for Windows Store Apps Libs-x86_en-us.msi",
-    //         f"Universal CRT Headers Libraries and Sources-x86_en-us.msi",
-    //     ]
-    //     for target in ALL_TARGETS:
-    //         pkgs += [
-    //             f"Windows SDK Desktop Headers {target}-x86_en-us.msi",
-    //             f"Windows SDK OnecoreUap Headers {target}-x86_en-us.msi",
-    //         ]
-    //     for target in targets:
-    //         pkgs += [f"Windows SDK Desktop Libs {target}-x86_en-us.msi"]
-    //     return pkgs
-    return .unknown;
 }
 
 const LockFileUrlKind = enum { vsix, msi, cab, zip };
@@ -3821,14 +3313,11 @@ fn getPackages(
         }
 
         for (extrapkgs.all) |pkg| {
-            const id = identifyPackage(pkg.id);
+            // the id of an extra package is PACKAGE-VERSION
+            const version = pkg.id[std.mem.indexOfScalar(u8, pkg.id, '-').? + 1 ..];
             out_packages[out_package_count] = .{
                 .id = allocator.dupe(u8, pkg.id) catch |e| oom(e),
-                .version = allocator.dupe(u8, switch (id) {
-                    .ninja => |version| version,
-                    .cmake => |version| version,
-                    else => unreachable,
-                }) catch |e| oom(e),
+                .version = allocator.dupe(u8, version) catch |e| oom(e),
                 .language = .neutral,
                 .source = .extra,
                 .payloads_offset = payload_count,
@@ -4052,8 +3541,10 @@ const extrapkgs = @import("extrapkgs");
 const ChannelKind = @import("channelkind.zig").ChannelKind;
 const Arch = @import("arch.zig").Arch;
 const Arches = @import("arch.zig").Arches;
+const MsvcupPackageKind = @import("msvcuppackagekind.zig").MsvcupPackageKind;
 const extra = @import("extra.zig");
 const LockFile = @import("LockFile.zig");
+const Recipes = @import("Recipes.zig");
 const JsonContext = @import("JsonContext.zig");
 const StringPool = @import("StringPool.zig");
 const zip = @import("zip.zig");
