@@ -29,7 +29,7 @@
 
 @if not exist %~dp0msvcup.exe (
     echo msvcup.exe: installing...
-    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_03_02/msvcup-%MSVCUP_ARCH%-windows.zip
+    curl -L -o %~dp0msvcup.zip https://github.com/marler8997/msvcup/releases/download/v2026_11_02/msvcup-%MSVCUP_ARCH%-windows.zip
     tar -C%~dp0 -xf %~dp0msvcup.zip
     del %~dp0msvcup.zip
 ) else (
@@ -37,7 +37,7 @@
 )
 @if not exist %~dp0msvcup.exe exit /b 1
 
-%~dp0msvcup.exe install %~dp0msvc --manifest-update-off autoenv msvc-14.44.17.14 sdk-10.0.22621.7
+%~dp0msvcup.exe install %~dp0msvc --manifest-update-off autoenv msvc-14.44.17.14 sdk-10.0.26100.15
 @if %errorlevel% neq 0 (exit /b %errorlevel%)
 
 @if not exist %~dp0out mkdir %~dp0out
