@@ -137,10 +137,10 @@ pub fn build(b: *std.Build) !void {
         step.dependOn(&run.step);
         test_step.dependOn(step);
     }
-    {
+    for ([_][]const u8{ "src/Recipes.zig", "src/channel.zig" }) |path| {
         const unit_tests = b.addTest(.{
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/Recipes.zig"),
+                .root_source_file = b.path(path),
                 .target = target,
                 .optimize = optimize,
             }),
@@ -224,6 +224,40 @@ fn addTests(b: *std.Build, msvcup: *std.Build.Step.Compile, test_step: *std.Buil
     {
         const run = b.addRunArtifact(msvcup);
         run.addArg("list");
+        test_step.dependOn(&run.step);
+    }
+    {
+        const run = b.addRunArtifact(msvcup);
+        run.addArg("list-channels");
+        run.expectStdOutEqual(
+            \\vs17-release    https://aka.ms/vs/17/release/channel
+            \\vs17-preview    https://aka.ms/vs/17/pre/channel
+            \\vs18-stable     https://aka.ms/vs/18/stable/channel
+            \\vs18-insiders   https://aka.ms/vs/18/insiders/channel
+            \\
+        );
+        test_step.dependOn(&run.step);
+    }
+    const unknown_channel = "unknown channel '{s}', 'msvcup list-channels' shows the known channels, a URL must start with https://\n";
+    for ([_]struct { args: []const []const u8, stderr: []const u8 }{
+        .{ .args = &.{ "list", "--channel", "vs19-stable" }, .stderr = b.fmt(unknown_channel, .{"vs19-stable"}) },
+        .{ .args = &.{ "list", "--channel", "http://example.com/channel" }, .stderr = b.fmt(unknown_channel, .{"http://example.com/channel"}) },
+        .{ .args = &.{ "list-payloads", "--channel", "vs19-stable" }, .stderr = b.fmt(unknown_channel, .{"vs19-stable"}) },
+        .{ .args = &.{ "install", "--channel", "vs19-stable" }, .stderr = b.fmt(unknown_channel, .{"vs19-stable"}) },
+        .{ .args = &.{ "list", "--channel" }, .stderr = "--channel missing argument\n" },
+        .{ .args = &.{ "list-payloads", "--channel" }, .stderr = "--channel missing argument\n" },
+        .{ .args = &.{ "install", "--channel" }, .stderr = "--channel missing argument\n" },
+        .{ .args = &.{ "list", "foo" }, .stderr = "list: unknown argument 'foo'\n" },
+        .{ .args = &.{ "list-payloads", "foo" }, .stderr = "list-payloads: unknown argument 'foo'\n" },
+        .{ .args = &.{ "list-channels", "foo" }, .stderr = "list-channels: unknown argument 'foo'\n" },
+        // starts with https:// so it's a URL, the error says what's wrong with it
+        .{ .args = &.{ "list", "--channel", "https://example.com:port/channel" }, .stderr = "invalid channel URL 'https://example.com:port/channel': InvalidPort\n" },
+        .{ .args = &.{ "install", "--channel", "https:///channel" }, .stderr = "channel URL 'https:///channel' has no host\n" },
+    }) |case| {
+        const run = b.addRunArtifact(msvcup);
+        run.addArgs(case.args);
+        run.expectExitCode(0xff);
+        run.expectStdErrEqual(case.stderr);
         test_step.dependOn(&run.step);
     }
     {
@@ -394,6 +428,5 @@ pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .
 
 const builtin = @import("builtin");
 const std = @import("std");
-const ChannelKind = @import("src/channelkind.zig").ChannelKind;
 const Arch = @import("src/arch.zig").Arch;
 const Arches = @import("src/arch.zig").Arches;
