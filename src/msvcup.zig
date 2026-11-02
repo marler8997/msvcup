@@ -3029,14 +3029,20 @@ fn fetchPayload(
     }
 }
 
+const FetchOptions = struct {
+    size: ?u64 = null,
+};
+
+/// The Visual Studio CDN sometimes ends a response early, curl sees it too. The connection
+/// closes normally so the only sign is that we received fewer bytes than Content-Length.
+const max_fetch_attempts = 3;
+
 fn fetch(
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
     uri: std.Uri,
     out_path: []const u8,
-    opt: struct {
-        size: ?u64 = null,
-    },
+    opt: FetchOptions,
 ) !Sha {
     log.info("fetch: {}", .{uri});
     const progress_node_name = std.fmt.allocPrint(scratch, "fetch {}", .{uri}) catch |e| oom(e);
@@ -3044,6 +3050,35 @@ fn fetch(
     const node = progress_node.start(progress_node_name, 1);
     defer node.end();
 
+    var attempt: u32 = 1;
+    while (true) : (attempt += 1) {
+        switch (try fetchAttempt(scratch, uri, out_path, opt)) {
+            .sha => |sha| return sha,
+            .wrong_size => |size| {
+                if (attempt == max_fetch_attempts) errExit(
+                    "fetch '{}': expected {} bytes but read {}, gave up after {} attempts",
+                    .{ uri, size.expected, size.received, attempt },
+                );
+                log.warn(
+                    "fetch '{}': expected {} bytes but read {}, retrying (attempt {} of {} failed)",
+                    .{ uri, size.expected, size.received, attempt, max_fetch_attempts },
+                );
+            },
+        }
+    }
+}
+
+const FetchAttemptResult = union(enum) {
+    sha: Sha,
+    wrong_size: struct { expected: u64, received: u64 },
+};
+
+fn fetchAttempt(
+    scratch: std.mem.Allocator,
+    uri: std.Uri,
+    out_path: []const u8,
+    opt: FetchOptions,
+) !FetchAttemptResult {
     var client = std.http.Client{ .allocator = scratch };
     defer client.deinit();
     client.initDefaultProxies(scratch) catch |err| switch (err) {
@@ -3111,19 +3146,13 @@ fn fetch(
         );
     }
 
-    if (request.response.content_length) |content_length| {
-        if (total_received != content_length) errExit(
-            "fetch '{}': Content-Length is {} but only read {}",
-            .{ uri, content_length, total_received },
-        );
-    } else if (opt.size) |size| if (total_received != size) errExit(
-        "fetch '{}': expected size {} but read {}",
-        .{ uri, size, total_received },
-    );
+    if (maybe_expected_size) |expected| if (total_received != expected) return .{
+        .wrong_size = .{ .expected = expected, .received = total_received },
+    };
 
     var sha: Sha = undefined;
     hasher.final(&sha.bytes);
-    return sha;
+    return .{ .sha = sha };
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
