@@ -38,6 +38,7 @@ pub fn main() !u8 {
     };
     if (std.mem.eql(u8, cmd, "install")) return install(arena, args);
     if (std.mem.eql(u8, cmd, "list")) return listCommand(arena, args);
+    if (std.mem.eql(u8, cmd, "list-channels")) return listChannels(args);
     if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(arena, args);
     if (std.mem.eql(u8, cmd, "msi")) return msiCommand(arena, args);
     if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(arena, args);
@@ -86,18 +87,27 @@ fn writeUsage(w: *std15.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!voi
         \\Commands:
         \\--------------------------------------------------------------------------------
         \\
-        \\  list                      | List all PKGS.
+        \\  list [--channel CHANNEL]  | List all PKGS.
+        \\  list-channels             | List the known channels with their URLs.
         \\  install DIR PKGS...       | Install the given PKGS to the given DIR. PKGS are
         \\                            | are of the form:
         \\                            |
         \\                            |      <PKG_NAME>-<VERSION>
         \\                            |
         \\                            | installed to {[install_dir]s}.
-        \\  list-payloads             | List all payloads and their msvcup package.
+        \\  list-payloads [--channel CHANNEL]
+        \\                            | List all payloads and their msvcup package.
         \\  msi MSI DIR               | Invoke builtin msi installer.
         \\
         \\InstallOptions:
         \\--------------------------------------------------------------------------------
+        \\  --channel CHANNEL         | Where to find packages. Microsoft publishes the
+        \\                            | packages of each Visual Studio version in a
+        \\                            | channel. CHANNEL is a name from list-channels or
+        \\                            | an https URL, of a channel or of a channel manifest
+        \\                            | (.chman). Not used when the lock file already has
+        \\                            | the packages being installed.
+        \\                            | default: {[channel]s}
         \\  --lock-file PATH          | A manifest to hold all payloads/urls installed.
         \\  --manifest-update-<OPT>   | Controls whether to update to the latest manifest
         \\                            | if it's already been downloaded. This option will
@@ -109,6 +119,7 @@ fn writeUsage(w: *std15.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!voi
         .{
             .version = @embedFile("version"),
             .install_dir = msvcup_dir.root_path,
+            .channel = Channel.default.asArg(),
         },
     );
     try w.flush();
@@ -151,9 +162,19 @@ fn arenaIsEmpty(arena: std.heap.ArenaAllocator) bool {
 }
 
 fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
-    // TODO: accept the "--preview" argument
     // TODO: accept the "--manifest-update-*" arguments
-    if (args.len != 0) errExit("the 'list-versions' command does not take any arguments", .{});
+    var channel = Channel.default;
+    {
+        var arg_index: usize = 0;
+        while (arg_index < args.len) : (arg_index += 1) {
+            const arg = args[arg_index];
+            if (std.mem.eql(u8, arg, "--channel")) {
+                arg_index += 1;
+                if (arg_index == args.len) errExit("--channel missing argument", .{});
+                channel = parseChannel(args[arg_index]);
+            } else errExit("list: unknown argument '{s}'", .{arg});
+        }
+    }
 
     const recipes = parseBuiltinRecipes(arena);
 
@@ -165,7 +186,7 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
     const msvcup_dir: MsvcupDir = try .alloc(arena);
 
-    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
+    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, channel, .off);
     defer vsman.freeConst(arena);
     scratch_instance.reset();
 
@@ -193,8 +214,36 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     return 0;
 }
 
+fn parseChannel(arg: []const u8) Channel {
+    const channel = Channel.fromArg(arg) orelse errExit(
+        "unknown channel '{s}', 'msvcup list-channels' shows the known channels, a URL must start with https://",
+        .{arg},
+    );
+    const uri = std.Uri.parse(channel.httpsUrl()) catch |e| errExit(
+        "invalid channel URL '{s}': {s}",
+        .{ channel.httpsUrl(), @errorName(e) },
+    );
+    const host_len: usize = if (uri.host) |host| switch (host) {
+        inline else => |h| h.len,
+    } else 0;
+    if (host_len == 0) errExit("channel URL '{s}' has no host", .{channel.httpsUrl()});
+    return channel;
+}
+
+fn listChannels(args: []const []const u8) !u8 {
+    if (args.len != 0) errExit("list-channels: unknown argument '{s}'", .{args[0]});
+    var stdout_buf: [1000]u8 = undefined;
+    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
+    const w = &stdout.interface;
+    for (Channel.known) |channel| {
+        w.print("{s: <16}{s}\n", .{ channel.asArg(), channel.httpsUrl() }) catch return stdout.err.?;
+    }
+    w.flush() catch return stdout.err.?;
+    return 0;
+}
+
 const list_payloads_help =
-    \\Usage: msvcup list-payloads
+    \\Usage: msvcup list-payloads [--channel CHANNEL]
     \\
     \\Lists every payload in the Visual Studio manifest (plus msvcup's builtin
     \\extra packages) along with the msvcup package that owns it, one payload
@@ -225,6 +274,8 @@ const list_payloads_help =
     \\readability). The output is meant to be diffed, e.g. to see how a change to
     \\payload selection affects which payloads are installed.
     \\
+    \\CHANNEL is a name shown by list-channels or an https URL.
+    \\
     \\Example:
     \\
     \\  sdk-10.0.22621.7     channel=vs17-release lang=neutral id=Win11SDK_10.0.22621 version=10.0.22621.7 "fileName=Installers\Windows SDK Desktop Headers x64-x86_en-us.msi"
@@ -232,10 +283,18 @@ const list_payloads_help =
 ;
 
 fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
-    for (args) |arg| {
-        errExit("list-payloads: unknown argument '{s}' (see 'msvcup list-payloads --help')", .{arg});
+    var channel = Channel.default;
+    {
+        var arg_index: usize = 0;
+        while (arg_index < args.len) : (arg_index += 1) {
+            const arg = args[arg_index];
+            if (std.mem.eql(u8, arg, "--channel")) {
+                arg_index += 1;
+                if (arg_index == args.len) errExit("--channel missing argument", .{});
+                channel = parseChannel(args[arg_index]);
+            } else errExit("list-payloads: unknown argument '{s}'", .{arg});
+        }
     }
-    const channel: ChannelKind = .release;
 
     const recipes = parseBuiltinRecipes(arena);
 
@@ -272,7 +331,7 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         else
             "-";
         writePayloadListing(w, owner, switch (pkg.source) {
-            .manifest => channel.name(),
+            .manifest => channel.asArg(),
             .extra => "extra",
         }, pkg, payload) catch return stdout.err.?;
     }
@@ -283,12 +342,12 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 fn writePayloadListing(
     w: *std15.Io.Writer,
     owner: []const u8,
-    channel_name: []const u8,
+    channel_arg: []const u8,
     pkg: *const Package,
     payload: *const Payload,
 ) error{WriteFailed}!void {
     try w.print("{s: <20}", .{owner});
-    try writeListingAttr(w, "channel", channel_name, pkg, payload);
+    try writeListingAttr(w, "channel", channel_arg, pkg, payload);
     try writeListingAttr(w, "lang", pkg.language.name(), pkg, payload);
     try writeListingAttr(w, "id", pkg.id, pkg, payload);
     try writeListingAttr(w, "version", pkg.version, pkg, payload);
@@ -634,6 +693,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         msvcup_pkgs: []const MsvcupPackage,
         lock_file: []const u8,
         manifest_update: ManifestUpdate,
+        channel: Channel,
         cache_dir: ?[]const u8,
         msiexec: bool = false,
     };
@@ -643,6 +703,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
         var maybe_lock_file: ?[]const u8 = null;
         var maybe_manifest_update: ?ManifestUpdate = null;
+        var channel = Channel.default;
         var cache_dir: ?[]const u8 = null;
         var msiexec: bool = false;
 
@@ -675,6 +736,10 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 maybe_manifest_update = .daily;
             } else if (std.mem.eql(u8, arg, "--manifest-update-always")) {
                 maybe_manifest_update = .always;
+            } else if (std.mem.eql(u8, arg, "--channel")) {
+                arg_index += 1;
+                if (arg_index == args.len) errExit("--channel missing argument", .{});
+                channel = parseChannel(args[arg_index]);
             } else if (std.mem.eql(u8, arg, "--cache-dir")) {
                 arg_index += 1;
                 if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
@@ -703,6 +768,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 "missing one of --manifest-update-off, --manifest-update-daily or --manifest-update-always",
                 .{},
             ),
+            .channel = channel,
             .cache_dir = cache_dir,
             .msiexec = msiexec,
         };
@@ -774,7 +840,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
     const recipes = parseBuiltinRecipes(arena);
 
-    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, .release, .off);
+    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, config.channel, .off);
     defer vsman.freeConst(arena);
     scratch_instance.reset();
 
@@ -786,6 +852,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         scratch,
         root_node,
         &recipes,
+        config.channel,
         config.autoenv,
         config.msvcup_pkgs,
         config.lock_file,
@@ -2169,6 +2236,7 @@ fn updateLockFileLocking(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     recipes: *const Recipes,
+    channel: Channel,
     autoenv: bool,
     msvcup_pkgs: []const MsvcupPackage,
     lock_file_path: []const u8,
@@ -2204,8 +2272,8 @@ fn updateLockFileLocking(
             for (payloads.items) |payload| {
                 if (MsvcupPackage.order({}, payload.target, msvcup_pkg) == .eq) break;
             } else errExit(
-                "package '{f}' has no payloads in the manifest, 'msvcup list' shows the available packages",
-                .{msvcup_pkg},
+                "package '{f}' has no payloads in the manifest of channel '{s}', 'msvcup list --channel {s}' shows the available packages",
+                .{ msvcup_pkg, channel.asArg(), channel.asArg() },
             );
         }
 
@@ -2516,17 +2584,14 @@ fn readVsManifestLocking(
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
     msvcup_dir: MsvcupDir,
-    channel_kind: ChannelKind,
+    channel: Channel,
     update: ManifestUpdate,
 ) !PathAndContent {
     globalfilelocks.enteredLockingFunction(@src().fn_name);
 
-    const subdir = switch (channel_kind) {
-        .release => "vs-release",
-        .preview => "vs-preview",
-    };
+    const manifest_dir = channel.manifestDir(.vs);
     var vsman_latest_owning: OwningPath = .{
-        .owning_path = msvcup_dir.path(allocator, .{ "manifest", subdir, "latest" }) catch |e| oom(e),
+        .owning_path = msvcup_dir.path(allocator, .{ "manifest", manifest_dir.slice(), "latest" }) catch |e| oom(e),
     };
     defer vsman_latest_owning.deinit(allocator);
 
@@ -2541,21 +2606,26 @@ fn readVsManifestLocking(
         .always => @panic("todo: replace the existing manifest"),
     }
 
-    var chman = try readChManifestLocking(scratch, progress_node, scratch, msvcup_dir, channel_kind, update);
+    var chman = try readChManifestLocking(scratch, progress_node, scratch, msvcup_dir, channel, update);
     defer chman.freeConst(scratch);
 
-    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", subdir, "latest.fetching" }) catch |e| oom(e);
+    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", manifest_dir.slice(), "latest.fetching" }) catch |e| oom(e);
     defer scratch.free(fetch_path);
     switch (try AtomicFile.lock(fetch_path, vsman_latest_owning.borrow())) {
         .exists => {},
         .locked => |locked| {
             var atomic_file = locked;
             defer atomic_file.deinit();
-            const payload = try vsManifestPayloadFromChManifest(scratch, scratch, channel_kind, chman);
+            const payload = try vsManifestPayloadFromChManifest(scratch, scratch, chman);
             defer payload.free(scratch);
             const uri = uriFromUrlDecoded(payload.url_decoded) catch |e| errExit(
                 "failed to parse vs manifest url '{s}' taken from file '{s}' with {s}",
                 .{ payload.url_decoded, chman.path, @errorName(e) },
+            );
+            // nothing verifies the vs manifest's content, see the note below
+            if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) errExit(
+                "vs manifest url '{s}' taken from file '{s}' is not an https URL",
+                .{ payload.url_decoded, chman.path },
             );
 
             // log.info("payload size {} url '{s}' sha256 '{s}'", .{ payload.size, payload.url, payload.sha256 });
@@ -2563,8 +2633,9 @@ fn readVsManifestLocking(
 
             // NOTE: for some reason the size/sha256 is not right for this?!?
             // const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{ .size = payload.size });
-            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{});
+            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{ .redirects = .https_only });
             _ = sha256;
+            try checkFetchedManifest(scratch, &atomic_file, uri, "vs manifest", "packages");
             try atomic_file.finish(vsman_latest_owning.borrow());
         },
     }
@@ -2606,7 +2677,6 @@ fn allocUrlPercentDecoded(allocator: std.mem.Allocator, url: []const u8) error{O
 fn vsManifestPayloadFromChManifest(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
-    channel_kind: ChannelKind,
     chman: PathAndContent,
 ) !VsManifestPayload {
     const parsed = try std.json.parseFromSlice(std.json.Value, scratch, chman.content, .{});
@@ -2616,33 +2686,34 @@ fn vsManifestPayloadFromChManifest(
     const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{f}", .{json_error});
     const channel_items_field = file_obj.getField(&json_error, "channelItems") catch errExit("{f}", .{json_error});
     const channel_items = channel_items_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
-    const payload = blk: {
-        const vs_manifest_channel_id = switch (channel_kind) {
-            .release => "Microsoft.VisualStudio.Manifests.VisualStudio",
-            .preview => "Microsoft.VisualStudio.Manifests.VisualStudioPreview",
-        };
-        for (0..channel_items.items.len) |index| {
-            const channel_item_element = channel_items.getElement(&json_error, index) catch errExit("{f}", .{json_error});
-            const channel_item = channel_item_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
-            const id_field = channel_item.getField(&json_error, "id") catch errExit("{f}", .{json_error});
-            const id = id_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
-            if (std.mem.eql(u8, id, vs_manifest_channel_id)) {
-                const payloads_field = channel_item.getField(&json_error, "payloads") catch errExit("{f}", .{json_error});
-                const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
-                if (payloads.items.len != 1) errExit(
-                    "{s}: channelItem with id \"{s}\" has {} payloads instead of 1",
-                    .{ chman.path, id, payloads.items.len },
-                );
-                const payload_element = payloads.getElement(&json_error, 0) catch unreachable;
-                const payload_object = payload_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
-                break :blk PayloadJson.init(payload_object);
-            }
-        }
-        errExit(
-            "channel manifest '{s}' is missing vs manifest id '{s}'",
-            .{ chman.path, vs_manifest_channel_id },
+    // the id depends on the channel, i.e. "Microsoft.VisualStudio.Manifests.VisualStudioPreview",
+    // but a channel has exactly one
+    const vs_manifest_id_prefix = "Microsoft.VisualStudio.Manifests.";
+    var maybe_payload: ?PayloadJson = null;
+    for (0..channel_items.items.len) |index| {
+        const channel_item_element = channel_items.getElement(&json_error, index) catch errExit("{f}", .{json_error});
+        const channel_item = channel_item_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
+        const id_field = channel_item.getField(&json_error, "id") catch errExit("{f}", .{json_error});
+        const id = id_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
+        if (!std.mem.startsWith(u8, id, vs_manifest_id_prefix)) continue;
+        if (maybe_payload != null) errExit(
+            "channel manifest '{s}' has more than one channelItem with an id starting with '{s}'",
+            .{ chman.path, vs_manifest_id_prefix },
         );
-    };
+        const payloads_field = channel_item.getField(&json_error, "payloads") catch errExit("{f}", .{json_error});
+        const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
+        if (payloads.items.len != 1) errExit(
+            "{s}: channelItem with id \"{s}\" has {} payloads instead of 1",
+            .{ chman.path, id, payloads.items.len },
+        );
+        const payload_element = payloads.getElement(&json_error, 0) catch unreachable;
+        const payload_object = payload_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
+        maybe_payload = PayloadJson.init(payload_object);
+    }
+    const payload = maybe_payload orelse errExit(
+        "channel manifest '{s}' has no channelItem with an id starting with '{s}'",
+        .{ chman.path, vs_manifest_id_prefix },
+    );
     return .{
         .url_decoded = allocUrlPercentDecoded(allocator, payload.url) catch |e| oom(e),
         .sha256 = payload.sha256,
@@ -2742,17 +2813,14 @@ fn readChManifestLocking(
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
     msvcup_dir: MsvcupDir,
-    channel_kind: ChannelKind,
+    channel: Channel,
     update: ManifestUpdate,
 ) !PathAndContent {
     globalfilelocks.enteredLockingFunction(@src().fn_name);
 
-    const subdir = switch (channel_kind) {
-        .release => "channel-release",
-        .preview => "channel-preview",
-    };
+    const manifest_dir = channel.manifestDir(.channel);
     var chman_latest_owning: OwningPath = .{
-        .owning_path = msvcup_dir.path(allocator, .{ "manifest", subdir, "latest" }) catch |e| oom(e),
+        .owning_path = msvcup_dir.path(allocator, .{ "manifest", manifest_dir.slice(), "latest" }) catch |e| oom(e),
     };
     defer chman_latest_owning.deinit(allocator);
 
@@ -2767,14 +2835,27 @@ fn readChManifestLocking(
         .always => @panic("todo: replace the existing manifest"),
     }
 
-    const chman_url_encoded = try resolveChManifestUrlLocking(scratch, scratch, msvcup_dir, channel_kind, update);
-    defer chman_url_encoded.freeConst(scratch);
-    const uri = std.Uri.parse(chman_url_encoded.content) catch |e| errExit(
+    // the url of a channel manifest is what a channel url redirects to, so there's nothing
+    // to resolve
+    const manifest_uri: ?std.Uri = switch (channel) {
+        .url => |url| blk: {
+            // parseChannel checked it
+            const uri = std.Uri.parse(url) catch unreachable;
+            break :blk if (Channel.isManifestUri(uri)) uri else null;
+        },
+        else => null,
+    };
+    const maybe_resolved: ?PathAndContent = if (manifest_uri == null)
+        try resolveChManifestUrlLocking(scratch, scratch, msvcup_dir, channel, update)
+    else
+        null;
+    defer if (maybe_resolved) |resolved| resolved.freeConst(scratch);
+    const uri = manifest_uri orelse std.Uri.parse(maybe_resolved.?.content) catch |e| errExit(
         "failed to parse latest channel manifest url '{s}' from file '{s}' with {s}",
-        .{ chman_url_encoded.content, chman_url_encoded.path, @errorName(e) },
+        .{ maybe_resolved.?.content, maybe_resolved.?.path, @errorName(e) },
     );
 
-    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", subdir, "latest.fetching" }) catch |e| oom(e);
+    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", manifest_dir.slice(), "latest.fetching" }) catch |e| oom(e);
     defer scratch.free(fetch_path);
     switch (try AtomicFile.lock(fetch_path, chman_latest_owning.borrow())) {
         .exists => {},
@@ -2789,8 +2870,9 @@ fn readChManifestLocking(
             // //       ALSO, I'd like to see if
             // if (true) std.debug.panic("check uri sha '{s}'", .{uri_sha});
 
-            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{});
+            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{ .redirects = .https_only });
             _ = sha256;
+            try checkFetchedManifest(scratch, &atomic_file, uri, "channel manifest", "channelItems");
             try atomic_file.finish(chman_latest_owning.borrow());
         },
     }
@@ -2801,21 +2883,51 @@ fn readChManifestLocking(
     return .{ .path = chman_latest_owning.take(), .content = content };
 }
 
+/// Exits unless what was just downloaded is a json object with the given field. A manifest
+/// has no hash to check it against and once it's cached it isn't downloaded again, so a url
+/// that gave us something else would fail every run until the file is deleted by hand.
+fn checkFetchedManifest(
+    scratch: std.mem.Allocator,
+    atomic_file: *AtomicFile,
+    uri: std.Uri,
+    what: []const u8,
+    required_field: []const u8,
+) !void {
+    const content = scratch.alloc(u8, try atomic_file.file.getEndPos()) catch |e| oom(e);
+    defer scratch.free(content);
+    const len = try atomic_file.file.preadAll(content, 0);
+    std.debug.assert(len == content.len);
+
+    const problem: []const u8 = blk: {
+        const parsed = std.json.parseFromSlice(std.json.Value, scratch, content, .{}) catch |err| switch (err) {
+            error.OutOfMemory => |e| oom(e),
+            else => break :blk "it isn't json",
+        };
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .object => |object| if (object.contains(required_field)) return,
+            else => break :blk "it isn't a json object",
+        }
+        // exit doesn't run defers, delete the file before the message that names the field
+        atomic_file.deinit();
+        errExit("'{}' is not a {s}, it has no \"{s}\" field", .{ uri, what, required_field });
+    };
+    atomic_file.deinit();
+    errExit("'{}' is not a {s}, {s}", .{ uri, what, problem });
+}
+
 fn resolveChManifestUrlLocking(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     msvcup_dir: MsvcupDir,
-    channel_kind: ChannelKind,
+    channel: Channel,
     update: ManifestUpdate,
 ) !PathAndContent {
     globalfilelocks.enteredLockingFunction(@src().fn_name);
 
-    const subdir = switch (channel_kind) {
-        .release => "channel-release-url",
-        .preview => "channel-preview-url",
-    };
+    const manifest_dir = channel.manifestDir(.@"channel-url");
     var chman_latest_url_path_owning: OwningPath = .{
-        .owning_path = msvcup_dir.path(allocator, .{ "manifest", subdir, "latest" }) catch |e| oom(e),
+        .owning_path = msvcup_dir.path(allocator, .{ "manifest", manifest_dir.slice(), "latest" }) catch |e| oom(e),
     };
     defer chman_latest_url_path_owning.deinit(allocator);
 
@@ -2830,7 +2942,7 @@ fn resolveChManifestUrlLocking(
         .always => @panic("todo: replace the existing url file"),
     }
 
-    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", subdir, "latest.fetching" }) catch |e| oom(e);
+    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", manifest_dir.slice(), "latest.fetching" }) catch |e| oom(e);
     defer scratch.free(fetch_path);
     switch (try AtomicFile.lock(fetch_path, chman_latest_url_path_owning.borrow())) {
         .exists => {},
@@ -2839,7 +2951,7 @@ fn resolveChManifestUrlLocking(
             defer atomic_file.deinit();
             try resolveChannelManifestUrlToFile(
                 scratch,
-                std.Uri.parse(channel_kind.httpsUrl()) catch unreachable,
+                std.Uri.parse(channel.httpsUrl()) catch unreachable,
                 atomic_file.file,
             );
             try atomic_file.finish(chman_latest_url_path_owning.borrow());
@@ -2885,18 +2997,31 @@ fn resolveChannelManifestUrlToFile(
     try request.send();
     request.wait() catch |err| switch (err) {
         error.TooManyHttpRedirects => {
-            if (request.response.location) |redirect_url| {
-                _ = std.Uri.parse(redirect_url) catch |e| errExit(
-                    "failed to parse the redirect url '{s}' with {s}",
-                    .{ redirect_url, @errorName(e) },
+            if (request.response.location) |location| {
+                // a Location can be relative to the url that redirected
+                var resolve_buf: [2 * header_buffer.len]u8 = undefined;
+                var resolve_unused: []u8 = &resolve_buf;
+                const redirect_uri = uri.resolve_inplace(location, &resolve_unused) catch |e| errExit(
+                    "channel URL '{}' redirects to '{s}', which failed to parse with {s}",
+                    .{ uri, location, @errorName(e) },
                 );
-                try out_file.writer().writeAll(redirect_url);
+                if (!std.ascii.eqlIgnoreCase(redirect_uri.scheme, "https")) errExit(
+                    "channel URL '{}' redirects to '{}', which is not an https URL",
+                    .{ uri, redirect_uri },
+                );
+                // an unknown aka.ms url redirects to a search page with a success status,
+                // check this before it gets cached
+                if (!Channel.isManifestUri(redirect_uri)) errExit(
+                    "channel URL '{}' redirects to '{}', which is not a channel manifest (.chman)",
+                    .{ uri, redirect_uri },
+                );
+                try out_file.writer().print("{}", .{redirect_uri});
                 return;
             }
         },
         else => |e| return e,
     };
-    errExit("GET '{s}' HTTP status {} \"{s}\"", .{
+    errExit("GET '{}' HTTP status {} \"{s}\", expected a redirect to a channel manifest", .{
         uri,
         @intFromEnum(request.response.status),
         request.response.status.phrase() orelse "",
@@ -2986,7 +3111,13 @@ fn fetchPayloadLocking(
 
 const FetchOptions = struct {
     size: ?u64 = null,
+    /// What a redirect is allowed to lead to. Payloads are checked against a hash from the
+    /// manifest so it doesn't matter where they come from. Nothing checks a manifest, so
+    /// every url on the way to one has to be https.
+    redirects: enum { any, https_only } = .any,
 };
+
+const max_fetch_redirects = 3;
 
 /// The Visual Studio CDN sometimes ends a response early, curl sees it too. The connection
 /// closes normally so the only sign is that we received fewer bytes than Content-Length.
@@ -3047,13 +3178,47 @@ fn fetchAttempt(
     };
 
     var header_buffer: [8196]u8 = undefined;
-    var request = try client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .keep_alive = false,
-    });
+    // the url we end up at when we follow the redirects ourselves, each one is allocated
+    // because it can reference the one before it
+    var redirect_uri = uri;
+    var redirect_count: u8 = 0;
+    var request = while (true) {
+        var request = try client.open(.GET, redirect_uri, .{
+            .server_header_buffer = &header_buffer,
+            .keep_alive = false,
+            .redirect_behavior = switch (opt.redirects) {
+                .any => @enumFromInt(max_fetch_redirects),
+                .https_only => .unhandled,
+            },
+        });
+        errdefer request.deinit();
+        try request.send();
+        try request.wait();
+        if (opt.redirects == .any or request.response.status.class() != .redirect) break request;
+
+        const location = request.response.location orelse errExit(
+            "fetch '{}': HTTP response {} has no Location",
+            .{ redirect_uri, @intFromEnum(request.response.status) },
+        );
+        if (redirect_count == max_fetch_redirects) errExit(
+            "fetch '{}': more than {} redirects, the last one to '{s}'",
+            .{ uri, max_fetch_redirects, location },
+        );
+        redirect_count += 1;
+        const resolve_buf = scratch.alloc(u8, 2 * header_buffer.len) catch |e| oom(e);
+        var resolve_unused = resolve_buf;
+        const next_uri = redirect_uri.resolve_inplace(location, &resolve_unused) catch |e| errExit(
+            "fetch '{}': redirects to '{s}', which failed to parse with {s}",
+            .{ redirect_uri, location, @errorName(e) },
+        );
+        if (!std.ascii.eqlIgnoreCase(next_uri.scheme, "https")) errExit(
+            "fetch '{}': redirects to '{}', which is not an https URL",
+            .{ redirect_uri, next_uri },
+        );
+        redirect_uri = next_uri;
+        request.deinit();
+    };
     defer request.deinit();
-    try request.send();
-    try request.wait();
     if (request.response.status != .ok) return errExit(
         "fetch '{}': HTTP response {} \"{?s}\"",
         .{ uri, @intFromEnum(request.response.status), request.response.status.phrase() },
@@ -3531,7 +3696,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const std15 = if (zig_atleast_15) std else @import("std15");
 const extrapkgs = @import("extrapkgs");
-const ChannelKind = @import("channelkind.zig").ChannelKind;
+const Channel = @import("channel.zig").Channel;
 const Arch = @import("arch.zig").Arch;
 const Arches = @import("arch.zig").Arches;
 const MsvcupPackageKind = @import("msvcuppackagekind.zig").MsvcupPackageKind;
