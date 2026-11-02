@@ -91,13 +91,37 @@ pub fn build(b: *std.Build) !void {
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
 
-    inline for ([_][]const u8{ "handmade", "cmake" }) |example| {
-        const run = b.addSystemCommand(&.{ "cmd.exe", "/c", "build.bat" });
-        run.cwd = b.path("examples/" ++ example);
-        run.has_side_effects = true;
-        const step = b.step("test-example-" ++ example, "");
-        step.dependOn(&run.step);
-        if (builtin.os.tag == .windows) test_step.dependOn(step);
+    for ([_]struct { name: []const u8, files: []const []const u8 }{
+        .{ .name = "handmade", .files = &.{ "build.bat", "hello.c", "msvc.lock" } },
+        .{ .name = "cmake", .files = &.{ "build.bat", "CMakeLists.txt", "hello.c", "msvc.lock" } },
+    }) |example| {
+        const example_dir = b.fmt("examples/{s}", .{example.name});
+        {
+            // runs the example in place, build.bat downloads the msvcup release if it's
+            // not already there
+            const run = addExampleRun(b, example_dir);
+            const step = b.step(b.fmt("test-example-{s}-release", .{example.name}), "");
+            step.dependOn(&run.step);
+            if (builtin.os.tag == .windows) test_step.dependOn(step);
+        }
+        {
+            // runs a copy of the example with the msvcup we just built next to build.bat,
+            // which it uses instead of downloading the release. The directory doesn't
+            // depend on a hash so each new msvcup reuses the install rather than leaving
+            // another one in the cache.
+            const copy_dir = b.fmt(".zig-cache/examples/{s}", .{example.name});
+            const copy = b.addUpdateSourceFiles();
+            for (example.files) |file| copy.addCopyFileToSource(
+                b.path(b.fmt("{s}/{s}", .{ example_dir, file })),
+                b.fmt("{s}/{s}", .{ copy_dir, file }),
+            );
+            copy.addCopyFileToSource(msvcup.getEmittedBin(), b.fmt("{s}/msvcup.exe", .{copy_dir}));
+            const run = addExampleRun(b, copy_dir);
+            run.step.dependOn(&copy.step);
+            const step = b.step(b.fmt("test-example-{s}-head", .{example.name}), "");
+            step.dependOn(&run.step);
+            if (builtin.os.tag == .windows) test_step.dependOn(step);
+        }
     }
 
     const release_step = b.step("release", "Build/archive release executables for all targets and test the native one");
@@ -130,6 +154,13 @@ fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
         }
     }
     return exe;
+}
+
+fn addExampleRun(b: *std.Build, dir: []const u8) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{ "cmd.exe", "/c", "build.bat" });
+    run.cwd = b.path(dir);
+    run.has_side_effects = true;
+    return run;
 }
 
 fn addTests(b: *std.Build, msvcup: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
