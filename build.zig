@@ -172,6 +172,10 @@ fn addTests(b: *std.Build, msvcup: *std.Build.Step.Compile, test_step: *std.Buil
     {
         const run = b.addRunArtifact(msvcup);
         run.addArg("list-payloads");
+        // this prints about 20,000 lines, capture it to keep it out of the CI logs
+        _ = run.captureStdOut();
+        // capturing makes the step cacheable, we still want it to run every time
+        run.has_side_effects = true;
         test_step.dependOn(&run.step);
     }
 }
