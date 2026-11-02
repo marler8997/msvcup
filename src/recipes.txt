@@ -26,10 +26,16 @@ sdk-{version} version={version} "fileName=Installers\Universal CRT Headers Libra
 sdk-{version} version={version} "fileName=Installers\Windows SDK Desktop Headers *"
 # contains a bunch of ".lib" file in the um directory
 sdk-{version} version={version} "fileName=Installers\Windows SDK Desktop Libs *"
+# contains more of the headers in 'shared', newer sdks moved them here, older sdks don't
+# have this msi
+sdk-{version} version={version} "fileName=Installers\Windows SDK OnecoreUap Headers *"
 # includes tools like signtool.exe
 sdk-{version} version={version} "fileName=Installers\Windows SDK Signing Tools-*"
 # contains cppwinrt and winrt headers
 sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Headers-*"
+# contains winapifamily.h, which windows.h includes, newer sdks moved it here, older sdks
+# don't have this msi
+sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Headers OnecoreUap-*"
 # contains a bunch of core windows ".lib" files like ntdll, kernel32, etc, but also
 # others like the DirectX libraries.
 sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Libs-*"
