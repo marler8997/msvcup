@@ -2911,7 +2911,7 @@ fn resolveChannelManifestUrlToFile(
     out_path: []const u8,
 ) !void {
     // TODO: progres report
-    log.info("resolving URL '{f}'...", .{uri});
+    log.info("resolving URL '{}'...", .{uri});
 
     var client = std.http.Client{ .allocator = scratch };
     defer client.deinit();
@@ -3075,7 +3075,7 @@ fn fetch(
         if (request.response.content_length) |content_length| {
             if (opt.size) |size| {
                 if (size != content_length) errExit(
-                    "fetch '{f}': Content-Length {} != expected size {}",
+                    "fetch '{}': Content-Length {} != expected size {}",
                     .{ uri, content_length, size },
                 );
             }
@@ -3098,7 +3098,7 @@ fn fetch(
         total_received += len;
         if (request.response.content_length) |content_length| {
             if (total_received > content_length) errExit(
-                "fetch '{f}': read more than Content-Length ({})",
+                "fetch '{}': read more than Content-Length ({})",
                 .{ uri, content_length },
             );
         }
@@ -3113,11 +3113,11 @@ fn fetch(
 
     if (request.response.content_length) |content_length| {
         if (total_received != content_length) errExit(
-            "fetch '{f}': Content-Length is {} but only read {}",
+            "fetch '{}': Content-Length is {} but only read {}",
             .{ uri, content_length, total_received },
         );
     } else if (opt.size) |size| if (total_received != size) errExit(
-        "fetch '{f}': expected size {} but read {}",
+        "fetch '{}': expected size {} but read {}",
         .{ uri, size, total_received },
     );
 
