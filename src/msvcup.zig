@@ -4,28 +4,6 @@ const log = std.log.scoped(.msvcup);
 
 const global = struct {
     var string_pool: StringPool = undefined;
-    var active_file_lock_fn_name: ?[]const u8 = null;
-
-    // Any function with a "Locking" suffix might take a file lock. We want to avoid
-    // taking multiple file locks at a time to avoid deadlock. We enforce this with the
-    // following functions.
-    fn enteredLockingFunction(fn_name: []const u8) void {
-        if (active_file_lock_fn_name) |active_fn_name| std.debug.panic(
-            "{s} was called while {s} had a file lock",
-            .{ fn_name, active_fn_name },
-        );
-    }
-    fn tookFileLock(fn_name: []const u8) void {
-        if (active_file_lock_fn_name) |active_fn_name| std.debug.panic(
-            "{s} took a file lock while {s} had a file lock",
-            .{ fn_name, active_fn_name },
-        );
-        active_file_lock_fn_name = fn_name;
-    }
-    fn releasedFileLock(fn_name: []const u8) void {
-        std.debug.assert(active_file_lock_fn_name.?.ptr == fn_name.ptr);
-        active_file_lock_fn_name = null;
-    }
 };
 
 pub fn main() !u8 {
@@ -502,16 +480,14 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const scratch = scratch_instance.allocator();
 
     {
-        const cache_path = std.fs.path.join(scratch, &.{ cache_dir, "nohash" }) catch |e| oom(e);
-        defer scratch.free(cache_path);
+        // we don't know the hash so there's no name for this download to have until it's done
+        const fetch_path = std.fs.path.join(scratch, &.{ cache_dir, "nohash" }) catch |e| oom(e);
+        defer scratch.free(fetch_path);
+        var atomic_file = (try AtomicFile.lock(fetch_path, null)).locked;
+        defer atomic_file.deinit();
 
-        const cache_lock_path = std.mem.concat(scratch, u8, &.{ cache_path, ".lock" }) catch |e| oom(e);
-        defer scratch.free(cache_lock_path);
-        var cache_lock = try LockFile.lock(cache_lock_path);
-        defer cache_lock.unlock();
-
-        const sha256 = try fetch(root_node, scratch, uri, cache_path, .{});
-        try finishCacheFetch(scratch, cache_dir, config.url, sha256, cache_path);
+        const sha256 = try fetch(root_node, scratch, uri, atomic_file.file, .{});
+        try finishCacheFetch(scratch, cache_dir, config.url, sha256, &atomic_file);
         var stdout_buf: [80]u8 = undefined;
         var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
         stdout.interface.print("{f}\n", .{sha256}) catch return stdout.err.?;
@@ -575,20 +551,20 @@ fn finishCacheFetch(
     cache_dir: []const u8,
     url: []const u8,
     sha256: Sha,
-    cache_path: []const u8,
+    atomic_file: *AtomicFile,
 ) !void {
     const entry = CacheEntry.alloc(scratch, scratch, cache_dir, sha256, basenameFromUrl(url));
     defer entry.free(scratch);
-    const already_exists = if (std.fs.accessAbsolute(entry.path, .{})) true else |err| switch (err) {
+    const already_exists = if (std.fs.cwd().access(entry.path, .{})) true else |err| switch (err) {
         error.FileNotFound => false,
         else => |e| return e,
     };
     if (already_exists) {
+        // the caller's deinit deletes the temporary file
         std.log.info("{s}: already exists", .{entry.path});
-        try std.fs.cwd().deleteFile(cache_path);
     } else {
         std.log.info("{s}: newly fetched", .{entry.path});
-        try std.fs.cwd().rename(cache_path, entry.path);
+        try atomic_file.finish(entry.path);
     }
 }
 
@@ -778,7 +754,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
             )) |mismatch| {
                 std.log.info("{f}", .{mismatch});
             } else {
-                const result = try installFromLockFile(
+                const result = try installFromLockFileLocking(
                     scratch,
                     root_node,
                     config.install_dir,
@@ -806,7 +782,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     // defer arena.free(pkgs);
     scratch_instance.reset();
 
-    try updateLockFile(
+    try updateLockFileLocking(
         scratch,
         root_node,
         &recipes,
@@ -836,7 +812,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         "lock file '{s}' still doesn't match what we're installing even after it's been updated: {f}",
         .{ config.lock_file, mismatch },
     );
-    switch (try installFromLockFile(
+    switch (try installFromLockFileLocking(
         scratch,
         root_node,
         config.install_dir,
@@ -1202,7 +1178,7 @@ const UniquePackages = struct {
     sdk: ?StringPool.Val = null,
 };
 
-fn installFromLockFile(
+fn installFromLockFileLocking(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     install_path: []const u8,
@@ -1211,6 +1187,8 @@ fn installFromLockFile(
     lock_file_content: []const u8,
     named: struct { msiexec: bool },
 ) !enum { success, version_mismatch } {
+    globalfilelocks.enteredLockingFunction(@src().fn_name);
+
     var line_it = std.mem.tokenizeAny(u8, lock_file_content, "\r\n");
     var lineno: u32 = 0;
     var save_cab_pos: ?struct { lineno: u32, offset: usize } = null;
@@ -1264,7 +1242,7 @@ fn installFromLockFile(
                     .{ lineno, line[0..0] };
                 save_cab_pos = null;
 
-                try installPayload(
+                try installPayloadLocking(
                     scratch,
                     progress_node,
                     install_path,
@@ -1537,7 +1515,7 @@ const CacheEntry = struct {
     }
 };
 
-fn installPayload(
+fn installPayloadLocking(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     install_dir_path: []const u8,
@@ -1552,6 +1530,8 @@ fn installPayload(
         msiexec: bool,
     },
 ) !void {
+    globalfilelocks.enteredLockingFunction(@src().fn_name);
+
     const install_kind: enum { vsix, msi, zip } = blk: {
         switch (getLockFileUrlKind(url_decoded) orelse errExit(
             "unable to determine install kind from payload url '{s}'",
@@ -1597,10 +1577,10 @@ fn installPayload(
             };
             const cab_cache_entry = CacheEntry.alloc(scratch, scratch, cache_dir, payload.sha256, basenameFromUrl(payload.url_decoded));
             defer cab_cache_entry.free(scratch);
-            try fetchPayload(scratch, progress_node, cache_dir, payload.sha256, payload.url_decoded, cab_cache_entry.path);
+            try fetchPayloadLocking(scratch, progress_node, cache_dir, payload.sha256, payload.url_decoded, cab_cache_entry.path);
         }
     }
-    try fetchPayload(scratch, progress_node, cache_dir, sha256, url_decoded, cache_entry.path);
+    try fetchPayloadLocking(scratch, progress_node, cache_dir, sha256, url_decoded, cache_entry.path);
 
     const install_lock_path = std.fs.path.join(scratch, &.{ install_dir_path, ".lock" }) catch |e| oom(e);
     defer scratch.free(install_lock_path);
@@ -2185,7 +2165,7 @@ const InstallPayload = struct {
 };
 const CabOffset = struct { cab_offset: usize };
 
-fn updateLockFile(
+fn updateLockFileLocking(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     recipes: *const Recipes,
@@ -2195,6 +2175,8 @@ fn updateLockFile(
     pkgs: Packages,
     cache_dir: []const u8,
 ) !void {
+    globalfilelocks.enteredLockingFunction(@src().fn_name);
+
     const payloads: []const InstallPayload = blk_payloads: {
         var payloads: std.ArrayListUnmanaged(InstallPayload) = .{};
 
@@ -2271,7 +2253,7 @@ fn updateLockFile(
                     basenameFromUrl(payload.url_decoded),
                 );
                 defer cache_entry.free(scratch);
-                try fetchPayload(
+                try fetchPayloadLocking(
                     scratch,
                     progress_node,
                     cache_dir,
@@ -2537,7 +2519,7 @@ fn readVsManifestLocking(
     channel_kind: ChannelKind,
     update: ManifestUpdate,
 ) !PathAndContent {
-    global.enteredLockingFunction(@src().fn_name);
+    globalfilelocks.enteredLockingFunction(@src().fn_name);
 
     const subdir = switch (channel_kind) {
         .release => "vs-release",
@@ -2548,68 +2530,49 @@ fn readVsManifestLocking(
     };
     defer vsman_latest_owning.deinit(allocator);
 
-    const vsman_lock_path = msvcup_dir.path(scratch, .{ "manifest", subdir, ".lock" }) catch |e| oom(e);
-    defer scratch.free(vsman_lock_path);
-
-    {
-        var vsman_lock = try LockFile.lock(vsman_lock_path);
-        defer vsman_lock.unlock();
-        global.tookFileLock(@src().fn_name);
-        defer global.releasedFileLock(@src().fn_name);
-        switch (update) {
-            .off => {
-                if (try readFile(allocator, vsman_latest_owning.borrow())) |content| return .{
-                    .path = vsman_latest_owning.take(),
-                    .content = content,
-                };
-            },
-            .daily => @panic("todo: daily update"),
-            .always => {},
-        }
+    switch (update) {
+        .off => {
+            if (try readFile(allocator, vsman_latest_owning.borrow())) |content| return .{
+                .path = vsman_latest_owning.take(),
+                .content = content,
+            };
+        },
+        .daily => @panic("todo: daily update"),
+        .always => @panic("todo: replace the existing manifest"),
     }
 
-    // we release the vsman_lock lock before doing another locking operation to avoid deadlock
     var chman = try readChManifestLocking(scratch, progress_node, scratch, msvcup_dir, channel_kind, update);
     defer chman.freeConst(scratch);
 
-    {
-        var vsman_lock = try LockFile.lock(vsman_lock_path);
-        defer vsman_lock.unlock();
-        global.tookFileLock(@src().fn_name);
-        defer global.releasedFileLock(@src().fn_name);
-        // we have to check if the file exists again because we released our lock
-        // to resolve the URL and avoid deadlock
-        switch (update) {
-            .off => {
-                if (try readFile(allocator, vsman_latest_owning.borrow())) |content| return .{
-                    .path = vsman_latest_owning.take(),
-                    .content = content,
-                };
-            },
-            .daily => @panic("todo: daily update"),
-            .always => @panic("todo: check if the file has been updated (this is the second check)"),
-        }
+    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", subdir, "latest.fetching" }) catch |e| oom(e);
+    defer scratch.free(fetch_path);
+    switch (try AtomicFile.lock(fetch_path, vsman_latest_owning.borrow())) {
+        .exists => {},
+        .locked => |locked| {
+            var atomic_file = locked;
+            defer atomic_file.deinit();
+            const payload = try vsManifestPayloadFromChManifest(scratch, scratch, channel_kind, chman);
+            defer payload.free(scratch);
+            const uri = uriFromUrlDecoded(payload.url_decoded) catch |e| errExit(
+                "failed to parse vs manifest url '{s}' taken from file '{s}' with {s}",
+                .{ payload.url_decoded, chman.path, @errorName(e) },
+            );
 
-        const payload = try vsManifestPayloadFromChManifest(scratch, scratch, channel_kind, chman);
-        defer payload.free(scratch);
-        const uri = uriFromUrlDecoded(payload.url_decoded) catch |e| errExit(
-            "failed to parse vs manifest url '{s}' taken from file '{s}' with {s}",
-            .{ payload.url_decoded, chman.path, @errorName(e) },
-        );
+            // log.info("payload size {} url '{s}' sha256 '{s}'", .{ payload.size, payload.url, payload.sha256 });
+            // if (true) @panic("hash the URI and don't redownload it");
 
-        // log.info("payload size {} url '{s}' sha256 '{s}'", .{ payload.size, payload.url, payload.sha256 });
-        // if (true) @panic("hash the URI and don't redownload it");
-
-        // NOTE: for some reason the size/sha256 is not right for this?!?
-        // try fetch(scratch, uri, vsman_latest_owning.borrow(), payload.size, payload.sha256);
-        const sha256 = try fetch(progress_node, scratch, uri, vsman_latest_owning.borrow(), .{});
-        _ = sha256;
-        const content = try readFile(allocator, vsman_latest_owning.borrow()) orelse errExit(
-            "{s} still doesn't exist",
-            .{vsman_latest_owning.borrow()},
-        );
-        return .{ .path = vsman_latest_owning.take(), .content = content };
+            // NOTE: for some reason the size/sha256 is not right for this?!?
+            // const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{ .size = payload.size });
+            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{});
+            _ = sha256;
+            try atomic_file.finish(vsman_latest_owning.borrow());
+        },
     }
+    const content = try readFile(allocator, vsman_latest_owning.borrow()) orelse errExit(
+        "{s} still doesn't exist",
+        .{vsman_latest_owning.borrow()},
+    );
+    return .{ .path = vsman_latest_owning.take(), .content = content };
 }
 
 fn sha256FromUri(uri: std.Uri) Sha {
@@ -2782,7 +2745,7 @@ fn readChManifestLocking(
     channel_kind: ChannelKind,
     update: ManifestUpdate,
 ) !PathAndContent {
-    global.enteredLockingFunction(@src().fn_name);
+    globalfilelocks.enteredLockingFunction(@src().fn_name);
 
     const subdir = switch (channel_kind) {
         .release => "channel-release",
@@ -2792,24 +2755,16 @@ fn readChManifestLocking(
         .owning_path = msvcup_dir.path(allocator, .{ "manifest", subdir, "latest" }) catch |e| oom(e),
     };
     defer chman_latest_owning.deinit(allocator);
-    const chman_lock_path = msvcup_dir.path(scratch, .{ "manifest", subdir, ".lock" }) catch |e| oom(e);
-    defer scratch.free(chman_lock_path);
 
-    {
-        var chman_lock = try LockFile.lock(chman_lock_path);
-        defer chman_lock.unlock();
-        global.tookFileLock(@src().fn_name);
-        defer global.releasedFileLock(@src().fn_name);
-        switch (update) {
-            .off => {
-                if (try readFile(allocator, chman_latest_owning.borrow())) |content| return .{
-                    .path = chman_latest_owning.take(),
-                    .content = content,
-                };
-            },
-            .daily => @panic("todo: daily update"),
-            .always => {},
-        }
+    switch (update) {
+        .off => {
+            if (try readFile(allocator, chman_latest_owning.borrow())) |content| return .{
+                .path = chman_latest_owning.take(),
+                .content = content,
+            };
+        },
+        .daily => @panic("todo: daily update"),
+        .always => @panic("todo: replace the existing manifest"),
     }
 
     const chman_url_encoded = try resolveChManifestUrlLocking(scratch, scratch, msvcup_dir, channel_kind, update);
@@ -2819,40 +2774,31 @@ fn readChManifestLocking(
         .{ chman_url_encoded.content, chman_url_encoded.path, @errorName(e) },
     );
 
-    {
-        var chman_lock = try LockFile.lock(chman_lock_path);
-        defer chman_lock.unlock();
-        global.tookFileLock(@src().fn_name);
-        defer global.releasedFileLock(@src().fn_name);
+    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", subdir, "latest.fetching" }) catch |e| oom(e);
+    defer scratch.free(fetch_path);
+    switch (try AtomicFile.lock(fetch_path, chman_latest_owning.borrow())) {
+        .exists => {},
+        .locked => |locked| {
+            var atomic_file = locked;
+            defer atomic_file.deinit();
 
-        // we have to check if the file exists again because we released our lock
-        // to resolve the URL and avoid deadlock
-        switch (update) {
-            .off => {
-                if (try readFile(allocator, chman_latest_owning.borrow())) |content| return .{
-                    .path = chman_latest_owning.take(),
-                    .content = content,
-                };
-            },
-            .daily => @panic("todo: daily update"),
-            .always => @panic("todo: check if the file has been updated (this is the second check)"),
-        }
+            // const uri_sha = sha256FromUri(uri);
+            // // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            // // TODO: don't perform the fetch if we already have!!!
+            // //       hash the URI and see if we've already fetched it?
+            // //       ALSO, I'd like to see if
+            // if (true) std.debug.panic("check uri sha '{s}'", .{uri_sha});
 
-        // const uri_sha = sha256FromUri(uri);
-        // // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        // // TODO: don't perform the fetch if we already have!!!
-        // //       hash the URI and see if we've already fetched it?
-        // //       ALSO, I'd like to see if
-        // if (true) std.debug.panic("check uri sha '{s}'", .{uri_sha});
-
-        const sha256 = try fetch(progress_node, scratch, uri, chman_latest_owning.borrow(), .{});
-        _ = sha256;
-        const content = try readFile(allocator, chman_latest_owning.borrow()) orelse errExit(
-            "{s} still doesn't exist",
-            .{chman_latest_owning.borrow()},
-        );
-        return .{ .path = chman_latest_owning.take(), .content = content };
+            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{});
+            _ = sha256;
+            try atomic_file.finish(chman_latest_owning.borrow());
+        },
     }
+    const content = try readFile(allocator, chman_latest_owning.borrow()) orelse errExit(
+        "{s} still doesn't exist",
+        .{chman_latest_owning.borrow()},
+    );
+    return .{ .path = chman_latest_owning.take(), .content = content };
 }
 
 fn resolveChManifestUrlLocking(
@@ -2862,7 +2808,7 @@ fn resolveChManifestUrlLocking(
     channel_kind: ChannelKind,
     update: ManifestUpdate,
 ) !PathAndContent {
-    global.enteredLockingFunction(@src().fn_name);
+    globalfilelocks.enteredLockingFunction(@src().fn_name);
 
     const subdir = switch (channel_kind) {
         .release => "channel-release-url",
@@ -2872,43 +2818,47 @@ fn resolveChManifestUrlLocking(
         .owning_path = msvcup_dir.path(allocator, .{ "manifest", subdir, "latest" }) catch |e| oom(e),
     };
     defer chman_latest_url_path_owning.deinit(allocator);
-    const chman_lock_path = msvcup_dir.path(scratch, .{ "manifest", subdir, ".lock" }) catch |e| oom(e);
-    defer scratch.free(chman_lock_path);
-    {
-        var chman_url_lock = try LockFile.lock(chman_lock_path);
-        defer chman_url_lock.unlock();
-        global.tookFileLock(@src().fn_name);
-        defer global.releasedFileLock(@src().fn_name);
-        switch (update) {
-            .off => {
-                if (try readFile(allocator, chman_latest_url_path_owning.borrow())) |content| return .{
-                    .path = chman_latest_url_path_owning.take(),
-                    .content = content,
-                };
-            },
-            .daily => @panic("todo: daily update"),
-            .always => {},
-        }
-        try resolveChannelManifestUrlToFile(
-            scratch,
-            std.Uri.parse(channel_kind.httpsUrl()) catch unreachable,
-            chman_latest_url_path_owning.borrow(),
-        );
-        const content = try readFile(allocator, chman_latest_url_path_owning.borrow()) orelse errExit(
-            "{s} still doesn't exist",
-            .{chman_latest_url_path_owning.borrow()},
-        );
-        return .{
-            .path = chman_latest_url_path_owning.take(),
-            .content = content,
-        };
+
+    switch (update) {
+        .off => {
+            if (try readFile(allocator, chman_latest_url_path_owning.borrow())) |content| return .{
+                .path = chman_latest_url_path_owning.take(),
+                .content = content,
+            };
+        },
+        .daily => @panic("todo: daily update"),
+        .always => @panic("todo: replace the existing url file"),
     }
+
+    const fetch_path = msvcup_dir.path(scratch, .{ "manifest", subdir, "latest.fetching" }) catch |e| oom(e);
+    defer scratch.free(fetch_path);
+    switch (try AtomicFile.lock(fetch_path, chman_latest_url_path_owning.borrow())) {
+        .exists => {},
+        .locked => |locked| {
+            var atomic_file = locked;
+            defer atomic_file.deinit();
+            try resolveChannelManifestUrlToFile(
+                scratch,
+                std.Uri.parse(channel_kind.httpsUrl()) catch unreachable,
+                atomic_file.file,
+            );
+            try atomic_file.finish(chman_latest_url_path_owning.borrow());
+        },
+    }
+    const content = try readFile(allocator, chman_latest_url_path_owning.borrow()) orelse errExit(
+        "{s} still doesn't exist",
+        .{chman_latest_url_path_owning.borrow()},
+    );
+    return .{
+        .path = chman_latest_url_path_owning.take(),
+        .content = content,
+    };
 }
 
 fn resolveChannelManifestUrlToFile(
     scratch: std.mem.Allocator,
     uri: std.Uri,
-    out_path: []const u8,
+    out_file: std.fs.File,
 ) !void {
     // TODO: progres report
     log.info("resolving URL '{}'...", .{uri});
@@ -2940,13 +2890,6 @@ fn resolveChannelManifestUrlToFile(
                     "failed to parse the redirect url '{s}' with {s}",
                     .{ redirect_url, @errorName(e) },
                 );
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // TODO: don't download directly to this file, download to a temp file and rename
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                const out_file = try std.fs.cwd().createFile(out_path, .{});
-                defer out_file.close();
                 try out_file.writer().writeAll(redirect_url);
                 return;
             }
@@ -2989,7 +2932,7 @@ fn uriFromUrlDecoded(url_decoded: []const u8) !std.Uri {
     };
 }
 
-fn fetchPayload(
+fn fetchPayloadLocking(
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     cache_dir: []const u8,
@@ -2997,36 +2940,48 @@ fn fetchPayload(
     url_decoded: []const u8,
     cache_path: []const u8,
 ) !void {
-    const cache_lock_path = std.mem.concat(scratch, u8, &.{ cache_path, ".lock" }) catch |e| oom(e);
-    defer scratch.free(cache_lock_path);
-    var cache_lock = try LockFile.lock(cache_lock_path);
-    defer cache_lock.unlock();
+    globalfilelocks.enteredLockingFunction(@src().fn_name);
+
+    // AtomicFile.lock checks this too, but it has to create and lock a file to get there. This
+    // is what lets a process that wants a cached payload skip waiting on a download.
     if (std.fs.cwd().access(cache_path, .{})) {
         log.info("ALREADY FETCHED  | {s} {f}", .{ url_decoded, sha256 });
+        return;
     } else |err| switch (err) {
-        error.FileNotFound => {
-            log.info("FETCHING         | {s} {f}", .{ url_decoded, sha256 });
-            const fetch_path = std.mem.concat(scratch, u8, &.{ cache_path, ".fetching" }) catch |e| oom(e);
-            defer scratch.free(fetch_path);
-            const actual_sha256 = try fetch(
-                progress_node,
-                scratch,
-                try uriFromUrlDecoded(url_decoded),
-                fetch_path,
-                .{},
-            );
-            if (!sha256.eql(&actual_sha256)) {
-                std.log.err(
-                    "SHA256 mismatch:\nexpected: {f}\nactual  : {f}\n",
-                    .{ sha256, actual_sha256 },
-                );
-                try finishCacheFetch(scratch, cache_dir, url_decoded, actual_sha256, fetch_path);
-                std.process.exit(0xff);
-            }
-            try std.fs.cwd().rename(fetch_path, cache_path);
-        },
+        error.FileNotFound => {},
         else => |e| return e,
     }
+
+    const fetch_path = std.mem.concat(scratch, u8, &.{ cache_path, ".fetching" }) catch |e| oom(e);
+    defer scratch.free(fetch_path);
+    var atomic_file = switch (try AtomicFile.lock(fetch_path, cache_path)) {
+        .exists => {
+            log.info("ALREADY FETCHED  | {s} {f}", .{ url_decoded, sha256 });
+            return;
+        },
+        .locked => |locked| locked,
+    };
+    defer atomic_file.deinit();
+
+    log.info("FETCHING         | {s} {f}", .{ url_decoded, sha256 });
+    const actual_sha256 = try fetch(
+        progress_node,
+        scratch,
+        try uriFromUrlDecoded(url_decoded),
+        atomic_file.file,
+        .{},
+    );
+    if (!sha256.eql(&actual_sha256)) {
+        std.log.err(
+            "SHA256 mismatch:\nexpected: {f}\nactual  : {f}\n",
+            .{ sha256, actual_sha256 },
+        );
+        try finishCacheFetch(scratch, cache_dir, url_decoded, actual_sha256, &atomic_file);
+        // exit doesn't run the defer above
+        atomic_file.deinit();
+        std.process.exit(0xff);
+    }
+    try atomic_file.finish(cache_path);
 }
 
 const FetchOptions = struct {
@@ -3041,7 +2996,7 @@ fn fetch(
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
     uri: std.Uri,
-    out_path: []const u8,
+    out_file: std.fs.File,
     opt: FetchOptions,
 ) !Sha {
     log.info("fetch: {}", .{uri});
@@ -3052,7 +3007,7 @@ fn fetch(
 
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
-        switch (try fetchAttempt(scratch, uri, out_path, opt)) {
+        switch (try fetchAttempt(scratch, uri, out_file, opt)) {
             .sha => |sha| return sha,
             .wrong_size => |size| {
                 if (attempt == max_fetch_attempts) errExit(
@@ -3076,7 +3031,7 @@ const FetchAttemptResult = union(enum) {
 fn fetchAttempt(
     scratch: std.mem.Allocator,
     uri: std.Uri,
-    out_path: []const u8,
+    out_file: std.fs.File,
     opt: FetchOptions,
 ) !FetchAttemptResult {
     var client = std.http.Client{ .allocator = scratch };
@@ -3104,8 +3059,9 @@ fn fetchAttempt(
         .{ uri, @intFromEnum(request.response.status), request.response.status.phrase() },
     );
 
-    const file = try std.fs.cwd().createFile(out_path, .{});
-    defer file.close();
+    // a previous attempt could have written some of it
+    try out_file.seekTo(0);
+    try out_file.setEndPos(0);
     const maybe_expected_size = blk: {
         if (request.response.content_length) |content_length| {
             if (opt.size) |size| {
@@ -3118,7 +3074,7 @@ fn fetchAttempt(
         }
         break :blk opt.size;
     };
-    if (maybe_expected_size) |size| try file.setEndPos(size);
+    if (maybe_expected_size) |size| try out_file.setEndPos(size);
 
     var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
     var total_received: u64 = 0;
@@ -3140,7 +3096,7 @@ fn fetchAttempt(
         hasher.update(buf[0..len]);
         // NOTE: not going through a buffered writer since we're writing
         //       large chunks
-        file.writer().writeAll(buf[0..len]) catch |err| std.debug.panic(
+        out_file.writer().writeAll(buf[0..len]) catch |err| std.debug.panic(
             "fetch '{}': write {} bytes of HTTP response failed with {s}",
             .{ uri, len, @errorName(err) },
         );
@@ -3580,7 +3536,9 @@ const Arch = @import("arch.zig").Arch;
 const Arches = @import("arch.zig").Arches;
 const MsvcupPackageKind = @import("msvcuppackagekind.zig").MsvcupPackageKind;
 const extra = @import("extra.zig");
+const AtomicFile = @import("AtomicFile.zig");
 const LockFile = @import("LockFile.zig");
+const globalfilelocks = @import("globalfilelocks.zig");
 const Recipes = @import("Recipes.zig");
 const JsonContext = @import("JsonContext.zig");
 const StringPool = @import("StringPool.zig");

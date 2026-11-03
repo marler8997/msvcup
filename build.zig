@@ -81,6 +81,63 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "");
     addTests(b, msvcup, test_step);
     {
+        const step = b.step("test-atomicfile", "Stress AtomicFile with multiple processes");
+        test_step.dependOn(step);
+        // Native builds on windows get POSIX delete and rename, a build for the default minimum
+        // windows version like our releases doesn't, and files behave differently without them.
+        const targets: []const std.Build.ResolvedTarget = if (builtin.os.tag == .windows)
+            &.{ b.graph.host, b.resolveTargetQuery(.{ .cpu_arch = builtin.cpu.arch, .os_tag = .windows }) }
+        else
+            &.{b.graph.host};
+        for (targets) |stress_target| {
+            const exe = b.addExecutable(.{
+                .name = "test-atomicfile",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/test-atomicfile.zig"),
+                    .target = stress_target,
+                    .optimize = .Debug,
+                }),
+            });
+            const run = b.addRunArtifact(exe);
+            _ = run.addOutputDirectoryArg("atomicfile");
+            run.has_side_effects = true;
+            step.dependOn(&run.step);
+        }
+    }
+    {
+        const exe = b.addExecutable(.{
+            .name = "test-fetch",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/test-fetch.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        run.addArtifactArg(msvcup);
+        _ = run.addOutputDirectoryArg("fetch");
+        run.has_side_effects = true;
+        const step = b.step("test-fetch", "Download payloads from a local server");
+        step.dependOn(&run.step);
+        test_step.dependOn(step);
+    }
+    {
+        const exe = b.addExecutable(.{
+            .name = "test-lockfile",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/test-lockfile.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        _ = run.addOutputDirectoryArg("lockfile");
+        run.has_side_effects = true;
+        const step = b.step("test-lockfile", "Check that only one process can hold a LockFile");
+        step.dependOn(&run.step);
+        test_step.dependOn(step);
+    }
+    {
         const unit_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/Recipes.zig"),
