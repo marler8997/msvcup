@@ -2893,7 +2893,11 @@ fn checkFetchedManifest(
     what: []const u8,
     required_field: []const u8,
 ) !void {
-    const content = scratch.alloc(u8, try atomic_file.file.getEndPos()) catch |e| oom(e);
+    const size = try atomic_file.file.getEndPos();
+    const content = scratch.alloc(u8, std.math.cast(usize, size) orelse errExit(
+        "'{}' gave us {} bytes, too big to be a {s}",
+        .{ uri, size, what },
+    )) catch |e| oom(e);
     defer scratch.free(content);
     const len = try atomic_file.file.preadAll(content, 0);
     std.debug.assert(len == content.len);
