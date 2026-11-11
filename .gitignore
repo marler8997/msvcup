@@ -2,3 +2,4 @@
 zig-out/
 *.exe
 *.pdb
+zig-pkg/

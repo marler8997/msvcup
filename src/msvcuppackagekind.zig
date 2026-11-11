@@ -6,7 +6,7 @@ pub const MsvcupPackageKind = enum {
     ninja,
     cmake,
     pub fn order(_: void, lhs: MsvcupPackageKind, rhs: MsvcupPackageKind) std.math.Order {
-        return std.math.order(@intFromEnum(lhs), @intFromEnum(rhs));
+        return std.math.order(@backingInt(lhs), @backingInt(rhs));
     }
 };
 

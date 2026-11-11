@@ -4,8 +4,8 @@ parent: ?*const JsonContext,
 format_fn: *const fn (*const JsonContext, FormatFnWriter, FormatDepth) FormatFnError!void,
 get_file_path_fn: *const fn (*const JsonContext) ?[]const u8,
 
-const FormatFnWriter = if (zig_atleast_15) *std.Io.Writer else std.io.AnyWriter;
-const FormatFnError = if (zig_atleast_15) error{WriteFailed} else anyerror;
+const FormatFnWriter = *std.Io.Writer;
+const FormatFnError = error{WriteFailed};
 
 pub fn getFilePath(self: *const JsonContext) ?[]const u8 {
     if (self.get_file_path_fn(self)) |p| return p;
@@ -16,19 +16,7 @@ fn formatParent(self: *const JsonContext, writer: FormatFnWriter) FormatFnError!
     try self.format_fn(self, writer, .parent);
 }
 
-pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-pub fn formatNew(self: *const JsonContext, writer: *std15.Io.Writer) !void {
-    if (self.parent) |p| try p.formatParent(writer);
-    try self.format_fn(self, writer, .self);
-}
-pub fn formatLegacy(
-    self: *const JsonContext,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: std.io.AnyWriter,
-) !void {
-    _ = fmt;
-    _ = options;
+pub fn format(self: *const JsonContext, writer: *std.Io.Writer) error{WriteFailed}!void {
     if (self.parent) |p| try p.formatParent(writer);
     try self.format_fn(self, writer, .self);
 }
@@ -148,18 +136,7 @@ pub const Error = struct {
         self.* = .{ .context = context, .payload = payload };
         return error.Json;
     }
-    pub const format = if (zig_atleast_15) Error.formatNew else Error.formatLegacy;
-    pub fn formatNew(self: Error, writer: *std15.Io.Writer) error{WriteFailed}!void {
-        try self.formatLegacy("", .{}, writer);
-    }
-    pub fn formatLegacy(
-        self: Error,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: Error, writer: *std.Io.Writer) error{WriteFailed}!void {
         if (self.context.getFilePath()) |file_path| {
             try writer.print("{s}: ", .{file_path});
         }
@@ -258,19 +235,8 @@ pub const Field = struct {
         return json_type.contextFromValue(out_err, &self.context, self.value);
     }
 
-    pub const format = if (zig_atleast_15) Field.formatNew else Field.formatLegacy;
-    pub fn formatNew(self: *const Field, writer: *std15.Io.Writer) error{WriteFailed}!void {
+    pub fn format(self: *const Field, writer: *std.Io.Writer) error{WriteFailed}!void {
         try writer.print("{f}", .{&self.context});
-    }
-    pub fn formatLegacy(
-        self: *const Field,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{}", .{&self.context});
     }
 
     fn getFilePath2(context: *const JsonContext) ?[]const u8 {
@@ -337,7 +303,4 @@ pub const Element = struct {
     }
 };
 
-const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-
 const std = @import("std");
-const std15 = if (zig_atleast_15) std else @import("std15");

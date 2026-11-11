@@ -4,19 +4,21 @@ const Payload = struct {
     ex: extra.Payload,
 };
 
-pub fn main() !void {
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+pub fn main(init: std.process.Init.Minimal) !void {
+    var arena_instance: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
-    const args_array = try std.process.argsAlloc(arena);
-    // no need to free, os will do it
-    const all_args = if (args_array.len == 0) args_array else args_array[1..];
-    if (all_args.len != 2) errExit("expected 2 cmdline args but got {}", .{all_args.len});
-    const in_path = all_args[0];
-    const out_path = all_args[1];
+    var threaded: std.Io.Threaded = .init(arena, .{ .environ = init.environ, .argv0 = .init(init.args) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var args = try init.args.iterateAllocator(arena);
+    _ = args.skip();
+    const in_path = args.next() orelse errExit("expected 2 cmdline args but got 0", .{});
+    const out_path = args.next() orelse errExit("expected 2 cmdline args but got 1", .{});
+    if (args.next() != null) errExit("expected 2 cmdline args but got more", .{});
 
-    var payloads: std.ArrayListUnmanaged(Payload) = .{};
+    var payloads: std.ArrayList(Payload) = .empty;
 
-    const in = try std.fs.cwd().readFileAlloc(arena, in_path, std.math.maxInt(usize));
+    const in = try std.Io.Dir.cwd().readFileAlloc(io, in_path, arena, .unlimited);
     var line_it = std.mem.tokenizeScalar(u8, in, '\n');
     var lineno: u32 = 0;
     while (line_it.next()) |url| {
@@ -41,15 +43,15 @@ pub fn main() !void {
         try payloads.append(arena, .{ .url = url, .sha = sha, .ex = ex });
     }
 
-    var out_file = try std.fs.cwd().createFile(out_path, .{});
-    defer out_file.close();
+    var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    defer out_file.close(io);
     var out_file_buf: [1000]u8 = undefined;
-    var out_file_writer: File15.Writer = .init(out_file, &out_file_buf);
+    var out_file_writer = out_file.writer(io, &out_file_buf);
     writeCode(payloads.items, &out_file_writer.interface) catch |err| switch (err) {
         error.WriteFailed => return out_file_writer.err.?,
     };
 }
-fn writeCode(payloads: []const Payload, writer: *std15.Io.Writer) error{WriteFailed}!void {
+fn writeCode(payloads: []const Payload, writer: *std.Io.Writer) error{WriteFailed}!void {
     try writer.writeAll(
         \\pub const Payload = struct {
         \\    url: []const u8,
@@ -108,10 +110,5 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(0xff);
 }
 
-pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-
 const std = @import("std");
-const std15 = if (zig_atleast_15) std else @import("std15");
 const extra = @import("extra.zig");
-
-const File15 = if (zig_atleast_15) std.fs.File else std15.fs.File15;

@@ -6,23 +6,35 @@ const global = struct {
     var string_pool: StringPool = undefined;
 };
 
-pub fn main() !u8 {
+pub fn main(init: std.process.Init.Minimal) !u8 {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
     global.string_pool = .init(arena);
+    const environ = init.environ;
+    var threaded: std.Io.Threaded = .init(arena, .{ .environ = environ, .argv0 = .init(init.args) });
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    const args_array = try std.process.argsAlloc(arena);
-    // no need to free, os will do it
-    //defer std.process.argsFree(arena, argsArray);
-    const all_args = if (args_array.len == 0) args_array else args_array[1..];
+    if (builtin.os.tag == .windows) {
+        // std.log, errExit and panics write through this writer, see withIoMode
+        std.debug.lockStderr(&.{}).file_writer.file = stderrFile();
+        std.debug.unlockStderr();
+    }
+
+    const all_args: [][]const u8 = blk: {
+        const args_array = try init.args.toSlice(arena);
+        const all_args = try arena.alloc([]const u8, args_array.len -| 1);
+        for (all_args, args_array[@min(1, args_array.len)..]) |*dst, src| dst.* = src;
+        break :blk all_args;
+    };
 
     const cmd, const args = cmd_args_blk: {
         const cmd_arg_index: usize = cmd_arg_index_blk: {
             var arg_index: usize = 0;
             while (true) : (arg_index += 1) {
-                if (arg_index == all_args.len) try usage(arena);
+                if (arg_index == all_args.len) try usage(io, environ, arena);
                 const arg = all_args[arg_index];
-                if (isHelpArg(arg)) return help(arena, for (all_args[arg_index + 1 ..]) |a| {
+                if (isHelpArg(arg)) return help(io, environ, arena, for (all_args[arg_index + 1 ..]) |a| {
                     if (!std.mem.startsWith(u8, a, "-")) break a;
                 } else null);
                 if (!std.mem.startsWith(u8, arg, "-")) break :cmd_arg_index_blk arg_index;
@@ -31,25 +43,25 @@ pub fn main() !u8 {
         };
         const cmd = all_args[cmd_arg_index];
         for (cmd_arg_index + 1..all_args.len) |i| {
-            if (isHelpArg(all_args[i])) return help(arena, cmd);
+            if (isHelpArg(all_args[i])) return help(io, environ, arena, cmd);
             all_args[i - 1] = all_args[i];
         }
         break :cmd_args_blk .{ cmd, all_args[0 .. all_args.len - 1] };
     };
-    if (std.mem.eql(u8, cmd, "install")) return install(arena, args);
-    if (std.mem.eql(u8, cmd, "list")) return listCommand(arena, args);
-    if (std.mem.eql(u8, cmd, "list-channels")) return listChannels(args);
-    if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(arena, args);
-    if (std.mem.eql(u8, cmd, "msi")) return msiCommand(arena, args);
-    if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(arena, args);
+    if (std.mem.eql(u8, cmd, "install")) return install(io, environ, arena, args);
+    if (std.mem.eql(u8, cmd, "list")) return listCommand(io, environ, arena, args);
+    if (std.mem.eql(u8, cmd, "list-channels")) return listChannels(io, args);
+    if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(io, environ, arena, args);
+    if (std.mem.eql(u8, cmd, "msi")) return msiCommand(io, arena, args);
+    if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(io, environ, arena, args);
     log.err("unknown command '{s}'", .{cmd});
     return 0xff;
 }
 
-fn usage(arena: std.mem.Allocator) !noreturn {
-    const msvcup_dir: MsvcupDir = try .alloc(arena);
+fn usage(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator) !noreturn {
+    const msvcup_dir: MsvcupDir = try .alloc(environ, arena);
     var stderr_buf: [1000]u8 = undefined;
-    var stderr: File15.Writer = .initStreaming(stderrFile(), &stderr_buf);
+    var stderr = stderrFile().writerStreaming(io, &stderr_buf);
     writeUsage(&stderr.interface, msvcup_dir) catch return stderr.err.?;
     std.process.exit(0xff);
 }
@@ -61,24 +73,24 @@ fn isHelpArg(arg: []const u8) bool {
 /// Called when a help option appears anywhere in the args. Prints the detailed
 /// help for the command if there is one and it has detailed help, otherwise
 /// the main usage.
-fn help(arena: std.mem.Allocator, cmd: ?[]const u8) !u8 {
+fn help(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, cmd: ?[]const u8) !u8 {
     const detailed: ?[]const u8 = if (cmd) |c|
         (if (std.mem.eql(u8, c, "list-payloads")) list_payloads_help else null)
     else
         null;
     var stdout_buf: [1000]u8 = undefined;
-    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
+    var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     if (detailed) |text| {
         stdout.interface.writeAll(text) catch return stdout.err.?;
         stdout.interface.flush() catch return stdout.err.?;
     } else {
-        const msvcup_dir: MsvcupDir = try .alloc(arena);
+        const msvcup_dir: MsvcupDir = try .alloc(environ, arena);
         writeUsage(&stdout.interface, msvcup_dir) catch return stdout.err.?;
     }
     return 0;
 }
 
-fn writeUsage(w: *std15.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!void {
+fn writeUsage(w: *std.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!void {
     try w.print(
         \\msvcup version {[version]s}
         \\
@@ -127,10 +139,35 @@ fn writeUsage(w: *std15.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!voi
 
 const MsvcupDir = struct {
     root_path: []const u8,
-    pub fn alloc(allocator: std.mem.Allocator) !MsvcupDir {
-        return .{
-            .root_path = try std.fs.getAppDataDir(allocator, "msvcup"),
-        };
+    /// The same directories std.fs.getAppDataDir gave before zig removed it.
+    pub fn alloc(environ: std.process.Environ, allocator: std.mem.Allocator) !MsvcupDir {
+        const join = std.fs.path.join;
+        switch (builtin.os.tag) {
+            .windows => {
+                const local_app_data = getEnv(environ, allocator, "LOCALAPPDATA") orelse errExit(
+                    "can't find msvcup's data directory, LOCALAPPDATA is not set",
+                    .{},
+                );
+                return .{ .root_path = try join(allocator, &.{ local_app_data, "msvcup" }) };
+            },
+            .macos => {
+                const home = getEnv(environ, allocator, "HOME") orelse errExit(
+                    "can't find msvcup's data directory, HOME is not set",
+                    .{},
+                );
+                return .{ .root_path = try join(allocator, &.{ home, "Library", "Application Support", "msvcup" }) };
+            },
+            else => {
+                if (getEnv(environ, allocator, "XDG_DATA_HOME")) |xdg| return .{
+                    .root_path = try join(allocator, &.{ xdg, "msvcup" }),
+                };
+                const home = getEnv(environ, allocator, "HOME") orelse errExit(
+                    "can't find msvcup's data directory, neither XDG_DATA_HOME nor HOME is set",
+                    .{},
+                );
+                return .{ .root_path = try join(allocator, &.{ home, ".local", "share", "msvcup" }) };
+            },
+        }
     }
     pub fn path(self: MsvcupDir, allocator: std.mem.Allocator, sub_path_tuple: anytype) error{OutOfMemory}![]const u8 {
         var args: [sub_path_tuple.len + 1][]const u8 = undefined;
@@ -161,7 +198,7 @@ fn arenaIsEmpty(arena: std.heap.ArenaAllocator) bool {
     return arena.state.end_index == 0;
 }
 
-fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn listCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
     // TODO: accept the "--manifest-update-*" arguments
     var channel = Channel.default;
     {
@@ -178,15 +215,15 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
     const recipes = parseBuiltinRecipes(arena);
 
-    const root_node = std.Progress.start(.{ .root_name = "msvcup list-versions" });
+    const root_node = std.Progress.start(io, .{ .root_name = "msvcup list-versions" });
     defer root_node.end();
 
     var scratch_instance: ScratchAllocator = .init();
     const scratch = scratch_instance.allocator();
 
-    const msvcup_dir: MsvcupDir = try .alloc(arena);
+    const msvcup_dir: MsvcupDir = try .alloc(environ, arena);
 
-    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, channel, .off);
+    const vsman = try readVsManifestLocking(io, environ, arena, root_node, scratch, msvcup_dir, channel, .off);
     defer vsman.freeConst(arena);
     scratch_instance.reset();
 
@@ -194,7 +231,7 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     // defer arena.free(pkgs);
     scratch_instance.reset();
 
-    var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
+    var msvcup_pkgs: std.ArrayList(MsvcupPackage) = .empty;
     for (pkgs.slice, 0..) |*pkg, pkg_index| {
         for (pkgs.payloadsFromPkgIndex(.fromInt(pkg_index))) |*payload| {
             const owner = recipeOwner(&recipes, pkg, payload) orelse continue;
@@ -204,7 +241,7 @@ fn listCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     }
 
     var stdout_buf: [2000]u8 = undefined;
-    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
+    var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
     w.writeAll("autoenv\n") catch return stdout.err.?;
     for (msvcup_pkgs.items) |msvcup_pkg| {
@@ -230,10 +267,10 @@ fn parseChannel(arg: []const u8) Channel {
     return channel;
 }
 
-fn listChannels(args: []const []const u8) !u8 {
+fn listChannels(io: std.Io, args: []const []const u8) !u8 {
     if (args.len != 0) errExit("list-channels: unknown argument '{s}'", .{args[0]});
     var stdout_buf: [1000]u8 = undefined;
-    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
+    var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
     for (Channel.known) |channel| {
         w.print("{s: <16}{s}\n", .{ channel.asArg(), channel.httpsUrl() }) catch return stdout.err.?;
@@ -282,7 +319,7 @@ const list_payloads_help =
     \\
 ;
 
-fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn listPayloads(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
     var channel = Channel.default;
     {
         var arg_index: usize = 0;
@@ -298,15 +335,15 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
     const recipes = parseBuiltinRecipes(arena);
 
-    const root_node = std.Progress.start(.{ .root_name = "msvcup list-payloads" });
+    const root_node = std.Progress.start(io, .{ .root_name = "msvcup list-payloads" });
     defer root_node.end();
 
     var scratch_instance: ScratchAllocator = .init();
     const scratch = scratch_instance.allocator();
 
-    const msvcup_dir: MsvcupDir = try .alloc(arena);
+    const msvcup_dir: MsvcupDir = try .alloc(environ, arena);
 
-    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, channel, .off);
+    const vsman = try readVsManifestLocking(io, environ, arena, root_node, scratch, msvcup_dir, channel, .off);
     defer vsman.freeConst(arena);
     scratch_instance.reset();
 
@@ -321,7 +358,7 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     std.sort.pdq(PayloadIndex, sorted, &pkgs, PayloadListingOrder.lessThan);
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
+    var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
     for (sorted) |payload_index| {
         const pkg = &pkgs.slice[pkgs.pkgIndexFromPayloadIndex(payload_index).int()];
@@ -340,7 +377,7 @@ fn listPayloads(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 }
 
 fn writePayloadListing(
-    w: *std15.Io.Writer,
+    w: *std.Io.Writer,
     owner: []const u8,
     channel_arg: []const u8,
     pkg: *const Package,
@@ -356,7 +393,7 @@ fn writePayloadListing(
 }
 
 fn writeListingAttr(
-    w: *std15.Io.Writer,
+    w: *std.Io.Writer,
     name: []const u8,
     value: []const u8,
     pkg: *const Package,
@@ -444,8 +481,8 @@ fn recipeOwner(recipes: *const Recipes, pkg: *const Package, payload: *const Pay
     };
 }
 
-fn msiCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
-    const root_node = std.Progress.start(.{ .root_name = "msvcup msi" });
+fn msiCommand(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !u8 {
+    const root_node = std.Progress.start(io, .{ .root_name = "msvcup msi" });
     defer root_node.end();
 
     const msi_path, const install_path = blk: {
@@ -470,15 +507,15 @@ fn msiCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     };
 
     const msi_content = blk: {
-        const file = std.fs.cwd().openFile(msi_path, .{}) catch |err| errExit(
+        const file = std.Io.Dir.cwd().openFile(io, msi_path, .{}) catch |err| errExit(
             "open '{s}' failed with {s}",
             .{ msi_path, @errorName(err) },
         );
-        defer file.close();
-        break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
+        defer file.close(io);
+        break :blk try readToEndAlloc(io, file, arena);
     };
     // defer arena.free(msi_content);
-    try @import("msi").install(arena, .{
+    try @import("msi").install(io, arena, .{
         .cabs_dir = std.fs.path.dirname(msi_path) orelse ".",
         .msi_content = msi_content,
         .install_path = install_path,
@@ -486,8 +523,8 @@ fn msiCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     return 0;
 }
 
-fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
-    const root_node = std.Progress.start(.{ .root_name = "msvcup fetch" });
+fn fetchCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
+    const root_node = std.Progress.start(io, .{ .root_name = "msvcup fetch" });
     defer root_node.end();
 
     const Config = struct {
@@ -528,7 +565,7 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     };
     _ = pkg;
 
-    const msvcup_dir: MsvcupDir = try .alloc(arena);
+    const msvcup_dir: MsvcupDir = try .alloc(environ, arena);
 
     const cache_dir: []const u8 = config.cache_dir orelse msvcup_dir.path(
         arena,
@@ -542,13 +579,13 @@ fn fetchCommand(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         // we don't know the hash so there's no name for this download to have until it's done
         const fetch_path = std.fs.path.join(scratch, &.{ cache_dir, "nohash" }) catch |e| oom(e);
         defer scratch.free(fetch_path);
-        var atomic_file = (try AtomicFile.lock(fetch_path, null)).locked;
-        defer atomic_file.deinit();
+        var atomic_file = (try AtomicFile.lock(io, fetch_path, null)).locked;
+        defer atomic_file.deinit(io);
 
-        const sha256 = try fetch(root_node, scratch, uri, atomic_file.file, .{});
-        try finishCacheFetch(scratch, cache_dir, config.url, sha256, &atomic_file);
+        const sha256 = try fetch(io, environ, root_node, scratch, uri, atomic_file.file, .{});
+        try finishCacheFetch(io, scratch, cache_dir, config.url, sha256, &atomic_file);
         var stdout_buf: [80]u8 = undefined;
-        var stdout: File15.Writer = .initStreaming(stdoutFile(), &stdout_buf);
+        var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
         stdout.interface.print("{f}\n", .{sha256}) catch return stdout.err.?;
         stdout.interface.flush() catch return stdout.err.?;
     }
@@ -581,18 +618,7 @@ const Sha = struct {
         std.debug.assert(64 == (std.fmt.bufPrint(&buf, "{f}", .{sha}) catch unreachable).len);
         return buf;
     }
-    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-    pub fn formatLegacy(
-        value: Sha,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{f}", .{std.fmt.fmtSliceHexLower(&value.bytes)});
-    }
-    pub fn formatNew(value: Sha, writer: *std.Io.Writer) error{WriteFailed}!void {
+    pub fn format(value: Sha, writer: *std.Io.Writer) error{WriteFailed}!void {
         try writer.print("{x}", .{&value.bytes});
     }
 };
@@ -606,6 +632,7 @@ fn lowerShaHex(sha: *const [64]u8) [64]u8 {
 }
 
 fn finishCacheFetch(
+    io: std.Io,
     scratch: std.mem.Allocator,
     cache_dir: []const u8,
     url: []const u8,
@@ -614,7 +641,7 @@ fn finishCacheFetch(
 ) !void {
     const entry = CacheEntry.alloc(scratch, scratch, cache_dir, sha256, basenameFromUrl(url));
     defer entry.free(scratch);
-    const already_exists = if (std.fs.cwd().access(entry.path, .{})) true else |err| switch (err) {
+    const already_exists = if (std.Io.Dir.cwd().access(io, entry.path, .{})) true else |err| switch (err) {
         error.FileNotFound => false,
         else => |e| return e,
     };
@@ -623,7 +650,7 @@ fn finishCacheFetch(
         std.log.info("{s}: already exists", .{entry.path});
     } else {
         std.log.info("{s}: newly fetched", .{entry.path});
-        try atomic_file.finish(entry.path);
+        try atomic_file.finish(io, entry.path);
     }
 }
 
@@ -665,28 +692,17 @@ const MsvcupPackage = struct {
             .eq => orderDottedNumeric({}, lhs.version.slice, rhs.version.slice),
         };
     }
-    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-    pub fn formatLegacy(
-        self: MsvcupPackage,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{s}-{s}", .{ @tagName(self.kind), self.version.slice });
-    }
-    pub fn formatNew(self: MsvcupPackage, writer: *std.Io.Writer) error{WriteFailed}!void {
+    pub fn format(self: MsvcupPackage, writer: *std.Io.Writer) error{WriteFailed}!void {
         try writer.print("{t}-{s}", .{ self.kind, self.version.slice });
     }
 };
 
 fn defaultLockFile(allocator: std.mem.Allocator, install_dir: []const u8) error{OutOfMemory}![]const u8 {
-    const dir = std.mem.trimRight(u8, install_dir, "\\/");
+    const dir = std.mem.trimEnd(u8, install_dir, "\\/");
     return try std.fmt.allocPrint(allocator, "{s}.lock", .{dir});
 }
 
-fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const Config = struct {
         install_dir: []const u8,
         autoenv: bool,
@@ -700,7 +716,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     const config: Config = blk_config: {
         var maybe_install_dir: ?[]const u8 = null;
         var autoenv: bool = false;
-        var msvcup_pkgs: std.ArrayListUnmanaged(MsvcupPackage) = .{};
+        var msvcup_pkgs: std.ArrayList(MsvcupPackage) = .empty;
         var maybe_lock_file: ?[]const u8 = null;
         var maybe_manifest_update: ?ManifestUpdate = null;
         var channel = Channel.default;
@@ -774,7 +790,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         };
     };
 
-    const msvcup_dir: MsvcupDir = try .alloc(arena);
+    const msvcup_dir: MsvcupDir = try .alloc(environ, arena);
 
     if (config.msvcup_pkgs.len == 0) errExit(
         "no packages were given to install, use 'list' to list the available packages",
@@ -786,7 +802,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         &.{"cache"},
     ) catch |e| oom(e);
 
-    const root_node = std.Progress.start(.{ .root_name = "msvcup install" });
+    const root_node = std.Progress.start(io, .{ .root_name = "msvcup install" });
     defer root_node.end();
 
     var scratch_instance: ScratchAllocator = .init();
@@ -799,10 +815,10 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     };
     if (try_no_update) {
         const maybe_lock_file_content: ?[]const u8 = blk: {
-            if (std.fs.cwd().openFile(config.lock_file, .{})) |lock_file| {
-                defer lock_file.close();
+            if (std.Io.Dir.cwd().openFile(io, config.lock_file, .{})) |lock_file| {
+                defer lock_file.close(io);
                 log.info("lock file found: '{s}'", .{config.lock_file});
-                break :blk try lock_file.readToEndAlloc(arena, std.math.maxInt(usize));
+                break :blk try readToEndAlloc(io, lock_file, arena);
             } else |err| switch (err) {
                 error.FileNotFound => {
                     log.info("lock file NOT found: '{s}'", .{config.lock_file});
@@ -821,6 +837,8 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
                 std.log.info("{f}", .{mismatch});
             } else {
                 const result = try installFromLockFileLocking(
+                    io,
+                    environ,
                     scratch,
                     root_node,
                     config.install_dir,
@@ -840,7 +858,7 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
 
     const recipes = parseBuiltinRecipes(arena);
 
-    const vsman = try readVsManifestLocking(arena, root_node, scratch, msvcup_dir, config.channel, .off);
+    const vsman = try readVsManifestLocking(io, environ, arena, root_node, scratch, msvcup_dir, config.channel, .off);
     defer vsman.freeConst(arena);
     scratch_instance.reset();
 
@@ -849,6 +867,8 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     scratch_instance.reset();
 
     try updateLockFileLocking(
+        io,
+        environ,
         scratch,
         root_node,
         &recipes,
@@ -862,12 +882,12 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
     scratch_instance.reset();
 
     const lock_file_content = blk: {
-        const lock_file = std.fs.cwd().openFile(config.lock_file, .{}) catch |e| std.debug.panic(
+        const lock_file = std.Io.Dir.cwd().openFile(io, config.lock_file, .{}) catch |e| std.debug.panic(
             "failed to open lock file '{s}' with {s} just after updating it",
             .{ config.lock_file, @errorName(e) },
         );
-        defer lock_file.close();
-        break :blk try lock_file.readToEndAlloc(arena, std.math.maxInt(usize));
+        defer lock_file.close(io);
+        break :blk try readToEndAlloc(io, lock_file, arena);
     };
 
     if (checkLockFilePkgs(
@@ -880,6 +900,8 @@ fn install(arena: std.mem.Allocator, args: []const []const u8) !u8 {
         .{ config.lock_file, mismatch },
     );
     switch (try installFromLockFileLocking(
+        io,
+        environ,
         scratch,
         root_node,
         config.install_dir,
@@ -923,6 +945,7 @@ const sdk_tools = [_]Tool{
 };
 
 fn updateAutoenv(
+    io: std.Io,
     scratch: std.mem.Allocator,
     install_path: []const u8,
     unique_pkgs: *const UniquePackages,
@@ -932,20 +955,20 @@ fn updateAutoenv(
     defer scratch.free(autoenv_path);
 
     if (!unique_pkgs.autoenv) {
-        try deleteTree(std.fs.cwd(), autoenv_path);
+        try deleteTree(io, std.Io.Dir.cwd(), autoenv_path);
         return;
     }
 
-    const install_path_absolute: AbsolutePath = try .init(scratch, install_path);
+    const install_path_absolute: AbsolutePath = try .init(io, scratch, install_path);
     defer install_path_absolute.deinit(scratch);
 
-    var autoenv_dir = try std.fs.cwd().makeOpenPath(autoenv_path, .{});
-    defer autoenv_dir.close();
-    inline for (std.meta.fields(Arch)) |arch_field| {
-        const target_cpu: Arch = @enumFromInt(arch_field.value);
-        var autoenv_arch_dir = try autoenv_dir.makeOpenPath(@tagName(target_cpu), .{});
-        defer autoenv_arch_dir.close();
+    var autoenv_dir = try std.Io.Dir.cwd().createDirPathOpen(io, autoenv_path, .{});
+    defer autoenv_dir.close(io);
+    inline for (comptime std.enums.values(Arch)) |target_cpu| {
+        var autoenv_arch_dir = try autoenv_dir.createDirPathOpen(io, @tagName(target_cpu), .{});
+        defer autoenv_arch_dir.close(io);
         try installAutoenvArch(
+            io,
             scratch,
             &install_path_absolute,
             unique_pkgs,
@@ -962,32 +985,33 @@ const InstallVersions = struct {
 };
 
 fn installAutoenvArch(
+    io: std.Io,
     scratch: std.mem.Allocator,
     install_path: *const AbsolutePath,
     unique_pkgs: *const UniquePackages,
     install_versions: *const InstallVersions,
     target_cpu: Arch,
-    out_dir: std.fs.Dir,
+    out_dir: std.Io.Dir,
 ) !void {
     {
         var content_buf: [100]u8 = undefined;
         const content = try std.fmt.bufPrint(&content_buf, "..\\..\\vcvars-{s}.bat\n", .{@tagName(target_cpu)});
-        try updateFile(out_dir, "env", content);
+        try updateFile(io, out_dir, "env", content);
     }
 
     if (unique_pkgs.msvc) |_| {
         inline for (msvc_tools) |tool| {
-            try updateFile(out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
+            try updateFile(io, out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
         }
     }
     if (unique_pkgs.sdk) |_| {
         inline for (sdk_tools) |tool| {
-            try updateFile(out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
+            try updateFile(io, out_dir, tool.name ++ ".exe", @embedFile("autoenv_exe"));
         }
     }
 
     // cleanup this file from an old version of msvcup
-    out_dir.deleteFile("toolchain.cmake") catch |err| switch (err) {
+    out_dir.deleteFile(io, "toolchain.cmake") catch |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
     };
@@ -995,32 +1019,32 @@ fn installAutoenvArch(
     {
         const cmake = generateToolchainCmake(scratch, unique_pkgs, target_cpu, .native) catch |e| oom(e);
         defer scratch.free(cmake);
-        try updateFile(out_dir, "toolchain-native.cmake", cmake);
+        try updateFile(io, out_dir, "toolchain-native.cmake", cmake);
     }
 
     {
         const cmake = generateToolchainCmake(scratch, unique_pkgs, target_cpu, .cross) catch |e| oom(e);
         defer scratch.free(cmake);
-        try updateFile(out_dir, "toolchain-cross.cmake", cmake);
+        try updateFile(io, out_dir, "toolchain-cross.cmake", cmake);
     }
 
     {
         const libc_txt = generateLibcTxt(scratch, install_path, install_versions, target_cpu) catch |e| oom(e);
         defer scratch.free(libc_txt);
-        try updateFile(out_dir, "libc.txt", libc_txt);
+        try updateFile(io, out_dir, "libc.txt", libc_txt);
     }
 }
 
-fn updateFile(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !void {
-    const needs_update = !try fileMatches(dir, sub_path, content);
+fn updateFile(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, content: []const u8) !void {
+    const needs_update = !try fileMatches(io, dir, sub_path, content);
     {
         const status: []const u8 = if (needs_update) "updating..." else "already up-to-date";
         std.log.info("{s}: {s}", .{ sub_path, status });
     }
     if (needs_update) {
-        var file = try dir.createFile(sub_path, .{});
-        defer file.close();
-        try file.writeAll(content);
+        var file = try dir.createFile(io, sub_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, content);
     }
 }
 
@@ -1030,18 +1054,7 @@ const LockFileMismatch = union(enum) {
     missing_pkg: MsvcupPackage,
     extra_pkg: MsvcupPackage,
 
-    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-    pub fn formatNew(self: LockFileMismatch, writer: *std.Io.Writer) error{WriteFailed}!void {
-        try self.formatLegacy("", .{}, writer);
-    }
-    pub fn formatLegacy(
-        self: LockFileMismatch,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(self: LockFileMismatch, writer: *std.Io.Writer) error{WriteFailed}!void {
         switch (self) {
             .msvc => |v| try writer.print(
                 "lock file is for msvc version '{s}' but '{s}' was requested",
@@ -1246,6 +1259,8 @@ const UniquePackages = struct {
 };
 
 fn installFromLockFileLocking(
+    io: std.Io,
+    environ: std.process.Environ,
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     install_path: []const u8,
@@ -1310,6 +1325,8 @@ fn installFromLockFileLocking(
                 save_cab_pos = null;
 
                 try installPayloadLocking(
+                    io,
+                    environ,
                     scratch,
                     progress_node,
                     install_path,
@@ -1333,32 +1350,32 @@ fn installFromLockFileLocking(
     }
 
     const install_versions: InstallVersions = .{
-        .msvc = if (unique_pkgs.msvc != null) try queryInstallVersion(scratch, scratch, .msvc, install_path) else null,
-        .sdk = if (unique_pkgs.sdk != null) try queryInstallVersion(scratch, scratch, .sdk, install_path) else null,
+        .msvc = if (unique_pkgs.msvc != null) try queryInstallVersion(io, scratch, scratch, .msvc, install_path) else null,
+        .sdk = if (unique_pkgs.sdk != null) try queryInstallVersion(io, scratch, scratch, .sdk, install_path) else null,
     };
     if (install_versions.msvc) |v| std.log.info("MSVC install version '{s}'", .{v});
     if (install_versions.sdk) |v| std.log.info("SDK  install version '{s}'", .{v});
 
-    try updateVcvars(scratch, install_path, &install_versions);
-    try updateAutoenv(scratch, install_path, &unique_pkgs, &install_versions);
+    try updateVcvars(io, scratch, install_path, &install_versions);
+    try updateAutoenv(io, scratch, install_path, &unique_pkgs, &install_versions);
 
     return .success;
 }
 
 fn updateVcvars(
+    io: std.Io,
     scratch: std.mem.Allocator,
     install_path: []const u8,
     install_versions: *const InstallVersions,
 ) !void {
-    var install_dir = try std.fs.cwd().makeOpenPath(install_path, .{});
-    defer install_dir.close();
-    inline for (std.meta.fields(Arch)) |arch_field| {
-        const arch: Arch = @enumFromInt(arch_field.value);
+    var install_dir = try std.Io.Dir.cwd().createDirPathOpen(io, install_path, .{});
+    defer install_dir.close(io);
+    inline for (comptime std.enums.values(Arch)) |arch| {
         const env_bat = generateVcvarsBat(scratch, install_versions, arch) catch |e| oom(e);
         defer scratch.free(env_bat);
         const env_basename = std.fmt.allocPrint(scratch, "vcvars-{s}.bat", .{@tagName(arch)}) catch |e| oom(e);
         defer scratch.free(env_basename);
-        try updateFile(install_dir, env_basename, env_bat);
+        try updateFile(io, install_dir, env_basename, env_bat);
     }
 }
 
@@ -1367,6 +1384,7 @@ fn updateVcvars(
 // have to go in and look at the directory that was actually created to
 // get the "install version".
 fn queryInstallVersion(
+    io: std.Io,
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     kind: enum { msvc, sdk },
@@ -1377,14 +1395,14 @@ fn queryInstallVersion(
         .sdk => std.fs.path.join(scratch, &.{ install_path, "Windows Kits", "10", "Include" }) catch |e| oom(e),
     };
     defer scratch.free(query_path);
-    var query_dir = std.fs.cwd().openDir(query_path, .{ .iterate = true }) catch |e| std.debug.panic(
+    var query_dir = std.Io.Dir.cwd().openDir(io, query_path, .{ .iterate = true }) catch |e| std.debug.panic(
         "open directory '{s}' failed with {s}",
         .{ query_path, @errorName(e) },
     );
-    defer query_dir.close();
+    defer query_dir.close(io);
     var version_entry: ?[]u8 = null;
     var it = query_dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (!isValidVersion(entry.name)) {
             std.log.info("entry '{s}' in directory '{s}' is not a valid version", .{ entry.name, query_path });
         } else if (version_entry) |existing| std.debug.panic(
@@ -1405,10 +1423,18 @@ fn generateVcvarsBat(
     install_versions: *const InstallVersions,
     target_arch: Arch,
 ) error{OutOfMemory}![]u8 {
-    var bat: std.ArrayListUnmanaged(u8) = .{};
-    defer bat.deinit(allocator);
-    const writer = bat.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    // running out of memory is the only way writing to memory fails
+    writeVcvarsBat(&aw.writer, install_versions, target_arch) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
 
+fn writeVcvarsBat(
+    writer: *std.Io.Writer,
+    install_versions: *const InstallVersions,
+    target_arch: Arch,
+) error{WriteFailed}!void {
     try writer.writeAll("set \"INCLUDE=");
     if (install_versions.msvc) |install_version| {
         try writer.print(
@@ -1458,20 +1484,29 @@ fn generateVcvarsBat(
         );
     }
     try writer.writeAll("%LIB%\"\n");
-
-    return bat.toOwnedSlice(allocator) catch |e| oom(e);
 }
 
 fn generateToolchainCmake(
     allocator: std.mem.Allocator,
     unique_pkgs: *const UniquePackages,
     target_cpu: Arch,
-    variant: enum { native, cross },
+    variant: ToolchainVariant,
 ) error{OutOfMemory}![]u8 {
-    var content: std.ArrayListUnmanaged(u8) = .{};
-    defer content.deinit(allocator);
-    const writer = content.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    // running out of memory is the only way writing to memory fails
+    writeToolchainCmake(&aw.writer, unique_pkgs, target_cpu, variant) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
 
+const ToolchainVariant = enum { native, cross };
+
+fn writeToolchainCmake(
+    writer: *std.Io.Writer,
+    unique_pkgs: *const UniquePackages,
+    target_cpu: Arch,
+    variant: ToolchainVariant,
+) error{WriteFailed}!void {
     switch (variant) {
         .native => {},
         .cross => {
@@ -1503,17 +1538,16 @@ fn generateToolchainCmake(
             }
         }
     }
-    return content.toOwnedSlice(allocator) catch |e| oom(e);
 }
 
 const AbsolutePath = struct {
     slice: []const u8,
     allocated: bool,
 
-    pub fn init(allocator: std.mem.Allocator, p: []const u8) !AbsolutePath {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, p: []const u8) !AbsolutePath {
         if (std.fs.path.isAbsolute(p)) return .{ .slice = p, .allocated = false };
         return .{
-            .slice = try std.fs.realpathAlloc(allocator, p),
+            .slice = try std.Io.Dir.cwd().realPathFileAlloc(io, p, allocator),
             .allocated = true,
         };
     }
@@ -1528,7 +1562,7 @@ fn generateLibcTxt(
     install_versions: *const InstallVersions,
     target_cpu: Arch,
 ) error{OutOfMemory}![]u8 {
-    var aw: std15.Io.Writer.Allocating = try .initCapacity(allocator, 1000);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(allocator, 1000);
     defer aw.deinit();
     if (install_versions.msvc) |msvc_version| {
         aw.writer.print(
@@ -1583,6 +1617,8 @@ const CacheEntry = struct {
 };
 
 fn installPayloadLocking(
+    io: std.Io,
+    environ: std.process.Environ,
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     install_dir_path: []const u8,
@@ -1624,7 +1660,7 @@ fn installPayloadLocking(
     defer scratch.free(installed_basename);
     const installed_manifest_path = std.fs.path.join(scratch, &.{ install_dir_path, "install", installed_basename }) catch |e| oom(e);
     defer scratch.free(installed_manifest_path);
-    if (std.fs.cwd().access(installed_manifest_path, .{})) {
+    if (std.Io.Dir.cwd().access(io, installed_manifest_path, .{})) {
         log.info("ALREADY INSTALLED | {s} {f}", .{ basenameFromUrl(url_decoded), sha256 });
         return;
     } else |err| switch (err) {
@@ -1644,21 +1680,21 @@ fn installPayloadLocking(
             };
             const cab_cache_entry = CacheEntry.alloc(scratch, scratch, cache_dir, payload.sha256, basenameFromUrl(payload.url_decoded));
             defer cab_cache_entry.free(scratch);
-            try fetchPayloadLocking(scratch, progress_node, cache_dir, payload.sha256, payload.url_decoded, cab_cache_entry.path);
+            try fetchPayloadLocking(io, environ, scratch, progress_node, cache_dir, payload.sha256, payload.url_decoded, cab_cache_entry.path);
         }
     }
-    try fetchPayloadLocking(scratch, progress_node, cache_dir, sha256, url_decoded, cache_entry.path);
+    try fetchPayloadLocking(io, environ, scratch, progress_node, cache_dir, sha256, url_decoded, cache_entry.path);
 
     const install_lock_path = std.fs.path.join(scratch, &.{ install_dir_path, ".lock" }) catch |e| oom(e);
     defer scratch.free(install_lock_path);
     const current_install_path = std.fs.path.join(scratch, &.{ install_dir_path, "install", "current" }) catch |e| oom(e);
     defer scratch.free(current_install_path);
 
-    var install_lock = try LockFile.lock(install_lock_path);
-    defer install_lock.unlock();
+    var install_lock = try LockFile.lock(io, install_lock_path);
+    defer install_lock.unlock(io);
 
-    var install_dir_handle = try std.fs.cwd().openDir(install_dir_path, .{});
-    defer install_dir_handle.close();
+    var install_dir_handle = try std.Io.Dir.cwd().openDir(io, install_dir_path, .{});
+    defer install_dir_handle.close(io);
 
     const pre_start_data: union(enum) {
         vsix,
@@ -1682,17 +1718,17 @@ fn installPayloadLocking(
     switch (pre_start_data) {
         .vsix => {},
         .msi => |msi| {
-            try deleteTree(std.fs.cwd(), msi.staging_dir);
+            try deleteTree(io, std.Io.Dir.cwd(), msi.staging_dir);
             const installer_path = std.fs.path.join(scratch, &.{ msi.staging_dir, "installer" }) catch |e| oom(e);
             defer scratch.free(installer_path);
-            try std.fs.cwd().makeDir(msi.staging_dir);
-            try std.fs.cwd().makeDir(installer_path);
+            try std.Io.Dir.cwd().createDir(io, msi.staging_dir, .default_dir);
+            try std.Io.Dir.cwd().createDir(io, installer_path, .default_dir);
             const msi_copy = std.fs.path.join(scratch, &.{ installer_path, basenameFromUrl(url_decoded) }) catch |e| oom(e);
             defer scratch.free(msi_copy);
-            try std.fs.cwd().copyFile(cache_entry.path, std.fs.cwd(), msi_copy, .{});
+            try copyFile(io, cache_entry.path, std.Io.Dir.cwd(), msi_copy);
             {
-                var installer_dir = try std.fs.cwd().openDir(installer_path, .{});
-                defer installer_dir.close();
+                var installer_dir = try std.Io.Dir.cwd().openDir(io, installer_path, .{});
+                defer installer_dir.close(io);
                 var line_it = std.mem.tokenizeAny(u8, cabs, "\r\n");
                 var lineno: u32 = cabs_lineno - 1;
                 while (line_it.next()) |line| {
@@ -1714,24 +1750,24 @@ fn installPayloadLocking(
                         basenameFromUrl(payload.url_decoded),
                     );
                     defer cab_cache_entry.free(scratch);
-                    if (std.fs.path.dirname(installer_sub_path)) |dir| try installer_dir.makePath(dir);
-                    try std.fs.cwd().copyFile(cab_cache_entry.path, installer_dir, installer_sub_path, .{});
+                    if (std.fs.path.dirname(installer_sub_path)) |dir| try installer_dir.createDirPath(io, dir);
+                    try copyFile(io, cab_cache_entry.path, installer_dir, installer_sub_path);
                 }
             }
             const target_dir = std.fs.path.join(scratch, &.{ msi.staging_dir, "target" }) catch |e| oom(e);
             defer scratch.free(target_dir);
-            try populateStagingMsi(scratch, msi_copy, target_dir, .{ .msiexec = named.msiexec });
+            try populateStagingMsi(io, scratch, msi_copy, target_dir, .{ .msiexec = named.msiexec });
             std.log.info("removing '{s}'...", .{installer_path});
-            try deleteTree(std.fs.cwd(), installer_path);
+            try deleteTree(io, std.Io.Dir.cwd(), installer_path);
         },
         .zip => {},
     }
 
     {
-        const current_install_file = try startInstall(scratch, install_dir_handle, current_install_path);
-        defer current_install_file.close();
+        const current_install_file = try startInstall(io, scratch, install_dir_handle, current_install_path);
+        defer current_install_file.close(io);
         var write_buf: [1000]u8 = undefined;
-        var file_writer: File15.Writer = .init(current_install_file, &write_buf);
+        var file_writer = current_install_file.writer(io, &write_buf);
         var writer: FileWriter = .{
             .error_ref = &file_writer.err,
             .interface = &file_writer.interface,
@@ -1740,6 +1776,7 @@ fn installPayloadLocking(
         try writer.printFlush("{s}\n", .{cache_entry.basename});
         switch (pre_start_data) {
             .vsix => try installPayloadZip(
+                io,
                 scratch,
                 cache_entry.path,
                 install_dir_handle,
@@ -1751,15 +1788,17 @@ fn installPayloadLocking(
                 const target_dir = std.fs.path.join(scratch, &.{ msi.staging_dir, "target" }) catch |e| oom(e);
                 defer scratch.free(target_dir);
                 _ = try installDir(
+                    io,
                     scratch,
                     .{ .path = install_dir_path, .handle = install_dir_handle },
                     target_dir,
                     &writer,
                     basenameFromUrl(url_decoded),
                 );
-                try deleteTree(std.fs.cwd(), msi.staging_dir);
+                try deleteTree(io, std.Io.Dir.cwd(), msi.staging_dir);
             },
             .zip => try installPayloadZip(
+                io,
                 scratch,
                 cache_entry.path,
                 install_dir_handle,
@@ -1770,17 +1809,17 @@ fn installPayloadLocking(
         }
     }
 
-    try endInstall(scratch, installed_manifest_path, current_install_path);
+    try endInstall(io, scratch, installed_manifest_path, current_install_path);
 }
 
 const FileWriter = struct {
-    error_ref: *?std.fs.File.WriteError,
-    interface: *std15.Io.Writer,
+    error_ref: *?std.Io.File.Writer.Error,
+    interface: *std.Io.Writer,
     fn printFlush(
         file_writer: *const FileWriter,
         comptime fmt: []const u8,
         args: anytype,
-    ) std.fs.File.WriteError!void {
+    ) std.Io.File.Writer.Error!void {
         file_writer.interface.print(fmt, args) catch return file_writer.error_ref.*.?;
         file_writer.interface.flush() catch return file_writer.error_ref.*.?;
     }
@@ -1794,6 +1833,7 @@ fn normalizePathSeps(path: []u8) void {
 }
 
 fn populateStagingMsi(
+    io: std.Io,
     scratch: std.mem.Allocator,
     msi_file_path: []const u8,
     staging_dir: []const u8,
@@ -1801,15 +1841,15 @@ fn populateStagingMsi(
 ) !void {
     if (!named.msiexec) {
         const msi_content = blk: {
-            const file = std.fs.cwd().openFile(msi_file_path, .{}) catch |err| errExit(
+            const file = std.Io.Dir.cwd().openFile(io, msi_file_path, .{}) catch |err| errExit(
                 "open '{s}' failed with {s}",
                 .{ msi_file_path, @errorName(err) },
             );
-            defer file.close();
-            break :blk try file.readToEndAlloc(scratch, std.math.maxInt(usize));
+            defer file.close(io);
+            break :blk try readToEndAlloc(io, file, scratch);
         };
         defer scratch.free(msi_content);
-        @import("msi").install(scratch, .{
+        @import("msi").install(io, scratch, .{
             .cabs_dir = std.fs.path.dirname(msi_file_path) orelse ".",
             .msi_content = msi_content,
             .install_path = staging_dir,
@@ -1827,8 +1867,8 @@ fn populateStagingMsi(
 
     // at least some MSI files require TARGETDIR to be an absolute path
     // also, realpath requires the directory to exist to work
-    try std.fs.cwd().makePath(staging_dir);
-    const staging_dir_abs = try std.fs.cwd().realpathAlloc(scratch, staging_dir);
+    try std.Io.Dir.cwd().createDirPath(io, staging_dir);
+    const staging_dir_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, staging_dir, scratch);
     defer scratch.free(staging_dir_abs);
     normalizePathSeps(staging_dir_abs);
 
@@ -1845,8 +1885,7 @@ fn populateStagingMsi(
         //"/lv", "C:\\temp\\log.txt",
         target_dir_arg,
     };
-    const result = try std.process.Child.run(.{
-        .allocator = scratch,
+    const result = try std.process.run(scratch, io, .{
         .argv = &argv,
     });
     defer {
@@ -1854,9 +1893,9 @@ fn populateStagingMsi(
         scratch.free(result.stderr);
     }
     switch (result.term) {
-        .Exited => |exit_code| {
+        .exited => |exit_code| {
             if (exit_code != 0) {
-                var stderr: File15.Writer = .initStreaming(stderrFile(), &.{});
+                var stderr = stderrFile().writerStreaming(io, &.{});
                 stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
                 stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
                 errExit(
@@ -1866,7 +1905,7 @@ fn populateStagingMsi(
             }
         },
         inline else => |e| {
-            var stderr: File15.Writer = .initStreaming(stderrFile(), &.{});
+            var stderr = stderrFile().writerStreaming(io, &.{});
             stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
             stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
             errExit("msiexec for '{s}' terminated with {}", .{ msi_file_path, e });
@@ -1875,27 +1914,31 @@ fn populateStagingMsi(
 }
 
 fn installPayloadZip(
+    io: std.Io,
     scratch: std.mem.Allocator,
     cache_path: []const u8,
-    install_dir: std.fs.Dir,
+    install_dir: std.Io.Dir,
     installing_manifest: *const FileWriter,
     kind: enum { vsix, zip },
     strip_root_dir: bool,
 ) !void {
-    var payload_file = try std.fs.cwd().openFile(cache_path, .{});
-    defer payload_file.close();
+    var payload_file = try std.Io.Dir.cwd().openFile(io, cache_path, .{});
+    defer payload_file.close(io);
+    var payload_buf: [4096]u8 = undefined;
+    var payload_reader = payload_file.reader(io, &payload_buf);
 
     var last_root_dir: ?[]const u8 = null;
 
     {
-        var zip_it = try zip.Iterator.init(payload_file.seekableStream());
+        var zip_it = try std.zip.Iterator.init(&payload_reader);
         while (try zip_it.next()) |entry| {
             var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
             const filename = filename_buf[0..entry.filename_len];
-            try payload_file.seekableStream().seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
-            const len = try payload_file.reader().readAll(filename);
-            if (len != filename.len)
-                return error.ZipBadFileOffset;
+            try payload_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+            payload_reader.interface.readSliceAll(filename) catch |err| switch (err) {
+                error.ReadFailed => return payload_reader.err.?,
+                error.EndOfStream => return error.ZipBadFileOffset,
+            };
             const other_sep = switch (std.fs.path.sep) {
                 '/' => '\\',
                 '\\' => '/',
@@ -1956,16 +1999,24 @@ fn installPayloadZip(
                 break :blk sub_path_decoded;
             };
 
-            switch (try updateInstallingManifest(install_dir, installing_manifest, sub_path)) {
+            switch (try updateInstallingManifest(io, install_dir, installing_manifest, sub_path)) {
                 .already_installed => {
                     // TODO: for zip, we could probably just take a CRC of the current file and compre
                     //       it to our expected CRC
                     std.debug.panic("'{s}' already installed (TODO: check if it's the same)", .{sub_path});
                 },
                 .ready => {
-                    const file = try install_dir.createFile(sub_path, .{});
-                    defer file.close();
-                    const crc = try zip.extract(entry, payload_file.seekableStream(), file.writer());
+                    const file = try install_dir.createFile(io, sub_path, .{});
+                    defer file.close(io);
+                    var file_writer = file.writer(io, &.{});
+                    var hash_buf: [16 * 4096]u8 = undefined;
+                    var hashed = file_writer.interface.hashed(std.hash.Crc32.init(), &hash_buf);
+                    entry.extractTo(&payload_reader, &hashed.writer) catch |err| switch (err) {
+                        error.WriteFailed => return file_writer.err.?,
+                        else => |e| return e,
+                    };
+                    hashed.writer.flush() catch return file_writer.err.?;
+                    const crc = hashed.hasher.final();
                     if (crc != entry.crc32) std.debug.panic(
                         "file '{s}' expected CRC32 0x{x} but got 0x{x}",
                         .{ sub_path, entry.crc32, crc },
@@ -1977,32 +2028,33 @@ fn installPayloadZip(
 }
 
 fn updateInstallingManifest(
-    install_dir: std.fs.Dir,
+    io: std.Io,
+    install_dir: std.Io.Dir,
     installing_manifest: *const FileWriter,
     install_path: []const u8,
 ) !enum { already_installed, ready } {
-    if (install_dir.openFile(install_path, .{})) |file| {
-        defer file.close();
+    if (install_dir.openFile(io, install_path, .{})) |file| {
+        defer file.close(io);
         try installing_manifest.printFlush("add {s}\n", .{install_path});
         return .already_installed;
     } else |err| switch (err) {
         error.FileNotFound => {
             try installing_manifest.printFlush("new {s}\n", .{install_path});
-            if (std.fs.path.dirname(install_path)) |d| try install_dir.makePath(d);
+            if (std.fs.path.dirname(install_path)) |d| try install_dir.createDirPath(io, d);
             return .ready;
         },
         else => |e| return e,
     }
 }
 
-fn fileMatches(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !bool {
-    const file = dir.openFile(sub_path, .{}) catch |err| switch (err) {
+fn fileMatches(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, content: []const u8) !bool {
+    const file = dir.openFile(io, sub_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
     {
-        const file_size = try file.getEndPos();
+        const file_size = try file.length(io);
         if (file_size != content.len) return false;
     }
     const chunk_size = @max(4096, std.heap.page_size_min);
@@ -2010,7 +2062,7 @@ fn fileMatches(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !bool
     var content_offset: usize = 0;
     while (content_offset < content.len) {
         const bytes_to_read = @min(chunk_size, content.len - content_offset);
-        const bytes_read = try file.readAll(buffer[0..bytes_to_read]);
+        const bytes_read = try file.readPositionalAll(io, buffer[0..bytes_to_read], content_offset);
         if (bytes_read != bytes_to_read) return false;
         if (!std.mem.eql(u8, buffer[0..bytes_read], content[content_offset .. content_offset + bytes_read])) {
             return false;
@@ -2019,22 +2071,24 @@ fn fileMatches(dir: std.fs.Dir, sub_path: []const u8, content: []const u8) !bool
     }
     return true;
 }
-fn filesAreIdentical(path1: []const u8, path2: []const u8) !bool {
-    const file1 = try std.fs.cwd().openFile(path1, .{});
-    defer file1.close();
-    const file2 = try std.fs.cwd().openFile(path2, .{});
-    defer file2.close();
+fn filesAreIdentical(io: std.Io, path1: []const u8, path2: []const u8) !bool {
+    const file1 = try std.Io.Dir.cwd().openFile(io, path1, .{});
+    defer file1.close(io);
+    const file2 = try std.Io.Dir.cwd().openFile(io, path2, .{});
+    defer file2.close(io);
     {
-        const file1_end_pos = try file1.getEndPos();
-        const file2_end_pos = try file2.getEndPos();
+        const file1_end_pos = try file1.length(io);
+        const file2_end_pos = try file2.length(io);
         if (file1_end_pos != file2_end_pos) return false;
     }
     const chunk_size = @max(4096, std.heap.page_size_min);
     var buffer1: [chunk_size]u8 = undefined;
     var buffer2: [chunk_size]u8 = undefined;
+    var offset: u64 = 0;
     while (true) {
-        const bytes_read1 = try file1.readAll(&buffer1);
-        const bytes_read2 = try file2.readAll(&buffer2);
+        const bytes_read1 = try file1.readPositionalAll(io, &buffer1, offset);
+        const bytes_read2 = try file2.readPositionalAll(io, &buffer2, offset);
+        offset += bytes_read1;
         if (bytes_read1 != bytes_read2) return false;
         if (bytes_read1 == 0) return true;
         if (!std.mem.eql(u8, buffer1[0..bytes_read1], buffer2[0..bytes_read2]))
@@ -2044,24 +2098,25 @@ fn filesAreIdentical(path1: []const u8, path2: []const u8) !bool {
 
 const OpenDir = struct {
     path: []const u8,
-    handle: std.fs.Dir,
+    handle: std.Io.Dir,
 };
 
 fn installDir(
+    io: std.Io,
     scratch: std.mem.Allocator,
     install_dir: OpenDir,
     source_dir_path: []const u8,
     installing_manifest: *const FileWriter,
     root_exclude: []const u8,
 ) !struct { root_excluded: bool } {
-    var source_dir = try std.fs.cwd().openDir(source_dir_path, .{ .iterate = true });
-    defer source_dir.close();
+    var source_dir = try std.Io.Dir.cwd().openDir(io, source_dir_path, .{ .iterate = true });
+    defer source_dir.close(io);
 
     var it = try source_dir.walk(scratch);
     defer it.deinit();
 
     var root_excluded = false;
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (std.mem.eql(u8, entry.path, root_exclude)) {
             root_excluded = true;
             continue;
@@ -2075,38 +2130,38 @@ fn installDir(
         defer scratch.free(install_path);
         const source_path = std.fs.path.join(scratch, &.{ source_dir_path, entry.path }) catch |e| oom(e);
         defer scratch.free(source_path);
-        switch (try updateInstallingManifest(install_dir.handle, installing_manifest, entry.path)) {
+        switch (try updateInstallingManifest(io, install_dir.handle, installing_manifest, entry.path)) {
             .already_installed => {
-                if (!try filesAreIdentical(source_path, install_path)) {
+                if (!try filesAreIdentical(io, source_path, install_path)) {
                     std.log.err("file conflict!", .{});
                     std.log.err("new source       : {s}", .{source_path});
                     std.log.err("already installed: {s}", .{install_path});
                     @panic("file conflict");
                 }
             },
-            .ready => try std.fs.cwd().copyFile(source_path, std.fs.cwd(), install_path, .{}),
+            .ready => try copyFile(io, source_path, std.Io.Dir.cwd(), install_path),
         }
     }
     return .{ .root_excluded = root_excluded };
 }
 
-pub fn deleteTree(dir: std.fs.Dir, sub_path: []const u8) !void {
+pub fn deleteTree(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) !void {
     if (builtin.os.tag != .windows) {
-        return dir.deleteTree(sub_path);
+        return dir.deleteTree(io, sub_path);
     }
 
     // workaround issue on windows where it just doesn't delete things
     const MAX_ATTEMPTS = 10;
     var attempt: u8 = 0;
     while (true) : (attempt += 1) {
-        if (dir.deleteTree(sub_path)) {
+        if (dir.deleteTree(io, sub_path)) {
             return;
         } else |err| {
             if (attempt == MAX_ATTEMPTS) return err;
             switch (err) {
                 error.FileBusy => {
                     std.log.warn("path '{s}' is busy (attempt {}), will retry", .{ sub_path, attempt });
-                    std.Thread.sleep(std.time.ns_per_ms * 100); // sleep for 100 ms
+                    try io.sleep(.fromMilliseconds(100), .awake);
                 },
                 else => |e| return e,
             }
@@ -2115,16 +2170,17 @@ pub fn deleteTree(dir: std.fs.Dir, sub_path: []const u8) !void {
 }
 
 fn startInstall(
+    io: std.Io,
     scratch: std.mem.Allocator,
-    install_dir: std.fs.Dir,
+    install_dir: std.Io.Dir,
     current_install_path: []const u8,
-) !std.fs.File {
-    if (std.fs.cwd().openFile(current_install_path, .{})) |current_install_file| {
+) !std.Io.File {
+    if (std.Io.Dir.cwd().openFile(io, current_install_path, .{})) |current_install_file| {
         const content = blk: {
-            defer current_install_file.close();
+            defer current_install_file.close(io);
             // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
             log.info(" opened '{s}'", .{current_install_path});
-            break :blk try current_install_file.readToEndAlloc(scratch, std.math.maxInt(usize));
+            break :blk try readToEndAlloc(io, current_install_file, scratch);
         };
         defer scratch.free(content);
         var line_it = std.mem.splitScalar(u8, content, '\n');
@@ -2137,7 +2193,7 @@ fn startInstall(
                 if (std.mem.startsWith(u8, line, "new ")) {
                     const sub_path = line[4..];
                     log.info("removing file '{s}'", .{sub_path});
-                    install_dir.deleteFile(sub_path) catch |err| switch (err) {
+                    install_dir.deleteFile(io, sub_path) catch |err| switch (err) {
                         error.FileNotFound => {},
                         else => |e| return e,
                     };
@@ -2151,19 +2207,20 @@ fn startInstall(
         } else {
             log.info("current-install was empty", .{});
         }
-        try std.fs.cwd().deleteFile(current_install_path);
+        try std.Io.Dir.cwd().deleteFile(io, current_install_path);
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
     }
 
-    if (std.fs.path.dirname(current_install_path)) |d| try std.fs.cwd().makePath(d);
+    if (std.fs.path.dirname(current_install_path)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     log.info("creating '{s}'...", .{current_install_path});
-    return try std.fs.cwd().createFile(current_install_path, .{});
+    return try std.Io.Dir.cwd().createFile(io, current_install_path, .{});
 }
 
 fn endInstall(
+    io: std.Io,
     scratch: std.mem.Allocator,
     installed_manifest_path: []const u8,
     current_install_path: []const u8,
@@ -2172,18 +2229,18 @@ fn endInstall(
     defer scratch.free(installed_manifest_path_tmp);
 
     {
-        const installed_manifest = try std.fs.cwd().createFile(installed_manifest_path_tmp, .{});
-        defer installed_manifest.close();
+        const installed_manifest = try std.Io.Dir.cwd().createFile(io, installed_manifest_path_tmp, .{});
+        defer installed_manifest.close(io);
         var buf: [8192]u8 = undefined;
-        var file_writer: File15.Writer = .init(installed_manifest, &buf);
+        var file_writer = installed_manifest.writer(io, &buf);
         const w = &file_writer.interface;
 
         const content = blk: {
-            const current_install_file = try std.fs.cwd().openFile(current_install_path, .{});
-            defer current_install_file.close();
+            const current_install_file = try std.Io.Dir.cwd().openFile(io, current_install_path, .{});
+            defer current_install_file.close(io);
             // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
             log.info(" opened '{s}'", .{current_install_path});
-            break :blk try current_install_file.readToEndAlloc(scratch, std.math.maxInt(usize));
+            break :blk try readToEndAlloc(io, current_install_file, scratch);
         };
         defer scratch.free(content);
         var line_it = std.mem.splitScalar(u8, content, '\n');
@@ -2212,8 +2269,8 @@ fn endInstall(
         }
         w.flush() catch return file_writer.err.?;
     }
-    try std.fs.cwd().deleteFile(current_install_path);
-    try std.fs.cwd().rename(installed_manifest_path_tmp, installed_manifest_path);
+    try std.Io.Dir.cwd().deleteFile(io, current_install_path);
+    try std.Io.Dir.rename(.cwd(), installed_manifest_path_tmp, .cwd(), installed_manifest_path, io);
 }
 
 const InstallPayload = struct {
@@ -2233,6 +2290,8 @@ const InstallPayload = struct {
 const CabOffset = struct { cab_offset: usize };
 
 fn updateLockFileLocking(
+    io: std.Io,
+    environ: std.process.Environ,
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     recipes: *const Recipes,
@@ -2246,7 +2305,7 @@ fn updateLockFileLocking(
     globalfilelocks.enteredLockingFunction(@src().fn_name);
 
     const payloads: []const InstallPayload = blk_payloads: {
-        var payloads: std.ArrayListUnmanaged(InstallPayload) = .{};
+        var payloads: std.ArrayList(InstallPayload) = .empty;
 
         for (pkgs.slice, 0..) |*pkg, pkg_index| {
             const payload_range = pkgs.payloadRangeFromPkgIndex(.fromInt(pkg_index));
@@ -2291,7 +2350,7 @@ fn updateLockFileLocking(
         std.debug.assert(.lt == InstallPayload.order(pkgs.payloads, payloads[i - 1], payloads[i]));
     };
 
-    var cabs: std.ArrayListUnmanaged(PayloadIndex) = .{};
+    var cabs: std.ArrayList(PayloadIndex) = .empty;
     defer cabs.deinit(scratch);
     var payload_cab_offsets: []CabOffset = scratch.alloc(CabOffset, payloads.len) catch |e| oom(e);
     defer scratch.free(payload_cab_offsets);
@@ -2322,6 +2381,8 @@ fn updateLockFileLocking(
                 );
                 defer cache_entry.free(scratch);
                 try fetchPayloadLocking(
+                    io,
+                    environ,
                     scratch,
                     progress_node,
                     cache_dir,
@@ -2330,25 +2391,25 @@ fn updateLockFileLocking(
                     cache_entry.path,
                 );
                 const msi_content = blk: {
-                    const file = try std.fs.cwd().openFile(cache_entry.path, .{});
-                    defer file.close();
-                    break :blk try file.readToEndAlloc(scratch, std.math.maxInt(usize));
+                    const file = try std.Io.Dir.cwd().openFile(io, cache_entry.path, .{});
+                    defer file.close(io);
+                    break :blk try readToEndAlloc(io, file, scratch);
                 };
                 const pkg_index = pkgs.pkgIndexFromPayloadIndex(install_payload.index);
                 const pkg_payload_range = pkgs.payloadRangeFromPkgIndex(pkg_index);
 
-                const start = std.time.nanoTimestamp();
+                const start = nanoTimestamp(io);
                 var indexof_elapsed: i128 = 0;
                 var loop_elapsed: i128 = 0;
 
                 {
                     var offset: usize = 0;
                     while (true) {
-                        const before_indexof: i128 = std.time.nanoTimestamp();
+                        const before_indexof: i128 = nanoTimestamp(io);
                         const index = indexOfCab2(msi_content, offset) orelse break;
-                        indexof_elapsed += std.time.nanoTimestamp() - before_indexof;
+                        indexof_elapsed += nanoTimestamp(io) - before_indexof;
                         offset = index + 4;
-                        const before_loop = std.time.nanoTimestamp();
+                        const before_loop = nanoTimestamp(io);
                         for (pkg_payload_range.start..pkg_payload_range.limit) |pkg_payload_index| {
                             if (pkg_payload_index == install_payload.index.int()) continue;
                             const pkg_payload = &pkgs.payloads[pkg_payload_index];
@@ -2356,17 +2417,17 @@ fn updateLockFileLocking(
                                 const cab_payload = std.fs.path.basenameWindows(pkg_payload.file_name);
                                 if (index + 4 < cab_payload.len) continue;
                                 const cab_msi = msi_content[index + 4 - cab_payload.len ..][0..cab_payload.len];
-                                if (std.ascii.indexOfIgnoreCase(cab_payload, cab_msi)) |_| {
+                                if (std.ascii.findIgnoreCase(cab_payload, cab_msi)) |_| {
                                     cabs.append(scratch, .fromInt(pkg_payload_index)) catch |e| oom(e);
                                     break;
                                 }
                             }
                         }
-                        const now = std.time.nanoTimestamp();
+                        const now = nanoTimestamp(io);
                         loop_elapsed += now - before_loop;
                     }
                 }
-                const elapsed = std.time.nanoTimestamp() - start;
+                const elapsed = nanoTimestamp(io) - start;
                 std.log.info(
                     "FindCabs took {d:.6} ms (loop took {d:.6} ms) (indexof took {d:.6} ms)",
                     .{
@@ -2381,11 +2442,11 @@ fn updateLockFileLocking(
     }
 
     log.info("{} payloads:", .{payloads.len});
-    if (std.fs.path.dirname(lock_file_path)) |dir| try std.fs.cwd().makePath(dir);
-    const lock_file = try std.fs.cwd().createFile(lock_file_path, .{});
-    defer lock_file.close();
+    if (std.fs.path.dirname(lock_file_path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    const lock_file = try std.Io.Dir.cwd().createFile(io, lock_file_path, .{});
+    defer lock_file.close(io);
     var write_buf: [8192]u8 = undefined;
-    var lock_file_writer: File15.Writer = .init(lock_file, &write_buf);
+    var lock_file_writer = lock_file.writer(io, &write_buf);
     writeLockFile(
         autoenv,
         pkgs,
@@ -2403,7 +2464,7 @@ fn writeLockFile(
     payloads: []const InstallPayload,
     cabs: []const PayloadIndex,
     payload_cab_offsets: []const CabOffset,
-    writer: *std15.Io.Writer,
+    writer: *std.Io.Writer,
 ) error{WriteFailed}!void {
     if (autoenv) {
         try writer.writeAll("autoenv\n");
@@ -2478,7 +2539,7 @@ fn writePayload(
     const target_str: []const u8 = if (maybe_target) |t| t.poolString().slice else "";
 
     const sha_hex = sha256.toHex();
-    if (std.ascii.indexOfIgnoreCase(url, &sha_hex)) |hash_index| {
+    if (std.ascii.findIgnoreCase(url, &sha_hex)) |hash_index| {
         try writer.print(
             "{s}|{s}|{d}{s}{s}\n",
             .{ target_str, url, hash_index, space, out_file_name },
@@ -2580,6 +2641,8 @@ fn basenameFromUrl(url: []const u8) []const u8 {
 }
 
 fn readVsManifestLocking(
+    io: std.Io,
+    environ: std.process.Environ,
     allocator: std.mem.Allocator,
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
@@ -2597,7 +2660,7 @@ fn readVsManifestLocking(
 
     switch (update) {
         .off => {
-            if (try readFile(allocator, vsman_latest_owning.borrow())) |content| return .{
+            if (try readFile(io, allocator, vsman_latest_owning.borrow())) |content| return .{
                 .path = vsman_latest_owning.take(),
                 .content = content,
             };
@@ -2606,16 +2669,16 @@ fn readVsManifestLocking(
         .always => @panic("todo: replace the existing manifest"),
     }
 
-    var chman = try readChManifestLocking(scratch, progress_node, scratch, msvcup_dir, channel, update);
+    var chman = try readChManifestLocking(io, environ, scratch, progress_node, scratch, msvcup_dir, channel, update);
     defer chman.freeConst(scratch);
 
     const fetch_path = msvcup_dir.path(scratch, .{ "manifest", manifest_dir.slice(), "latest.fetching" }) catch |e| oom(e);
     defer scratch.free(fetch_path);
-    switch (try AtomicFile.lock(fetch_path, vsman_latest_owning.borrow())) {
+    switch (try AtomicFile.lock(io, fetch_path, vsman_latest_owning.borrow())) {
         .exists => {},
         .locked => |locked| {
             var atomic_file = locked;
-            defer atomic_file.deinit();
+            defer atomic_file.deinit(io);
             const payload = try vsManifestPayloadFromChManifest(scratch, scratch, chman);
             defer payload.free(scratch);
             const uri = uriFromUrlDecoded(payload.url_decoded) catch |e| errExit(
@@ -2633,13 +2696,13 @@ fn readVsManifestLocking(
 
             // NOTE: for some reason the size/sha256 is not right for this?!?
             // const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{ .size = payload.size });
-            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{ .redirects = .https_only });
+            const sha256 = try fetch(io, environ, progress_node, scratch, uri, atomic_file.file, .{ .redirects = .https_only });
             _ = sha256;
-            try checkFetchedManifest(scratch, &atomic_file, uri, "vs manifest", "packages");
-            try atomic_file.finish(vsman_latest_owning.borrow());
+            try checkFetchedManifest(io, scratch, &atomic_file, uri, "vs manifest", "packages");
+            try atomic_file.finish(io, vsman_latest_owning.borrow());
         },
     }
-    const content = try readFile(allocator, vsman_latest_owning.borrow()) orelse errExit(
+    const content = try readFile(io, allocator, vsman_latest_owning.borrow()) orelse errExit(
         "{s} still doesn't exist",
         .{vsman_latest_owning.borrow()},
     );
@@ -2665,7 +2728,7 @@ const VsManifestPayload = struct {
 };
 
 fn allocUrlPercentDecoded(allocator: std.mem.Allocator, url: []const u8) error{OutOfMemory}![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = try .initCapacity(allocator, url.len);
+    var buf: std.ArrayList(u8) = try .initCapacity(allocator, url.len);
     buf.expandToCapacity();
     @memcpy(buf.items[0..url.len], url);
     const decoded = std.Uri.percentDecodeInPlace(buf.items);
@@ -2809,6 +2872,8 @@ const OwningPath = struct {
 //             transformation, which, means that if we need to modify our transformation,
 //             then we can re-transform old manifests if we need new data.
 fn readChManifestLocking(
+    io: std.Io,
+    environ: std.process.Environ,
     allocator: std.mem.Allocator,
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
@@ -2826,7 +2891,7 @@ fn readChManifestLocking(
 
     switch (update) {
         .off => {
-            if (try readFile(allocator, chman_latest_owning.borrow())) |content| return .{
+            if (try readFile(io, allocator, chman_latest_owning.borrow())) |content| return .{
                 .path = chman_latest_owning.take(),
                 .content = content,
             };
@@ -2846,7 +2911,7 @@ fn readChManifestLocking(
         else => null,
     };
     const maybe_resolved: ?PathAndContent = if (manifest_uri == null)
-        try resolveChManifestUrlLocking(scratch, scratch, msvcup_dir, channel, update)
+        try resolveChManifestUrlLocking(io, environ, scratch, scratch, msvcup_dir, channel, update)
     else
         null;
     defer if (maybe_resolved) |resolved| resolved.freeConst(scratch);
@@ -2857,11 +2922,11 @@ fn readChManifestLocking(
 
     const fetch_path = msvcup_dir.path(scratch, .{ "manifest", manifest_dir.slice(), "latest.fetching" }) catch |e| oom(e);
     defer scratch.free(fetch_path);
-    switch (try AtomicFile.lock(fetch_path, chman_latest_owning.borrow())) {
+    switch (try AtomicFile.lock(io, fetch_path, chman_latest_owning.borrow())) {
         .exists => {},
         .locked => |locked| {
             var atomic_file = locked;
-            defer atomic_file.deinit();
+            defer atomic_file.deinit(io);
 
             // const uri_sha = sha256FromUri(uri);
             // // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -2870,13 +2935,13 @@ fn readChManifestLocking(
             // //       ALSO, I'd like to see if
             // if (true) std.debug.panic("check uri sha '{s}'", .{uri_sha});
 
-            const sha256 = try fetch(progress_node, scratch, uri, atomic_file.file, .{ .redirects = .https_only });
+            const sha256 = try fetch(io, environ, progress_node, scratch, uri, atomic_file.file, .{ .redirects = .https_only });
             _ = sha256;
-            try checkFetchedManifest(scratch, &atomic_file, uri, "channel manifest", "channelItems");
-            try atomic_file.finish(chman_latest_owning.borrow());
+            try checkFetchedManifest(io, scratch, &atomic_file, uri, "channel manifest", "channelItems");
+            try atomic_file.finish(io, chman_latest_owning.borrow());
         },
     }
-    const content = try readFile(allocator, chman_latest_owning.borrow()) orelse errExit(
+    const content = try readFile(io, allocator, chman_latest_owning.borrow()) orelse errExit(
         "{s} still doesn't exist",
         .{chman_latest_owning.borrow()},
     );
@@ -2887,20 +2952,15 @@ fn readChManifestLocking(
 /// has no hash to check it against and once it's cached it isn't downloaded again, so a url
 /// that gave us something else would fail every run until the file is deleted by hand.
 fn checkFetchedManifest(
+    io: std.Io,
     scratch: std.mem.Allocator,
     atomic_file: *AtomicFile,
     uri: std.Uri,
     what: []const u8,
     required_field: []const u8,
 ) !void {
-    const size = try atomic_file.file.getEndPos();
-    const content = scratch.alloc(u8, std.math.cast(usize, size) orelse errExit(
-        "'{}' gave us {} bytes, too big to be a {s}",
-        .{ uri, size, what },
-    )) catch |e| oom(e);
+    const content = try readToEndAlloc(io, atomic_file.file, scratch);
     defer scratch.free(content);
-    const len = try atomic_file.file.preadAll(content, 0);
-    std.debug.assert(len == content.len);
 
     const problem: []const u8 = blk: {
         const parsed = std.json.parseFromSlice(std.json.Value, scratch, content, .{}) catch |err| switch (err) {
@@ -2913,14 +2973,32 @@ fn checkFetchedManifest(
             else => break :blk "it isn't a json object",
         }
         // exit doesn't run defers, delete the file before the message that names the field
-        atomic_file.deinit();
-        errExit("'{}' is not a {s}, it has no \"{s}\" field", .{ uri, what, required_field });
+        atomic_file.deinit(io);
+        errExit("'{f}' is not a {s}, it has no \"{s}\" field", .{ uri, what, required_field });
     };
-    atomic_file.deinit();
-    errExit("'{}' is not a {s}, {s}", .{ uri, what, problem });
+    atomic_file.deinit(io);
+    errExit("'{f}' is not a {s}, {s}", .{ uri, what, problem });
+}
+
+/// A Location longer than this fails to resolve.
+const max_location_len = 8192;
+
+/// Gives the url a redirect leads to, its Location can be relative to the url that
+/// redirected. The result references buf.
+fn resolveLocation(
+    base: std.Uri,
+    location: []const u8,
+    buf: *[2 * max_location_len]u8,
+) std.Uri.ResolveInPlaceError!std.Uri {
+    if (location.len > max_location_len) return error.NoSpaceLeft;
+    @memcpy(buf[0..location.len], location);
+    var unused: []u8 = buf;
+    return base.resolveInPlace(location.len, &unused);
 }
 
 fn resolveChManifestUrlLocking(
+    io: std.Io,
+    environ: std.process.Environ,
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     msvcup_dir: MsvcupDir,
@@ -2937,7 +3015,7 @@ fn resolveChManifestUrlLocking(
 
     switch (update) {
         .off => {
-            if (try readFile(allocator, chman_latest_url_path_owning.borrow())) |content| return .{
+            if (try readFile(io, allocator, chman_latest_url_path_owning.borrow())) |content| return .{
                 .path = chman_latest_url_path_owning.take(),
                 .content = content,
             };
@@ -2948,20 +3026,22 @@ fn resolveChManifestUrlLocking(
 
     const fetch_path = msvcup_dir.path(scratch, .{ "manifest", manifest_dir.slice(), "latest.fetching" }) catch |e| oom(e);
     defer scratch.free(fetch_path);
-    switch (try AtomicFile.lock(fetch_path, chman_latest_url_path_owning.borrow())) {
+    switch (try AtomicFile.lock(io, fetch_path, chman_latest_url_path_owning.borrow())) {
         .exists => {},
         .locked => |locked| {
             var atomic_file = locked;
-            defer atomic_file.deinit();
+            defer atomic_file.deinit(io);
             try resolveChannelManifestUrlToFile(
+                io,
+                environ,
                 scratch,
                 std.Uri.parse(channel.httpsUrl()) catch unreachable,
                 atomic_file.file,
             );
-            try atomic_file.finish(chman_latest_url_path_owning.borrow());
+            try atomic_file.finish(io, chman_latest_url_path_owning.borrow());
         },
     }
-    const content = try readFile(allocator, chman_latest_url_path_owning.borrow()) orelse errExit(
+    const content = try readFile(io, allocator, chman_latest_url_path_owning.borrow()) orelse errExit(
         "{s} still doesn't exist",
         .{chman_latest_url_path_owning.borrow()},
     );
@@ -2972,63 +3052,52 @@ fn resolveChManifestUrlLocking(
 }
 
 fn resolveChannelManifestUrlToFile(
+    io: std.Io,
+    environ: std.process.Environ,
     scratch: std.mem.Allocator,
     uri: std.Uri,
-    out_file: std.fs.File,
+    out_file: std.Io.File,
 ) !void {
     // TODO: progres report
-    log.info("resolving URL '{}'...", .{uri});
+    log.info("resolving URL '{f}'...", .{uri});
 
-    var client = std.http.Client{ .allocator = scratch };
+    var client: std.http.Client = .{ .allocator = scratch, .io = io };
     defer client.deinit();
-    client.initDefaultProxies(scratch) catch |err| switch (err) {
-        error.OutOfMemory => oom(error.OutOfMemory),
-        error.InvalidWtf8,
-        error.UnexpectedCharacter,
-        error.InvalidFormat,
-        error.InvalidPort,
-        error.HttpProxyMissingHost,
-        => |e| errExit("init proxy failed with {s}", .{@errorName(e)}),
-    };
-    var header_buffer: [8196]u8 = undefined;
-
-    var request = try client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
+    initProxies(environ, &client, scratch);
+    var request = try client.request(.GET, uri, .{
         .keep_alive = false,
-        .redirect_behavior = .not_allowed,
+        // we want the redirect itself, not what it leads to
+        .redirect_behavior = .unhandled,
     });
     defer request.deinit();
-    try request.send();
-    request.wait() catch |err| switch (err) {
-        error.TooManyHttpRedirects => {
-            if (request.response.location) |location| {
-                // a Location can be relative to the url that redirected
-                var resolve_buf: [2 * header_buffer.len]u8 = undefined;
-                var resolve_unused: []u8 = &resolve_buf;
-                const redirect_uri = uri.resolve_inplace(location, &resolve_unused) catch |e| errExit(
-                    "channel URL '{}' redirects to '{s}', which failed to parse with {s}",
-                    .{ uri, location, @errorName(e) },
-                );
-                if (!std.ascii.eqlIgnoreCase(redirect_uri.scheme, "https")) errExit(
-                    "channel URL '{}' redirects to '{}', which is not an https URL",
-                    .{ uri, redirect_uri },
-                );
-                // an unknown aka.ms url redirects to a search page with a success status,
-                // check this before it gets cached
-                if (!Channel.isManifestUri(redirect_uri)) errExit(
-                    "channel URL '{}' redirects to '{}', which is not a channel manifest (.chman)",
-                    .{ uri, redirect_uri },
-                );
-                try out_file.writer().print("{}", .{redirect_uri});
-                return;
-            }
-        },
-        else => |e| return e,
-    };
-    errExit("GET '{}' HTTP status {} \"{s}\", expected a redirect to a channel manifest", .{
+    try request.sendBodiless();
+    const response = try request.receiveHead(&.{});
+    if (response.head.status.class() == .redirect) {
+        if (response.head.location) |location| {
+            var resolve_buf: [2 * max_location_len]u8 = undefined;
+            const redirect_uri = resolveLocation(uri, location, &resolve_buf) catch |e| errExit(
+                "channel URL '{f}' redirects to '{s}', which failed to parse with {t}",
+                .{ uri, location, e },
+            );
+            if (!std.ascii.eqlIgnoreCase(redirect_uri.scheme, "https")) errExit(
+                "channel URL '{f}' redirects to '{f}', which is not an https URL",
+                .{ uri, redirect_uri },
+            );
+            // an unknown aka.ms url redirects to a search page with a success status,
+            // check this before it gets cached
+            if (!Channel.isManifestUri(redirect_uri)) errExit(
+                "channel URL '{f}' redirects to '{f}', which is not a channel manifest (.chman)",
+                .{ uri, redirect_uri },
+            );
+            var file_writer = out_file.writerStreaming(io, &.{});
+            file_writer.interface.print("{f}", .{redirect_uri}) catch return file_writer.err.?;
+            return;
+        }
+    }
+    errExit("GET '{f}' HTTP status {} \"{s}\", expected a redirect to a channel manifest", .{
         uri,
-        @intFromEnum(request.response.status),
-        request.response.status.phrase() orelse "",
+        @backingInt(response.head.status),
+        response.head.status.phrase() orelse "",
     });
 }
 
@@ -3062,6 +3131,8 @@ fn uriFromUrlDecoded(url_decoded: []const u8) !std.Uri {
 }
 
 fn fetchPayloadLocking(
+    io: std.Io,
+    environ: std.process.Environ,
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
     cache_dir: []const u8,
@@ -3073,7 +3144,7 @@ fn fetchPayloadLocking(
 
     // AtomicFile.lock checks this too, but it has to create and lock a file to get there. This
     // is what lets a process that wants a cached payload skip waiting on a download.
-    if (std.fs.cwd().access(cache_path, .{})) {
+    if (std.Io.Dir.cwd().access(io, cache_path, .{})) {
         log.info("ALREADY FETCHED  | {s} {f}", .{ url_decoded, sha256 });
         return;
     } else |err| switch (err) {
@@ -3083,17 +3154,19 @@ fn fetchPayloadLocking(
 
     const fetch_path = std.mem.concat(scratch, u8, &.{ cache_path, ".fetching" }) catch |e| oom(e);
     defer scratch.free(fetch_path);
-    var atomic_file = switch (try AtomicFile.lock(fetch_path, cache_path)) {
+    var atomic_file = switch (try AtomicFile.lock(io, fetch_path, cache_path)) {
         .exists => {
             log.info("ALREADY FETCHED  | {s} {f}", .{ url_decoded, sha256 });
             return;
         },
         .locked => |locked| locked,
     };
-    defer atomic_file.deinit();
+    defer atomic_file.deinit(io);
 
     log.info("FETCHING         | {s} {f}", .{ url_decoded, sha256 });
     const actual_sha256 = try fetch(
+        io,
+        environ,
         progress_node,
         scratch,
         try uriFromUrlDecoded(url_decoded),
@@ -3105,12 +3178,12 @@ fn fetchPayloadLocking(
             "SHA256 mismatch:\nexpected: {f}\nactual  : {f}\n",
             .{ sha256, actual_sha256 },
         );
-        try finishCacheFetch(scratch, cache_dir, url_decoded, actual_sha256, &atomic_file);
+        try finishCacheFetch(io, scratch, cache_dir, url_decoded, actual_sha256, &atomic_file);
         // exit doesn't run the defer above
-        atomic_file.deinit();
+        atomic_file.deinit(io);
         std.process.exit(0xff);
     }
-    try atomic_file.finish(cache_path);
+    try atomic_file.finish(io, cache_path);
 }
 
 const FetchOptions = struct {
@@ -3128,29 +3201,31 @@ const max_fetch_redirects = 3;
 const max_fetch_attempts = 3;
 
 fn fetch(
+    io: std.Io,
+    environ: std.process.Environ,
     progress_node: std.Progress.Node,
     scratch: std.mem.Allocator,
     uri: std.Uri,
-    out_file: std.fs.File,
+    out_file: std.Io.File,
     opt: FetchOptions,
 ) !Sha {
-    log.info("fetch: {}", .{uri});
-    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {}", .{uri}) catch |e| oom(e);
+    log.info("fetch: {f}", .{uri});
+    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {f}", .{uri}) catch |e| oom(e);
     defer scratch.free(progress_node_name);
     const node = progress_node.start(progress_node_name, 1);
     defer node.end();
 
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
-        switch (try fetchAttempt(scratch, uri, out_file, opt)) {
+        switch (try fetchAttempt(io, environ, scratch, uri, out_file, opt)) {
             .sha => |sha| return sha,
             .wrong_size => |size| {
                 if (attempt == max_fetch_attempts) errExit(
-                    "fetch '{}': expected {} bytes but read {}, gave up after {} attempts",
+                    "fetch '{f}': expected {} bytes but read {}, gave up after {} attempts",
                     .{ uri, size.expected, size.received, attempt },
                 );
                 log.warn(
-                    "fetch '{}': expected {} bytes but read {}, retrying (attempt {} of {} failed)",
+                    "fetch '{f}': expected {} bytes but read {}, retrying (attempt {} of {} failed)",
                     .{ uri, size.expected, size.received, attempt, max_fetch_attempts },
                 );
             },
@@ -3164,78 +3239,74 @@ const FetchAttemptResult = union(enum) {
 };
 
 fn fetchAttempt(
+    io: std.Io,
+    environ: std.process.Environ,
     scratch: std.mem.Allocator,
     uri: std.Uri,
-    out_file: std.fs.File,
+    out_file: std.Io.File,
     opt: FetchOptions,
 ) !FetchAttemptResult {
-    var client = std.http.Client{ .allocator = scratch };
+    var client: std.http.Client = .{ .allocator = scratch, .io = io };
     defer client.deinit();
-    client.initDefaultProxies(scratch) catch |err| switch (err) {
-        error.OutOfMemory => oom(error.OutOfMemory),
-        error.InvalidWtf8,
-        error.UnexpectedCharacter,
-        error.InvalidFormat,
-        error.InvalidPort,
-        error.HttpProxyMissingHost,
-        => |e| errExit("init proxy failed with {s}", .{@errorName(e)}),
-    };
+    initProxies(environ, &client, scratch);
 
-    var header_buffer: [8196]u8 = undefined;
+    var redirect_buffer: [8196]u8 = undefined;
     // the url we end up at when we follow the redirects ourselves, each one is allocated
     // because it can reference the one before it
     var redirect_uri = uri;
     var redirect_count: u8 = 0;
-    var request = while (true) {
-        var request = try client.open(.GET, redirect_uri, .{
-            .server_header_buffer = &header_buffer,
+    // a response points to its request, so the request can't move once it has one
+    var request: std.http.Client.Request = undefined;
+    var response: std.http.Client.Response = undefined;
+    while (true) {
+        request = try client.request(.GET, redirect_uri, .{
             .keep_alive = false,
+            // the body is written as it arrives, so it must not be compressed
+            .headers = .{ .accept_encoding = .omit },
             .redirect_behavior = switch (opt.redirects) {
-                .any => @enumFromInt(max_fetch_redirects),
+                .any => .init(max_fetch_redirects),
                 .https_only => .unhandled,
             },
         });
         errdefer request.deinit();
-        try request.send();
-        try request.wait();
-        if (opt.redirects == .any or request.response.status.class() != .redirect) break request;
+        try request.sendBodiless();
+        response = try request.receiveHead(&redirect_buffer);
+        if (opt.redirects == .any or response.head.status.class() != .redirect) break;
 
-        const location = request.response.location orelse errExit(
-            "fetch '{}': HTTP response {} has no Location",
-            .{ redirect_uri, @intFromEnum(request.response.status) },
+        const location = response.head.location orelse errExit(
+            "fetch '{f}': HTTP response {} has no Location",
+            .{ redirect_uri, @backingInt(response.head.status) },
         );
         if (redirect_count == max_fetch_redirects) errExit(
-            "fetch '{}': more than {} redirects, the last one to '{s}'",
+            "fetch '{f}': more than {} redirects, the last one to '{s}'",
             .{ uri, max_fetch_redirects, location },
         );
         redirect_count += 1;
-        const resolve_buf = scratch.alloc(u8, 2 * header_buffer.len) catch |e| oom(e);
-        var resolve_unused = resolve_buf;
-        const next_uri = redirect_uri.resolve_inplace(location, &resolve_unused) catch |e| errExit(
-            "fetch '{}': redirects to '{s}', which failed to parse with {s}",
-            .{ redirect_uri, location, @errorName(e) },
+        const resolve_buf = scratch.create([2 * max_location_len]u8) catch |e| oom(e);
+        const next_uri = resolveLocation(redirect_uri, location, resolve_buf) catch |e| errExit(
+            "fetch '{f}': redirects to '{s}', which failed to parse with {t}",
+            .{ redirect_uri, location, e },
         );
         if (!std.ascii.eqlIgnoreCase(next_uri.scheme, "https")) errExit(
-            "fetch '{}': redirects to '{}', which is not an https URL",
+            "fetch '{f}': redirects to '{f}', which is not an https URL",
             .{ redirect_uri, next_uri },
         );
         redirect_uri = next_uri;
         request.deinit();
-    };
+    }
     defer request.deinit();
-    if (request.response.status != .ok) return errExit(
-        "fetch '{}': HTTP response {} \"{?s}\"",
-        .{ uri, @intFromEnum(request.response.status), request.response.status.phrase() },
+    if (response.head.status != .ok) return errExit(
+        "fetch '{f}': HTTP response {} \"{?s}\"",
+        .{ uri, @backingInt(response.head.status), response.head.status.phrase() },
     );
 
     // a previous attempt could have written some of it
-    try out_file.seekTo(0);
-    try out_file.setEndPos(0);
+    try out_file.setLength(io, 0);
     const maybe_expected_size = blk: {
-        if (request.response.content_length) |content_length| {
+        if (response.head.content_length) |content_length| {
             if (opt.size) |size| {
                 if (size != content_length) errExit(
-                    "fetch '{}': Content-Length {} != expected size {}",
+                    "fetch '{f}': Content-Length {} != expected size {}",
                     .{ uri, content_length, size },
                 );
             }
@@ -3243,32 +3314,37 @@ fn fetchAttempt(
         }
         break :blk opt.size;
     };
-    if (maybe_expected_size) |size| try out_file.setEndPos(size);
+    if (maybe_expected_size) |size| try out_file.setLength(io, size);
 
     var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
     var total_received: u64 = 0;
 
+    // The body reader stops at Content-Length, and ends early without an error if the
+    // connection closes before that, which the size check below turns into a retry.
+    var transfer_buffer: [64]u8 = undefined;
+    const body = response.reader(&transfer_buffer);
     while (true) {
         var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
-        const len = request.reader().read(&buf) catch |e| std.debug.panic(
-            "fetch '{}': read failed with {s}",
-            .{ uri, @errorName(e) },
-        );
-        if (len == 0) break;
-        total_received += len;
-        if (request.response.content_length) |content_length| {
-            if (total_received > content_length) errExit(
-                "fetch '{}': read more than Content-Length ({})",
-                .{ uri, content_length },
-            );
-        }
+        const len = body.readSliceShort(&buf) catch |err| switch (err) {
+            error.ReadFailed => {
+                const read_err: anyerror = if (response.bodyErr()) |e|
+                    e
+                else if (request.connection) |connection|
+                    connection.getReadError() orelse err
+                else
+                    err;
+                std.debug.panic("fetch '{f}': read failed with {t}", .{ uri, read_err });
+            },
+        };
         hasher.update(buf[0..len]);
         // NOTE: not going through a buffered writer since we're writing
         //       large chunks
-        out_file.writer().writeAll(buf[0..len]) catch |err| std.debug.panic(
-            "fetch '{}': write {} bytes of HTTP response failed with {s}",
-            .{ uri, len, @errorName(err) },
+        out_file.writePositionalAll(io, buf[0..len], total_received) catch |err| std.debug.panic(
+            "fetch '{f}': write {} bytes of HTTP response failed with {t}",
+            .{ uri, len, err },
         );
+        total_received += len;
+        if (len < buf.len) break;
     }
 
     if (maybe_expected_size) |expected| if (total_received != expected) return .{
@@ -3280,13 +3356,38 @@ fn fetchAttempt(
     return .{ .sha = sha };
 }
 
-fn readFile(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+/// The same as std's copyFile with a bigger buffer. Windows can't copy from one file to another
+/// in the kernel, so there the buffer is the size of each read and write, and std's is 1KiB.
+fn copyFile(io: std.Io, source_path: []const u8, dest_dir: std.Io.Dir, dest_path: []const u8) !void {
+    const source = try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source.close(io);
+    var reader: std.Io.File.Reader = .init(source, io, &.{});
+    const stat = try source.stat(io);
+    reader.size = stat.size;
+
+    var atomic_file = try dest_dir.createFileAtomic(io, dest_path, .{
+        .permissions = stat.permissions,
+        .replace = true,
+    });
+    defer atomic_file.deinit(io);
+
+    var buffer: [64 * 1024]u8 = undefined;
+    var writer = atomic_file.file.writer(io, &buffer);
+    _ = writer.interface.sendFileAll(&reader, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.WriteFailed => return writer.err.?,
+    };
+    try writer.flush();
+    try atomic_file.replace(io);
+}
+
+fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => |e| return e,
     };
-    defer file.close();
-    return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    defer file.close(io);
+    return try readToEndAlloc(io, file, allocator);
 }
 
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -3370,19 +3471,19 @@ const Packages = struct {
 const PackageIndex = enum(usize) {
     _,
     pub fn fromInt(i: usize) PackageIndex {
-        return @enumFromInt(i);
+        return @fromBackingInt(@intCast(i));
     }
     pub fn int(self: PackageIndex) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 const PayloadIndex = enum(usize) {
     _,
     pub fn fromInt(i: usize) PayloadIndex {
-        return @enumFromInt(i);
+        return @fromBackingInt(@intCast(i));
     }
     pub fn int(self: PayloadIndex) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
     pub fn order(payloads: []const Payload, lhs: PayloadIndex, rhs: PayloadIndex) std.math.Order {
         switch (orderAlphabetical({}, payloads[lhs.int()].nameDecoded(), payloads[rhs.int()].nameDecoded())) {
@@ -3634,7 +3735,7 @@ fn orderAlphabetical(_: void, lhs: []const u8, rhs: []const u8) std.math.Order {
 
 fn findSortedIndex(
     comptime T: type,
-    list: *std.ArrayListUnmanaged(T),
+    list: *std.ArrayList(T),
     item: T,
     context: anytype,
     comptime orderFn: fn (@TypeOf(context), T, T) std.math.Order,
@@ -3657,7 +3758,7 @@ fn findSortedIndex(
 fn insertSorted(
     comptime T: type,
     allocator: std.mem.Allocator,
-    list: *std.ArrayListUnmanaged(T),
+    list: *std.ArrayList(T),
     item: T,
     context: anytype,
     comptime orderFn: fn (@TypeOf(context), T, T) std.math.Order,
@@ -3668,21 +3769,41 @@ fn insertSorted(
     }
 }
 
-pub fn stdoutFile() std.fs.File {
-    return if (zig_atleast_15) std.fs.File.stdout() else std.io.getStdOut();
+pub fn stdoutFile() std.Io.File {
+    return withIoMode(.stdout());
 }
-pub fn stderrFile() std.fs.File {
-    return if (zig_atleast_15) std.fs.File.stderr() else std.io.getStdErr();
+pub fn stderrFile() std.Io.File {
+    return withIoMode(.stderr());
+}
+
+/// std says its stdout and stderr files are opened for synchronous io, which isn't true of the
+/// pipes that Git Bash and the other MSYS2 and Cygwin shells make. A write to one of those that
+/// can't finish at once is pending when NtWriteFile returns, which std treats as unreachable
+/// for a synchronous file.
+fn withIoMode(file: std.Io.File) std.Io.File {
+    if (builtin.os.tag != .windows) return file;
+    var io_status: std.os.windows.IO_STATUS_BLOCK = undefined;
+    var info: std.os.windows.FILE.MODE.INFORMATION = undefined;
+    switch (std.os.windows.ntdll.NtQueryInformationFile(file.handle, &io_status, &info, @sizeOf(@TypeOf(info)), .Mode)) {
+        .SUCCESS => {},
+        // there's no file, such as when the handle was closed, and a write to it fails either way
+        else => return file,
+    }
+    var result = file;
+    result.flags.nonblocking = info.Mode.IO == .ASYNCHRONOUS;
+    return result;
 }
 
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     var stderr_buf: [1000]u8 = undefined;
-    var stderr: File15.Writer = .initStreaming(stderrFile(), &stderr_buf);
-    const maybe_err: ?File15.WriteError = blk: {
+    // through std's debug io, like std.log, so reporting an error doesn't need an Io
+    const stderr = std.debug.lockStderr(&stderr_buf).file_writer;
+    const maybe_err: ?std.Io.File.Writer.Error = blk: {
         stderr.interface.print(fmt ++ "\n", args) catch break :blk stderr.err.?;
         stderr.interface.flush() catch break :blk stderr.err.?;
         break :blk null;
     };
+    std.debug.unlockStderr();
     if (maybe_err) |e| std.debug.panic(
         "error {s} printing another error to stdout",
         .{@errorName(e)},
@@ -3693,12 +3814,45 @@ fn oom(e: error{OutOfMemory}) noreturn {
     @panic(@errorName(e));
 }
 
-const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-const File15 = if (zig_atleast_15) std.fs.File else std15.fs.File15;
+/// Returns null if the variable isn't set or is empty.
+fn getEnv(environ: std.process.Environ, allocator: std.mem.Allocator, comptime name: []const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        const value_w = environ.getWindows(comptime std.unicode.wtf8ToWtf16LeStringLiteral(name)) orelse return null;
+        if (value_w.len == 0) return null;
+        return std.unicode.wtf16LeToWtf8Alloc(allocator, value_w) catch |e| oom(e);
+    }
+    const value = environ.getPosix(name) orelse return null;
+    if (value.len == 0) return null;
+    return value;
+}
+
+fn nanoTimestamp(io: std.Io) i96 {
+    return std.Io.Clock.real.now(io).toNanoseconds();
+}
+
+fn readToEndAlloc(io: std.Io, file: std.Io.File, allocator: std.mem.Allocator) ![]u8 {
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.OutOfMemory => |e| return e,
+        error.StreamTooLong => unreachable,
+    };
+}
+
+fn initProxies(environ: std.process.Environ, client: *std.http.Client, arena: std.mem.Allocator) void {
+    var environ_map: std.process.Environ.Map = .init(arena);
+    defer environ_map.deinit();
+    inline for (.{ "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY" }) |name| {
+        if (getEnv(environ, arena, name)) |value| environ_map.put(name, value) catch |e| oom(e);
+    }
+    client.initDefaultProxies(arena, &environ_map) catch |err| switch (err) {
+        error.OutOfMemory => |e| oom(e),
+        else => |e| errExit("init proxy failed with {t}", .{e}),
+    };
+}
 
 const builtin = @import("builtin");
 const std = @import("std");
-const std15 = if (zig_atleast_15) std else @import("std15");
 const extrapkgs = @import("extrapkgs");
 const Channel = @import("channel.zig").Channel;
 const Arch = @import("arch.zig").Arch;
@@ -3711,4 +3865,3 @@ const globalfilelocks = @import("globalfilelocks.zig");
 const Recipes = @import("Recipes.zig");
 const JsonContext = @import("JsonContext.zig");
 const StringPool = @import("StringPool.zig");
-const zip = @import("zip.zig");

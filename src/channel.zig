@@ -13,12 +13,12 @@ pub const Channel = union(enum) {
 
     /// Every channel with a name, in the order they're declared.
     pub const known = blk: {
-        const fields = @typeInfo(Channel).@"union".fields;
-        var channels: [fields.len - 1]Channel = undefined;
+        const names = @typeInfo(Channel).@"union".field_names;
+        var channels: [names.len - 1]Channel = undefined;
         var count: usize = 0;
-        for (fields) |field| {
-            if (std.mem.eql(u8, field.name, "url")) continue;
-            channels[count] = @unionInit(Channel, field.name, {});
+        for (names) |name| {
+            if (std.mem.eql(u8, name, "url")) continue;
+            channels[count] = @unionInit(Channel, name, {});
             count += 1;
         }
         std.debug.assert(count == channels.len);
@@ -114,7 +114,7 @@ pub const Channel = union(enum) {
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(self.httpsUrl(), &digest, .{});
         var key: [cache_key_len]u8 = undefined;
-        _ = std.fmt.bufPrint(&key, "{}", .{std.fmt.fmtSliceHexLower(digest[0 .. key.len / 2])}) catch unreachable;
+        _ = std.fmt.bufPrint(&key, "{x}", .{digest[0 .. key.len / 2]}) catch unreachable;
         return key;
     }
 };
