@@ -20,28 +20,28 @@ msvc-{version} id=Microsoft.VC.{version}.Tools.Host{arch}.Target{arch}.base
 msvc-{version} id=Microsoft.VC.{version}.Tools.Host{arch}.Target{arch}.Res.base
 
 # contains the "Universal CRT" headers, libraries and sources
-sdk-{version} version={version} "fileName=Installers\Universal CRT Headers Libraries and Sources-*"
+sdk-{version} version={version} "fileName=Installers/Universal CRT Headers Libraries and Sources-*"
 # contains the headers in "Windows Kits\10\Include\VERSION" subdirectories
 # 'shared', 'um' and 'winrt'
-sdk-{version} version={version} "fileName=Installers\Windows SDK Desktop Headers *"
+sdk-{version} version={version} "fileName=Installers/Windows SDK Desktop Headers *"
 # contains a bunch of ".lib" file in the um directory
-sdk-{version} version={version} "fileName=Installers\Windows SDK Desktop Libs *"
+sdk-{version} version={version} "fileName=Installers/Windows SDK Desktop Libs *"
 # contains more of the headers in 'shared', newer sdks moved them here, older sdks don't
 # have this msi
-sdk-{version} version={version} "fileName=Installers\Windows SDK OnecoreUap Headers *"
+sdk-{version} version={version} "fileName=Installers/Windows SDK OnecoreUap Headers *"
 # includes tools like signtool.exe
-sdk-{version} version={version} "fileName=Installers\Windows SDK Signing Tools-*"
+sdk-{version} version={version} "fileName=Installers/Windows SDK Signing Tools-*"
 # contains cppwinrt and winrt headers
-sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Headers-*"
+sdk-{version} version={version} "fileName=Installers/Windows SDK for Windows Store Apps Headers-*"
 # contains winapifamily.h, which windows.h includes, newer sdks moved it here, older sdks
 # don't have this msi
-sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Headers OnecoreUap-*"
+sdk-{version} version={version} "fileName=Installers/Windows SDK for Windows Store Apps Headers OnecoreUap-*"
 # contains a bunch of core windows ".lib" files like ntdll, kernel32, etc, but also
 # others like the DirectX libraries.
-sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Libs-*"
+sdk-{version} version={version} "fileName=Installers/Windows SDK for Windows Store Apps Libs-*"
 # contains a bunch of executables like dxc.exe, fxc.exe, inspect.exe, certmgr.exe,
 # cppwinrt.exe, mc.exe, midl.exe, mt.exe, rc.exe
-sdk-{version} version={version} "fileName=Installers\Windows SDK for Windows Store Apps Tools-*"
+sdk-{version} version={version} "fileName=Installers/Windows SDK for Windows Store Apps Tools-*"
 
 # NOTE: we're assuming these packages are currently at version 170
 msbuild-170 id=Microsoft.Build
