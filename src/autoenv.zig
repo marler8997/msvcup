@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const std15 = if (zig_atleast_15) std else @import("std15");
+const wintrace = @import("wintrace.zig");
 
 pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
 
@@ -10,9 +11,17 @@ const win32 = std.os.windows;
 const GetLastError = win32.kernel32.GetLastError;
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
-pub fn main() !u8 {
+pub const panic = wintrace.panic;
+pub const std_options: std.Options = .{ .enable_segfault_handler = false };
+
+pub fn main() noreturn {
+    if (wintrace.SetUnhandledExceptionFilter(&wintrace.unhandledExceptionFilter) != null) unreachable;
+    run() catch |err| wintrace.exitWithErrorTrace(err, @errorReturnTrace());
+}
+
+fn run() !noreturn {
     // it looks like we don't even need to update command_line
-    const command_line = std.mem.span(GetCommandLineW());
+    const command_line = getCommandLine();
 
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     // arena_instance.deinit();
@@ -27,33 +36,23 @@ pub fn main() !u8 {
 
     const exe = blk_exe: {
         {
-            const self_exe_dir_utf8 = try std.unicode.wtf16LeToWtf8Alloc(arena, self_exe_paths.dir);
-            defer arena.free(self_exe_dir_utf8);
-
-            const env_file_path = try std.fs.path.join(arena, &.{ self_exe_dir_utf8, "env" });
+            const env_file_path = try resolvePath(arena, self_exe_paths.dir, "env");
             defer arena.free(env_file_path);
-            const env_file_content = blk: {
-                var file = std.fs.cwd().openFile(env_file_path, .{}) catch |err| switch (err) {
-                    error.FileNotFound => errExit(
-                        "unable to load environment, '{s}' does not exist",
-                        .{env_file_path},
-                    ),
-                    else => |e| return e,
-                };
-                defer file.close();
-                break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
+            const env_file_content = content: {
+                const env_file = openFile(env_file_path) orelse errExit(
+                    "unable to load environment, '{f}' does not exist",
+                    .{std.unicode.fmtUtf16Le(env_file_path)},
+                );
+                defer _ = win32.ntdll.NtClose(env_file);
+                break :content try readFile(arena, env_file, env_file_path);
             };
             defer arena.free(env_file_content);
             var line_it = std.mem.tokenizeAny(u8, env_file_content, "\r\n");
             while (line_it.next()) |line| {
                 var scratch: std.heap.ArenaAllocator = .init(arena);
                 defer scratch.deinit();
-
-                const is_absolute = std.fs.path.isAbsolute(line);
-                const file_path = if (is_absolute) line else try std.fs.path.join(arena, &.{ self_exe_dir_utf8, line });
-                defer if (!is_absolute) arena.free(file_path);
-
-                try loadVcVars(scratch.allocator(), file_path);
+                const vcvars_path = try resolvePath(scratch.allocator(), self_exe_paths.dir, line);
+                try loadVcVars(scratch.allocator(), vcvars_path);
             }
         }
         std.debug.assert(arena_instance.reset(.retain_capacity));
@@ -76,7 +75,7 @@ pub fn main() !u8 {
     if (0 == win32.kernel32.CreateProcessW(
         // L(exe_basename),
         exe,
-        if (command_line) |cl| cl.ptr else null,
+        command_line,
         null,
         null,
         1, // inherit handles
@@ -91,50 +90,54 @@ pub fn main() !u8 {
     );
 
     if (use_job) {
-        const job = CreateJobObjectW(null, null) orelse errExit(
-            "CreateJobObject failed, error={f}",
-            .{fmtError(GetLastError())},
-        );
+        var job: win32.HANDLE = undefined;
+        check("NtCreateJobObject", NtCreateJobObject(&job, JOB_OBJECT_ALL_ACCESS, null));
 
-        {
-            var info = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
-            info.BasicLimitInformation.LimitFlags = .{ .LIMIT_KILL_ON_JOB_CLOSE = 1 };
-            if (0 == SetInformationJobObject(
-                job,
-                .JobObjectExtendedLimitInformation,
-                &info,
-                @sizeOf(@TypeOf(info)),
-            )) errExit(
-                "SetInformationJobObject failed, error={f}",
-                .{fmtError(GetLastError())},
-            );
-        }
-
-        if (0 == AssignProcessToJobObject(
+        var info = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+        info.BasicLimitInformation.LimitFlags = .{ .LIMIT_KILL_ON_JOB_CLOSE = 1 };
+        check("NtSetInformationJobObject", NtSetInformationJobObject(
             job,
-            process_info.hProcess,
-        )) errExit(
-            "AssignProcessToJobObject failed, error={f}",
-            .{fmtError(GetLastError())},
-        );
-
-        {
-            const suspend_count = ResumeThread(process_info.hThread);
-            if (suspend_count == -1) return errExit(
-                "ResumeThread failed, error={f}",
-                .{fmtError(win32.GetLastError())},
-            );
-        }
+            .JobObjectExtendedLimitInformation,
+            &info,
+            @sizeOf(@TypeOf(info)),
+        ));
+        check("NtAssignProcessToJobObject", NtAssignProcessToJobObject(job, process_info.hProcess));
+        check("NtResumeThread", NtResumeThread(process_info.hThread, null));
     }
-    win32.CloseHandle(process_info.hThread);
-    try win32.WaitForSingleObject(process_info.hProcess, win32.INFINITE);
+    _ = win32.ntdll.NtClose(process_info.hThread);
+    // with no timeout and not alertable, success is the only status that isn't a failure
+    const wait_status = NtWaitForSingleObject(process_info.hProcess, 0, null);
+    if (wait_status != .SUCCESS) errExit("NtWaitForSingleObject failed, status=0x{x}", .{@intFromEnum(wait_status)});
 
-    var exit_code: u32 = undefined;
-    if (0 == win32.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code)) errExit(
-        "GetExitCodeProcess failed, error={f}",
-        .{fmtError(GetLastError())},
+    var basic_info: win32.PROCESS_BASIC_INFORMATION = undefined;
+    check("NtQueryInformationProcess", win32.ntdll.NtQueryInformationProcess(
+        process_info.hProcess,
+        .ProcessBasicInformation,
+        &basic_info,
+        @sizeOf(win32.PROCESS_BASIC_INFORMATION),
+        null,
+    ));
+    win32.ntdll.RtlExitUserProcess(@intFromEnum(basic_info.ExitStatus));
+}
+
+fn check(what: []const u8, status: win32.NTSTATUS) void {
+    if (isFailure(status)) errExit("{s} failed, status=0x{x}", .{ what, @intFromEnum(status) });
+}
+
+fn isFailure(status: win32.NTSTATUS) bool {
+    return @intFromEnum(status) >= 0x80000000;
+}
+
+fn getCommandLine() ?[*:0]u16 {
+    const str = &win32.peb().ProcessParameters.CommandLine;
+    const buffer = str.Buffer orelse return null;
+    const len = str.Length / 2;
+    // CreateProcessW takes it 0-terminated, which a UNICODE_STRING doesn't have to be
+    if (str.MaximumLength < @as(u32, str.Length) + 2 or buffer[len] != 0) errExit(
+        "the command line isn't 0-terminated: '{f}'",
+        .{std.unicode.fmtUtf16Le(buffer[0..len])},
     );
-    win32.kernel32.ExitProcess(exit_code);
+    return buffer[0..len :0];
 }
 
 fn getImagePathName() ?[]const u16 {
@@ -155,23 +158,41 @@ fn splitDirBasename(path: []const u16) ?struct {
     return null;
 }
 
+/// sub_path if it's absolute, otherwise dir joined with it.
+fn resolvePath(allocator: std.mem.Allocator, dir: []const u16, sub_path: []const u8) ![:0]u16 {
+    const prefix_len = blk: {
+        if (std.fs.path.isAbsolute(sub_path)) break :blk 0;
+        break :blk switch (dir[dir.len - 1]) {
+            '\\', '/' => dir.len,
+            else => dir.len + 1,
+        };
+    };
+    const sub_path_len = try std.unicode.calcWtf16LeLen(sub_path);
+    const path = try allocator.allocSentinel(u16, prefix_len + sub_path_len, 0);
+    if (prefix_len != 0) {
+        path[prefix_len - 1] = '\\';
+        @memcpy(path[0..dir.len], dir);
+    }
+    const written = try std.unicode.wtf8ToWtf16Le(path[prefix_len..], sub_path);
+    std.debug.assert(written == sub_path_len);
+    return path;
+}
+
 const dp0 = "%~dp0";
 
-fn loadVcVars(scratch: std.mem.Allocator, vcvars_path: []const u8) !void {
-    if (false) std.log.debug("loading vcvars from '{s}'...", .{vcvars_path});
+fn loadVcVars(scratch: std.mem.Allocator, vcvars_path_w: [:0]const u16) !void {
+    const vcvars_path = std.unicode.fmtUtf16Le(vcvars_path_w);
 
-    const vcvars = blk: {
-        var file = std.fs.cwd().openFile(vcvars_path, .{}) catch |e|
-            errExit("open '{s}' failed with {s}", .{ vcvars_path, @errorName(e) });
-        defer file.close();
-        break :blk try file.readToEndAlloc(scratch, std.math.maxInt(usize));
+    const vcvars = content: {
+        const file = openFile(vcvars_path_w) orelse errExit("'{f}' does not exist", .{vcvars_path});
+        defer _ = win32.ntdll.NtClose(file);
+        break :content try readFile(scratch, file, vcvars_path_w);
     };
 
-    const root_dir = std.fs.path.dirname(vcvars_path) orelse errExit(
-        "invalid vcvars path '{s}' missing directory",
+    const root_dir = (splitDirBasename(vcvars_path_w) orelse errExit(
+        "invalid vcvars path '{f}' missing directory",
         .{vcvars_path},
-    );
-    const root_dir_len = try std.unicode.calcWtf16LeLen(root_dir);
+    )).dir;
 
     var line_it = std.mem.tokenizeAny(u8, vcvars, "\r\n");
     var lineno: u32 = 0;
@@ -179,11 +200,11 @@ fn loadVcVars(scratch: std.mem.Allocator, vcvars_path: []const u8) !void {
         lineno += 1;
         const prefix = "set \"";
         if (!std.mem.startsWith(u8, line, prefix)) errExit(
-            "{s}:{}: line did not start with '{s}'",
+            "{f}:{}: line did not start with '{s}'",
             .{ vcvars_path, lineno, prefix },
         );
         const eq_index = std.mem.indexOfScalarPos(u8, line, prefix.len, '=') orelse errExit(
-            "{s}:{}: missing '=' to end name",
+            "{f}:{}: missing '=' to end name",
             .{ vcvars_path, lineno },
         );
         const name = line[prefix.len..eq_index];
@@ -196,7 +217,7 @@ fn loadVcVars(scratch: std.mem.Allocator, vcvars_path: []const u8) !void {
                 std.mem.eql(u8, suffix[2 + name.len ..], "%\"");
         };
         if (!expected_end) errExit(
-            "{s}:{}: line did not end with ';%{s}%\"', it ended with '{s}'",
+            "{f}:{}: line did not end with ';%{s}%\"', it ended with '{s}'",
             .{ vcvars_path, lineno, name, if (suffix_len <= line.len) line[line.len - suffix_len ..] else line },
         );
         const paths_start = eq_index + 1;
@@ -207,11 +228,11 @@ fn loadVcVars(scratch: std.mem.Allocator, vcvars_path: []const u8) !void {
             var offset: usize = paths_start;
             while (scanPath(line, offset, paths_limit)) |scan| {
                 if (!std.mem.startsWith(u8, line[offset..], dp0)) errExit(
-                    "{s}:{}: invalid path list, expected '{s}' at offset {} but got '{s}'",
+                    "{f}:{}: invalid path list, expected '{s}' at offset {} but got '{s}'",
                     .{ vcvars_path, lineno, dp0, offset, line[offset..scan.path_end] },
                 );
                 if (offset != paths_start) new_paths_len += 1; // ';' separator
-                new_paths_len += root_dir_len + 1;
+                new_paths_len += root_dir.len + 1;
                 const path_len_wtf16 = try std.unicode.calcWtf16LeLen(line[offset + dp0.len .. scan.path_end]);
                 new_paths_len += path_len_wtf16;
                 offset = scan.next_offset;
@@ -249,11 +270,8 @@ fn loadVcVars(scratch: std.mem.Allocator, vcvars_path: []const u8) !void {
                     new_value[new_value_offset] = ';';
                     new_value_offset += 1;
                 }
-                {
-                    const len = try std.unicode.wtf8ToWtf16Le(new_value[new_value_offset..], root_dir);
-                    std.debug.assert(len == root_dir_len);
-                    new_value_offset += len;
-                }
+                @memcpy(new_value[new_value_offset..][0..root_dir.len], root_dir);
+                new_value_offset += root_dir.len;
                 new_value[new_value_offset] = '\\';
                 new_value_offset += 1;
                 const path_len_wtf16 = try std.unicode.wtf8ToWtf16Le(new_value[new_value_offset..], line[offset + dp0.len .. scan.path_end]);
@@ -341,23 +359,162 @@ fn scanPath(line: []const u8, offset: usize, limit: usize) ?struct {
     return .{ .path_end = line.len, .next_offset = line.len };
 }
 
-fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
-    var stderr_buf: [1000]u8 = undefined;
-    var stderr: File15.Writer = .initStreaming(stderrFile(), &stderr_buf);
-    const maybe_err: ?File15.WriteError = blk: {
-        stderr.interface.print(fmt ++ "\n", args) catch break :blk stderr.err.?;
-        stderr.interface.flush() catch break :blk stderr.err.?;
-        break :blk null;
-    };
-    if (maybe_err) |e| std.debug.panic(
-        "error {s} printing another error to stdout",
-        .{@errorName(e)},
-    );
-    std.process.exit(0xff);
+/// The NT path for a Win32 path, written to buf. Not RtlDosPathNameToNtPathName_U, which fails
+/// for a path of MAX_PATH or more unless the exe's manifest says it's long path aware.
+fn ntPath(path: [:0]const u16, buf: *[win32.PATH_MAX_WIDE]u16) []u16 {
+    const prefix = L("\\??\\");
+    if (std.mem.startsWith(u16, path, L("\\\\?\\")) or std.mem.startsWith(u16, path, prefix)) {
+        // a verbatim path is used as it is
+        if (path.len > buf.len) errExit("path '{f}' is too long", .{std.unicode.fmtUtf16Le(path)});
+        @memcpy(buf[0..path.len], path);
+        buf[0..prefix.len].* = prefix.*;
+        return buf[0..path.len];
+    }
+    // The full path goes where its longest prefix leaves it room: a UNC path's "\\" becomes
+    // "\??\UNC\", which is 6 longer.
+    const unc_prefix = L("\\??\\UNC\\");
+    const full_offset = unc_prefix.len - 2;
+    const full_buf = buf[full_offset..];
+    const full_byte_len = win32.ntdll.RtlGetFullPathName_U(path, @intCast(full_buf.len * 2), full_buf.ptr, null);
+    if (full_byte_len == 0) errExit("invalid path '{f}'", .{std.unicode.fmtUtf16Le(path)});
+    // when the buffer is too small it's the size needed
+    if (full_byte_len > full_buf.len * 2) errExit("path '{f}' is too long", .{std.unicode.fmtUtf16Le(path)});
+    const full = full_buf[0 .. full_byte_len / 2];
+    const end = full_offset + full.len;
+    if (std.mem.startsWith(u16, full, L("\\\\.\\"))) {
+        full[0..prefix.len].* = prefix.*;
+        return full;
+    }
+    if (std.mem.startsWith(u16, full, L("\\\\"))) {
+        buf[0..unc_prefix.len].* = unc_prefix.*;
+        return buf[0..end];
+    }
+    const start = full_offset - prefix.len;
+    buf[start..][0..prefix.len].* = prefix.*;
+    return buf[start..end];
 }
 
-pub fn stderrFile() std.fs.File {
-    return if (zig_atleast_15) std.fs.File.stderr() else std.io.getStdErr();
+/// Opens a file for reading, null if it doesn't exist. Close it with NtClose.
+fn openFile(path: [:0]const u16) ?win32.HANDLE {
+    var nt_path_buf: [win32.PATH_MAX_WIDE]u16 = undefined;
+    const nt_path_slice = ntPath(path, &nt_path_buf);
+    var nt_path: win32.UNICODE_STRING = .{
+        .Length = @intCast(nt_path_slice.len * 2),
+        .MaximumLength = @intCast(nt_path_slice.len * 2),
+        .Buffer = nt_path_slice.ptr,
+    };
+
+    var attributes: win32.OBJECT_ATTRIBUTES = .{
+        .Length = @sizeOf(win32.OBJECT_ATTRIBUTES),
+        .RootDirectory = null,
+        .ObjectName = &nt_path,
+        .Attributes = OBJ_CASE_INSENSITIVE,
+        .SecurityDescriptor = null,
+        .SecurityQualityOfService = null,
+    };
+    var file: win32.HANDLE = undefined;
+    var io_status: win32.IO_STATUS_BLOCK = undefined;
+    switch (win32.ntdll.NtCreateFile(
+        &file,
+        win32.GENERIC_READ | win32.SYNCHRONIZE,
+        &attributes,
+        &io_status,
+        null,
+        win32.FILE_ATTRIBUTE_NORMAL,
+        win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE,
+        win32.FILE_OPEN,
+        win32.FILE_NON_DIRECTORY_FILE | win32.FILE_SYNCHRONOUS_IO_NONALERT,
+        null,
+        0,
+    )) {
+        .SUCCESS => return file,
+        .OBJECT_NAME_NOT_FOUND, .OBJECT_PATH_NOT_FOUND => return null,
+        else => |status| errExit(
+            "open '{f}' failed, status=0x{x}",
+            .{ std.unicode.fmtUtf16Le(path), @intFromEnum(status) },
+        ),
+    }
+}
+
+/// Reads all of an open file, path is for the error messages.
+fn readFile(allocator: std.mem.Allocator, file: win32.HANDLE, path: []const u16) ![]u8 {
+    var io_status: win32.IO_STATUS_BLOCK = undefined;
+    var info: win32.FILE_STANDARD_INFORMATION = undefined;
+    switch (win32.ntdll.NtQueryInformationFile(file, &io_status, &info, @sizeOf(@TypeOf(info)), .FileStandardInformation)) {
+        .SUCCESS => {},
+        else => |status| errExit(
+            "get size of '{f}' failed, status=0x{x}",
+            .{ std.unicode.fmtUtf16Le(path), @intFromEnum(status) },
+        ),
+    }
+    const content = try allocator.alloc(u8, @intCast(info.EndOfFile));
+    errdefer allocator.free(content);
+    var total: usize = 0;
+    while (total < content.len) {
+        const remaining = content[total..];
+        switch (NtReadFile(file, null, null, null, &io_status, remaining.ptr, @intCast(@min(remaining.len, std.math.maxInt(u32))), null, null)) {
+            .SUCCESS => {},
+            else => |status| errExit(
+                "read '{f}' failed after {} of {} bytes, status=0x{x}",
+                .{ std.unicode.fmtUtf16Le(path), total, content.len, @intFromEnum(status) },
+            ),
+        }
+        total += io_status.Information;
+    }
+    return content;
+}
+
+fn writeStderr(bytes: []const u8) error{WriteFailed}!void {
+    const stderr = win32.peb().ProcessParameters.hStdError;
+    var rest = bytes;
+    while (rest.len > 0) {
+        var io_status: win32.IO_STATUS_BLOCK = undefined;
+        var status = NtWriteFile(
+            stderr,
+            null,
+            null,
+            null,
+            &io_status,
+            rest.ptr,
+            @intCast(@min(rest.len, std.math.maxInt(u32))),
+            null,
+            null,
+        );
+        if (status == .PENDING) {
+            // a handle opened for overlapped io, which is signaled when the write is done
+            if (NtWaitForSingleObject(stderr, 0, null) != .SUCCESS) return error.WriteFailed;
+            status = io_status.u.Status;
+        }
+        if (isFailure(status) or io_status.Information == 0) return error.WriteFailed;
+        rest = rest[io_status.Information..];
+    }
+}
+
+fn stderrWriter(buffer: []u8) std15.Io.Writer {
+    return .{ .vtable = &.{ .drain = drainStderr }, .buffer = buffer };
+}
+
+fn drainStderr(w: *std15.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+    try writeStderr(w.buffered());
+    w.end = 0;
+    var written: usize = 0;
+    for (data[0 .. data.len - 1]) |bytes| {
+        try writeStderr(bytes);
+        written += bytes.len;
+    }
+    const last = data[data.len - 1];
+    for (0..splat) |_| try writeStderr(last);
+    return written + splat * last.len;
+}
+
+/// Writes straight to stderr with ntdll, as does everything else in this file that could go
+/// through std's files. This exe is copied next to every tool it wraps, so its size matters.
+fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
+    var buf: [1000]u8 = undefined;
+    var stderr = stderrWriter(&buf);
+    stderr.print(fmt ++ "\n", args) catch {};
+    stderr.flush() catch {};
+    win32.ntdll.RtlExitUserProcess(0xff);
 }
 
 /// Returns a formatter that will print the given error in the following format:
@@ -443,10 +600,12 @@ pub const FORMAT_MESSAGE_OPTIONS = packed struct(u32) {
     _reserved2: u18 = 0,
 };
 
-extern "kernel32" fn CreateJobObjectW(
-    lpJobAttributes: ?*win32.SECURITY_ATTRIBUTES,
-    lpName: ?[*:0]const u16,
-) callconv(.winapi) ?win32.HANDLE;
+const JOB_OBJECT_ALL_ACCESS = 0x1F003F;
+extern "ntdll" fn NtCreateJobObject(
+    JobHandle: *win32.HANDLE,
+    DesiredAccess: u32,
+    ObjectAttributes: ?*anyopaque,
+) callconv(.winapi) win32.NTSTATUS;
 
 pub const JOBOBJECTINFOCLASS = enum(i32) {
     JobObjectExtendedLimitInformation = 9,
@@ -507,20 +666,50 @@ const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
     PeakJobMemoryUsed: usize,
 };
 
-extern "kernel32" fn SetInformationJobObject(
-    hJob: ?win32.HANDLE,
+extern "ntdll" fn NtSetInformationJobObject(
+    JobHandle: win32.HANDLE,
     JobObjectInformationClass: JOBOBJECTINFOCLASS,
-    lpJobObjectInformation: ?*anyopaque,
-    cbJobObjectInformationLength: u32,
-) callconv(.winapi) win32.BOOL;
+    JobObjectInformation: *const anyopaque,
+    JobObjectInformationLength: u32,
+) callconv(.winapi) win32.NTSTATUS;
 
-extern "kernel32" fn AssignProcessToJobObject(
-    hJob: ?win32.HANDLE,
-    hProcess: ?win32.HANDLE,
-) callconv(.winapi) win32.BOOL;
+extern "ntdll" fn NtAssignProcessToJobObject(
+    JobHandle: win32.HANDLE,
+    ProcessHandle: win32.HANDLE,
+) callconv(.winapi) win32.NTSTATUS;
 
-extern "kernel32" fn ResumeThread(
-    hThread: ?win32.HANDLE,
-) callconv(.winapi) u32;
+extern "ntdll" fn NtResumeThread(
+    ThreadHandle: win32.HANDLE,
+    PreviousSuspendCount: ?*u32,
+) callconv(.winapi) win32.NTSTATUS;
 
-extern "kernel32" fn GetCommandLineW() callconv(.winapi) ?[*:0]u16;
+extern "ntdll" fn NtWaitForSingleObject(
+    Handle: win32.HANDLE,
+    Alertable: u8,
+    Timeout: ?*const i64,
+) callconv(.winapi) win32.NTSTATUS;
+
+const OBJ_CASE_INSENSITIVE = 0x40;
+extern "ntdll" fn NtReadFile(
+    FileHandle: win32.HANDLE,
+    Event: ?win32.HANDLE,
+    ApcRoutine: ?*anyopaque,
+    ApcContext: ?*anyopaque,
+    IoStatusBlock: *win32.IO_STATUS_BLOCK,
+    Buffer: [*]u8,
+    Length: u32,
+    ByteOffset: ?*i64,
+    Key: ?*u32,
+) callconv(.winapi) win32.NTSTATUS;
+
+extern "ntdll" fn NtWriteFile(
+    FileHandle: win32.HANDLE,
+    Event: ?win32.HANDLE,
+    ApcRoutine: ?*anyopaque,
+    ApcContext: ?*anyopaque,
+    IoStatusBlock: *win32.IO_STATUS_BLOCK,
+    Buffer: [*]const u8,
+    Length: u32,
+    ByteOffset: ?*i64,
+    Key: ?*u32,
+) callconv(.winapi) win32.NTSTATUS;
