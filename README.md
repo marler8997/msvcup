@@ -4,11 +4,13 @@ A standalone tool for installing the MSVC toolchain and Windows SDK without Visu
 
 ## Why?
 
-The Visual Studio Installer manages thousands of components, modifies the registry, and can take hours to configure. msvcup treats the toolchain as a versioned asset rather than global system state. The build environment is defined by code, not a GUI.
+The Visual Studio Installer manages thousands of components and runs installers that write to the registry and to locations all over the filesystem. msvcup downloads the same `.vsix`, `.msi` and `.cab` packages the Visual Studio Installer does, but instead of running them it extracts their contents into a directory you choose, without executing any installer or other code from the packages. That directory is just files: delete it to uninstall, copy it, or keep several with different versions side by side.
+
+Each install saves a lock file that contains the URL and SHA-256 hash of every package. Commit it to source control and everyone gets the same toolchain.
 
 - **Fast**: Runs in milliseconds when already installed. Put it at the start of every build script.
-- **Reproducible**: Lock file ensures everyone gets the same toolchain.
-- **Isolated**: Every package is installed to its own versioned directory. No registry modifications. No conflicts.
+- **Reproducible**: The lock file pins every download by URL and hash.
+- **Isolated**: Everything goes into one directory. No registry modifications. No installers. No conflicts.
 - **Cross-compilation**: Target x64, arm64, or x86 out of the box.
 - **Minimal**: Download only what's needed to get a working native toolchain/SDK.
 
