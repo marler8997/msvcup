@@ -165,6 +165,12 @@ fn parseRule(text: []const u8, line: u32, diagnostic: *Diagnostic) error{Invalid
         if (field.* != null) return fail(diagnostic, line, "duplicate predicate");
         const pattern = predicate[equals + 1 ..];
         version_captures += try validatePattern(pattern, line, diagnostic);
+        // one spelling, so that two rules can't look different and mean the same thing
+        if (field == &rule.file_name and std.mem.indexOfScalar(u8, pattern, '\\') != null) return fail(
+            diagnostic,
+            line,
+            "use '/' for path separators in a fileName, it matches '\\' too",
+        );
         field.* = pattern;
     }
     if (rule.id == null and rule.version == null and rule.file_name == null) return fail(diagnostic, line, "rule has no predicates");
@@ -214,21 +220,29 @@ pub fn match(self: *const Recipes, attributes: Attributes) Match {
     var found: ?Match.One = null;
     for (self.rules) |*rule| {
         var capture: ?[]const u8 = null;
-        if (!matchOptional(rule.id, attributes.id, &capture)) continue;
-        if (!matchOptional(rule.version, attributes.version, &capture)) continue;
-        if (!matchOptional(rule.file_name, attributes.file_name, &capture)) continue;
+        if (!matchOptional(rule.id, attributes.id, .text, &capture)) continue;
+        if (!matchOptional(rule.version, attributes.version, .text, &capture)) continue;
+        if (!matchOptional(rule.file_name, attributes.file_name, .path, &capture)) continue;
         if (found) |one| return .{ .multiple = .{ one.rule, rule } };
         found = .{ .rule = rule, .package_version = rule.package_version orelse capture.? };
     }
     return if (found) |one| .{ .one = one } else .none;
 }
 
-fn matchOptional(pattern: ?[]const u8, value: []const u8, capture: *?[]const u8) bool {
-    return matchPattern(pattern orelse return true, value, capture);
+const ValueKind = enum {
+    text,
+    /// The manifests spell the same directory with either separator, i.e. the newer sdks have
+    /// "Installers/" where the older ones have "Installers\". A pattern always has '/', parse
+    /// rejects '\', and it matches both.
+    path,
+};
+
+fn matchOptional(pattern: ?[]const u8, value: []const u8, kind: ValueKind, capture: *?[]const u8) bool {
+    return matchPattern(pattern orelse return true, value, kind, capture);
 }
 
 /// Each placeholder consumes as much as it can, there's no backtracking.
-fn matchPattern(pattern_start: []const u8, value_start: []const u8, capture: *?[]const u8) bool {
+fn matchPattern(pattern_start: []const u8, value_start: []const u8, kind: ValueKind, capture: *?[]const u8) bool {
     var pattern = pattern_start;
     var value = value_start;
     while (pattern.len > 0) {
@@ -253,13 +267,33 @@ fn matchPattern(pattern_start: []const u8, value_start: []const u8, capture: *?[
             },
             else => {
                 const end = std.mem.indexOfAny(u8, pattern, "*{") orelse pattern.len;
-                if (!std.mem.startsWith(u8, value, pattern[0..end])) return false;
+                const literal = pattern[0..end];
+                if (!switch (kind) {
+                    .text => std.mem.startsWith(u8, value, literal),
+                    .path => startsWithPath(value, literal),
+                }) return false;
                 pattern = pattern[end..];
                 value = value[end..];
             },
         }
     }
     return value.len == 0;
+}
+
+/// Like std.mem.startsWith but '/' and '\' are the same character.
+fn startsWithPath(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    for (value[0..prefix.len], prefix) |v, p| {
+        if (normalizePathSep(v) != normalizePathSep(p)) return false;
+    }
+    return true;
+}
+
+fn normalizePathSep(c: u8) u8 {
+    return switch (c) {
+        '\\' => '/',
+        else => c,
+    };
 }
 
 /// Returns the length of the longest prefix that's digits separated by single dots.
@@ -401,7 +435,7 @@ test "stars, quotes and literal owner versions" {
     const recipes = try testParse(arena_instance.allocator(),
         \\# a comment
         \\
-        \\sdk-{version}   version={version} "fileName=Installers\Windows SDK Desktop Headers *"
+        \\sdk-{version}   version={version} "fileName=Installers/Windows SDK Desktop Headers *"
         \\msbuild-170 id=Microsoft.Build
         \\msbuild-170 id=Microsoft.VisualStudio.VC.MSBuild.v170.*
     );
@@ -502,3 +536,31 @@ test "parse errors" {
 const std = @import("std");
 const Arch = @import("arch.zig").Arch;
 const MsvcupPackageKind = @import("msvcuppackagekind.zig").MsvcupPackageKind;
+
+test "a slash in a fileName pattern matches either path separator" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const recipes = try testParse(arena_instance.allocator(),
+        \\sdk-{version} version={version} "fileName=Installers/Windows SDK Desktop Headers *"
+        \\cmake-{version} version={version} fileName=a/b/c.msi
+        \\ninja-1 id=a\b
+        \\ninja-2 id=c/d
+    );
+    // the newer sdks have a forward slash where the older ones have a backslash
+    try testExpectOwner(.sdk, "10.0.1", &recipes, .{ .version = "10.0.1", .file_name = "Installers\\Windows SDK Desktop Headers x64-x86_en-us.msi" });
+    try testExpectOwner(.sdk, "10.0.1", &recipes, .{ .version = "10.0.1", .file_name = "Installers/Windows SDK Desktop Headers x64-x86_en-us.msi" });
+    try testExpectOwner(.cmake, "1.2", &recipes, .{ .version = "1.2", .file_name = "a/b/c.msi" });
+    try testExpectOwner(.cmake, "1.2", &recipes, .{ .version = "1.2", .file_name = "a\\b\\c.msi" });
+    try testExpectOwner(.cmake, "1.2", &recipes, .{ .version = "1.2", .file_name = "a\\b/c.msi" });
+    // patterns only have one spelling
+    try testExpectParseError(1, "use '/' for path separators in a fileName, it matches '\\' too", "sdk-1 fileName=a\\b");
+    try testExpectParseError(2, "use '/' for path separators in a fileName, it matches '\\' too", "sdk-1 id=a\nsdk-2 \"fileName=a/b\\c d\"");
+    // a separator only matches a separator
+    try testExpectNone(&recipes, .{ .version = "10.0.1", .file_name = "Installers-Windows SDK Desktop Headers x64-x86_en-us.msi" });
+    try testExpectNone(&recipes, .{ .version = "10.0.1", .file_name = "Installers" });
+    // only in file names, an id or a version isn't a path
+    try testExpectOwner(.ninja, "1", &recipes, .{ .id = "a\\b" });
+    try testExpectNone(&recipes, .{ .id = "a/b" });
+    try testExpectOwner(.ninja, "2", &recipes, .{ .id = "c/d" });
+    try testExpectNone(&recipes, .{ .id = "c\\d" });
+}
