@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) !void {
         else => .x64,
     };
 
-    const release_version = try makeCalVersion();
+    const release_version = try makeCalVersion(b.graph.io);
     const dev_version = b.fmt("{s}-dev", .{release_version});
     const write_files_version = b.addWriteFiles();
     const release_version_file = write_files_version.add("version-release", &release_version);
@@ -32,11 +32,6 @@ pub fn build(b: *std.Build) !void {
                 .single_threaded = true,
             }),
         });
-        if (!zig_atleast_15) {
-            if (b.lazyDependency("iobackport", .{})) |iobackport| {
-                generate_exe.root_module.addImport("std15", iobackport.module("std15"));
-            }
-        }
         const run = b.addRunArtifact(generate_exe);
         run.addFileArg(b.path("extrapkgs.lock"));
         break :blk b.createModule(.{
@@ -65,16 +60,11 @@ pub fn build(b: *std.Build) !void {
             },
         }),
     });
-    if (!zig_atleast_15) {
-        if (b.lazyDependency("iobackport", .{})) |iobackport| {
-            msvcup.root_module.addImport("std15", iobackport.module("std15"));
-        }
-    }
     b.installArtifact(msvcup);
 
     {
         const run = b.addRunArtifact(msvcup);
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         b.step("run", "").dependOn(&run.step);
     }
 
@@ -205,11 +195,7 @@ fn addAutoenvExe(b: *std.Build, cpu: Arch) *std.Build.Step.Compile {
             .pic = true,
         }),
     });
-    if (!zig_atleast_15) {
-        if (b.lazyDependency("iobackport", .{})) |iobackport| {
-            exe.root_module.addImport("std15", iobackport.module("std15"));
-        }
-    }
+    if (b.lazyDependency("wintrace", .{})) |dep| exe.root_module.addImport("wintrace", dep.module("wintrace"));
     return exe;
 }
 
@@ -264,22 +250,22 @@ fn addTests(b: *std.Build, msvcup: *std.Build.Step.Compile, test_step: *std.Buil
         const run = b.addRunArtifact(msvcup);
         run.addArg("list-payloads");
         // this prints about 20,000 lines, capture it to keep it out of the CI logs
-        _ = run.captureStdOut();
+        _ = run.captureStdOut(.{});
         // capturing makes the step cacheable, we still want it to run every time
         run.has_side_effects = true;
         test_step.dependOn(&run.step);
     }
 }
 
-fn makeCalVersion() ![11]u8 {
-    const now = std.time.epoch.EpochSeconds{ .secs = @intCast(std.time.timestamp()) };
+fn makeCalVersion(io: std.Io) ![11]u8 {
+    const now = std.time.epoch.EpochSeconds{ .secs = @intCast(std.Io.Clock.real.now(io).toSeconds()) };
     const day = now.getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     var buf: [11]u8 = undefined;
     const formatted = try std.fmt.bufPrint(&buf, "v{d}_{d:0>2}_{d:0>2}", .{
         year_day.year,
-        @intFromEnum(month_day.month),
+        @backingInt(month_day.month),
         month_day.day_index + 1,
     });
     std.debug.assert(formatted.len == buf.len);
@@ -294,15 +280,9 @@ fn addRelease(
     autoenv_cpu: Arch,
     release_step: *std.Build.Step,
 ) !void {
-    const zip_dep = b.dependency("zipcmdline", .{});
-    const host_zip_exe = b.addExecutable(.{
-        .name = "zip",
-        .root_module = b.createModule(.{
-            .root_source_file = zip_dep.path("src/zip.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
+    // zipcmdline builds its exes with a patched std, so use its artifact, its source doesn't
+    // compile on its own
+    const host_zip_exe = b.dependency("zipcmdline", .{}).artifact("zip");
 
     const ci_targets = [_][]const u8{
         "aarch64-linux",
@@ -349,11 +329,6 @@ fn addRelease(
                 },
             }),
         });
-        if (!zig_atleast_15) {
-            if (b.lazyDependency("iobackport", .{})) |iobackport| {
-                msvcup_exe.root_module.addImport("std15", iobackport.module("std15"));
-            }
-        }
         install_exes.dependOn(
             &b.addInstallArtifact(msvcup_exe, .{ .dest_dir = .{ .override = target_dest_dir } }).step,
         );
@@ -387,44 +362,34 @@ fn makeCiArchiveStep(
     install_exes: *std.Build.Step,
     host_zip_exe: *std.Build.Step.Compile,
 ) *std.Build.Step {
-    const install_path = b.getInstallPath(.prefix, ".");
+    const archive_dir: std.Build.LazyPath = .{ .relative = .{
+        .base = .install_prefix,
+        .sub_path = target_install_dir.custom,
+    } };
 
     if (target.os.tag == .windows) {
-        const out_zip_file = b.pathJoin(&.{
-            install_path,
-            b.fmt("msvcup-{s}.zip", .{ci_target_str}),
-        });
         const zip = b.addRunArtifact(host_zip_exe);
-        zip.addArg(out_zip_file);
+        zip.addFileArg(.{ .relative = .{
+            .base = .install_prefix,
+            .sub_path = b.fmt("msvcup-{s}.zip", .{ci_target_str}),
+        } });
         zip.addArg("msvcup.exe");
         zip.addArg("msvcup.pdb");
-        zip.cwd = .{ .cwd_relative = b.getInstallPath(
-            target_install_dir,
-            ".",
-        ) };
+        zip.setCwd(archive_dir);
         zip.step.dependOn(install_exes);
         return &zip.step;
     }
 
-    const targz = b.pathJoin(&.{
-        install_path,
-        b.fmt("msvcup-{s}.tar.gz", .{ci_target_str}),
-    });
-    const tar = b.addSystemCommand(&.{
-        "tar",
-        "-czf",
-        targz,
-        "msvcup",
-    });
-    tar.cwd = .{ .cwd_relative = b.getInstallPath(
-        target_install_dir,
-        ".",
-    ) };
+    const tar = b.addSystemCommand(&.{ "tar", "-czf" });
+    tar.addFileArg(.{ .relative = .{
+        .base = .install_prefix,
+        .sub_path = b.fmt("msvcup-{s}.tar.gz", .{ci_target_str}),
+    } });
+    tar.addArg("msvcup");
+    tar.setCwd(archive_dir);
     tar.step.dependOn(install_exes);
     return &tar.step;
 }
-
-pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
 
 const builtin = @import("builtin");
 const std = @import("std");
