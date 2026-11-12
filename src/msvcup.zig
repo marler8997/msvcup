@@ -3522,14 +3522,10 @@ fn getPackages(
     // //       and we should cache the result
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     log.debug("parsing '{s}'...", .{vsman.path});
-    const parsed = try std.json.parseFromSlice(std.json.Value, scratch, vsman.content, .{});
+    const parsed = parseVsManifest(scratch, vsman);
     defer parsed.deinit();
-    const json_file: JsonContext.File = .{ .file_path = vsman.path };
-    var json_error: JsonContext.Error = undefined;
-    const file_obj = json_file.as(.object, &json_error, parsed.value) catch errExit("{f}", .{json_error});
-    const packages_field = file_obj.getField(&json_error, "packages") catch errExit("{f}", .{json_error});
-    const packages = packages_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
-    const out_packages = allocator.alloc(Package, packages.items.len + extrapkgs.all.len) catch |e| oom(e);
+    const packages = parsed.value.packages;
+    const out_packages = allocator.alloc(Package, packages.len + extrapkgs.all.len) catch |e| oom(e);
     var out_package_count: usize = 0;
     errdefer {
         for (out_packages[0..out_package_count]) |out_package| {
@@ -3540,16 +3536,9 @@ fn getPackages(
 
     const payload_count: usize = payload_count_blk: {
         var payload_count: usize = 0;
-        for (0..packages.items.len) |pkg_index| {
-            const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{f}", .{json_error});
-            const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
-            const id_field = pkg_obj.getField(&json_error, "id") catch errExit("{f}", .{json_error});
-            const id = id_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
-            const version_field = pkg_obj.getField(&json_error, "version") catch errExit("{f}", .{json_error});
-            const version = version_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
+        for (packages, 0..) |pkg, pkg_index| {
             const language: Language = language_blk: {
-                const language_field = pkg_obj.getOptionalField("language") orelse break :language_blk .neutral;
-                const language = language_field.as(.string, &json_error) catch errExit("{f}", .{json_error});
+                const language = pkg.language orelse break :language_blk .neutral;
                 const en_us = "en-US";
                 if (std.mem.eql(u8, language, "neutral")) break :language_blk .neutral;
                 if (std.mem.eql(u8, language, en_us)) break :language_blk .en_us;
@@ -3557,21 +3546,16 @@ fn getPackages(
                 if (std.ascii.eqlIgnoreCase(language, en_us)) std.debug.panic("new {s} casing '{s}'", .{ en_us, language });
                 std.debug.panic("unknown language '{s}'", .{language});
             };
-            const payloads_offset = payload_count;
-            if (pkg_obj.map.get("payloads")) |payloads_field_node| {
-                const payloads_field: JsonContext.Field = .init(pkg_obj.parent_context, "payloads", payloads_field_node);
-                const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
-                payload_count += payloads.items.len;
-            }
             out_packages[pkg_index] = .{
-                .id = allocator.dupe(u8, id) catch |e| oom(e),
+                .id = allocator.dupe(u8, pkg.id) catch |e| oom(e),
                 // TODO: maybe we should have a string pool for versions?
-                .version = allocator.dupe(u8, version) catch |e| oom(e),
+                .version = allocator.dupe(u8, pkg.version) catch |e| oom(e),
                 .language = language,
                 .source = .manifest,
-                .payloads_offset = payloads_offset,
+                .payloads_offset = payload_count,
             };
             out_package_count += 1;
+            payload_count += pkg.payloads.len;
         }
 
         for (extrapkgs.all) |pkg| {
@@ -3601,25 +3585,23 @@ fn getPackages(
         allocator.free(out_payloads);
     }
 
-    for (0..packages.items.len) |pkg_index| {
+    for (packages, 0..) |pkg, pkg_index| {
         std.debug.assert(out_packages[pkg_index].payloads_offset == out_payload_count);
-        const pkg_obj_element = packages.getElement(&json_error, pkg_index) catch errExit("{f}", .{json_error});
-        const pkg_obj = pkg_obj_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
-        if (pkg_obj.map.get("payloads")) |payloads_field_node| {
-            const payloads_field: JsonContext.Field = .init(pkg_obj.parent_context, "payloads", payloads_field_node);
-            const payloads = payloads_field.as(.array, &json_error) catch errExit("{f}", .{json_error});
-            // payload_count += payloads.items.len;
-            for (0..payloads.items.len) |payload_index| {
-                const payload_element = payloads.getElement(&json_error, payload_index) catch errExit("{f}", .{json_error});
-                const payload_object = payload_element.as(.object, &json_error) catch errExit("{f}", .{json_error});
-                const payload_json = PayloadJson.init(payload_object);
-                out_payloads[out_payload_count] = .{
-                    .url_decoded = allocUrlPercentDecoded(allocator, payload_json.url) catch |e| oom(e),
-                    .sha256 = payload_json.sha256,
-                    .file_name = allocator.dupe(u8, payload_json.fileName) catch |e| oom(e),
-                };
-                out_payload_count += 1;
-            }
+        for (pkg.payloads) |payload| {
+            if (payload.sha256.len != 64) errExit(
+                "{s}: the sha256 '{s}' of payload '{s}' in package '{s}' is {} chars but expected 64",
+                .{ vsman.path, payload.sha256, payload.fileName, pkg.id, payload.sha256.len },
+            );
+            const sha_hex = lowerShaHex(payload.sha256[0..64]);
+            out_payloads[out_payload_count] = .{
+                .url_decoded = allocUrlPercentDecoded(allocator, payload.url) catch |e| oom(e),
+                .sha256 = Sha.parseHex(&sha_hex) orelse errExit(
+                    "{s}: invalid sha256 '{s}' for payload '{s}' in package '{s}'",
+                    .{ vsman.path, payload.sha256, payload.fileName, pkg.id },
+                ),
+                .file_name = allocator.dupe(u8, payload.fileName) catch |e| oom(e),
+            };
+            out_payload_count += 1;
         }
     }
     for (extrapkgs.all) |pkg| {
@@ -3639,6 +3621,43 @@ fn getPackages(
     return .{
         .slice = out_packages,
         .payloads = out_payloads,
+    };
+}
+
+/// The parts of a VS manifest that we read. A manifest is about 17 MB, and parsing all of it
+/// into a std.json.Value takes about 100 MB.
+const VsManifestJson = struct {
+    packages: []const VsPackageJson,
+};
+
+const VsPackageJson = struct {
+    id: []const u8,
+    version: []const u8,
+    language: ?[]const u8 = null,
+    payloads: []const VsPayloadJson = &.{},
+};
+
+const VsPayloadJson = struct {
+    fileName: []const u8,
+    sha256: []const u8,
+    size: u63,
+    url: []const u8,
+};
+
+/// The result references vsman.content.
+fn parseVsManifest(scratch: std.mem.Allocator, vsman: PathAndContent) std.json.Parsed(VsManifestJson) {
+    var scanner: std.json.Scanner = .initCompleteInput(scratch, vsman.content);
+    defer scanner.deinit();
+    var diagnostics: std.json.Diagnostics = .{};
+    scanner.enableDiagnostics(&diagnostics);
+    return std.json.parseFromTokenSource(VsManifestJson, scratch, &scanner, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => |e| oom(e),
+        else => |e| errExit(
+            "{s}:{}:{}: not a VS manifest we can read, parsing it failed with {t}",
+            .{ vsman.path, diagnostics.getLine(), diagnostics.getColumn(), e },
+        ),
     };
 }
 
