@@ -3184,7 +3184,8 @@ const FetchOptions = struct {
 const max_fetch_redirects = 3;
 
 /// The Visual Studio CDN sometimes ends a response early, curl sees it too. The connection
-/// closes normally so the only sign is that we received fewer bytes than Content-Length.
+/// closes normally so the only sign is that we received fewer bytes than Content-Length. A
+/// read that fails, such as when the connection is reset, is tried again the same way.
 const max_fetch_attempts = 3;
 
 fn fetch(
@@ -3216,6 +3217,16 @@ fn fetch(
                     .{ uri, size.expected, size.received, attempt, max_fetch_attempts },
                 );
             },
+            .read_failed => |failure| {
+                if (attempt == max_fetch_attempts) errExit(
+                    "fetch '{f}': read failed with {t} after {} bytes, gave up after {} attempts",
+                    .{ uri, failure.err, failure.received, attempt },
+                );
+                log.warn(
+                    "fetch '{f}': read failed with {t} after {} bytes, retrying (attempt {} of {} failed)",
+                    .{ uri, failure.err, failure.received, attempt, max_fetch_attempts },
+                );
+            },
         }
     }
 }
@@ -3223,6 +3234,7 @@ fn fetch(
 const FetchAttemptResult = union(enum) {
     sha: Sha,
     wrong_size: struct { expected: u64, received: u64 },
+    read_failed: struct { err: anyerror, received: u64 },
 };
 
 fn fetchAttempt(
@@ -3313,15 +3325,15 @@ fn fetchAttempt(
     while (true) {
         var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
         const len = body.readSliceShort(&buf) catch |err| switch (err) {
-            error.ReadFailed => {
-                const read_err: anyerror = if (response.bodyErr()) |e|
+            error.ReadFailed => return .{ .read_failed = .{
+                .err = if (response.bodyErr()) |e|
                     e
                 else if (request.connection) |connection|
                     connection.getReadError() orelse err
                 else
-                    err;
-                std.debug.panic("fetch '{f}': read failed with {t}", .{ uri, read_err });
-            },
+                    err,
+                .received = total_received,
+            } },
         };
         hasher.update(buf[0..len]);
         // NOTE: not going through a buffered writer since we're writing
