@@ -60,6 +60,9 @@ pub fn build(b: *std.Build) !void {
             },
         }),
     });
+    if (target.result.os.tag == .windows) {
+        if (b.lazyDependency("wintrace", .{})) |dep| msvcup.root_module.addImport("wintrace", dep.module("wintrace"));
+    }
     b.installArtifact(msvcup);
 
     {
@@ -329,6 +332,9 @@ fn addRelease(
                 },
             }),
         });
+        if (target.result.os.tag == .windows) {
+            if (b.lazyDependency("wintrace", .{})) |dep| msvcup_exe.root_module.addImport("wintrace", dep.module("wintrace"));
+        }
         install_exes.dependOn(
             &b.addInstallArtifact(msvcup_exe, .{ .dest_dir = .{ .override = target_dest_dir } }).step,
         );
