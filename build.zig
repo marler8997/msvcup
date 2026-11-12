@@ -141,6 +141,25 @@ pub fn build(b: *std.Build) !void {
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
 
+    {
+        const size_test = b.createModule(.{
+            .root_source_file = b.path("src/test-autoenv-size.zig"),
+            .target = b.graph.host,
+        });
+        for ([_]Arch{ .x64, .x86, .arm64 }) |cpu| size_test.addAnonymousImport(
+            b.fmt("autoenv-{s}", .{switch (cpu) {
+                .x64 => "x86_64",
+                .x86 => "x86",
+                .arm64 => "aarch64",
+                .arm => unreachable,
+            }}),
+            .{ .root_source_file = addAutoenvExe(b, cpu).getEmittedBin() },
+        );
+        const step = b.step("test-autoenv-size", "Check the size of autoenv.exe for each arch");
+        step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = size_test })).step);
+        test_step.dependOn(step);
+    }
+
     for ([_]struct { name: []const u8, files: []const []const u8 }{
         .{ .name = "handmade", .files = &.{ "build.bat", "hello.c", "msvc.lock" } },
         .{ .name = "cmake", .files = &.{ "build.bat", "CMakeLists.txt", "hello.c", "msvc.lock" } },
