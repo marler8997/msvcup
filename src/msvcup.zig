@@ -90,11 +90,11 @@ fn help(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, cmd:
     var stdout_buf: [1000]u8 = undefined;
     var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     if (detailed) |text| {
-        stdout.interface.writeAll(text) catch return stdout.err.?;
-        stdout.interface.flush() catch return stdout.err.?;
+        stdout.interface.writeAll(text) catch return stdoutWriteFailed(stdout.err.?);
+        stdout.interface.flush() catch return stdoutWriteFailed(stdout.err.?);
     } else {
         const msvcup_dir: MsvcupDir = try .alloc(environ, arena);
-        writeUsage(&stdout.interface, msvcup_dir) catch return stdout.err.?;
+        writeUsage(&stdout.interface, msvcup_dir) catch return stdoutWriteFailed(stdout.err.?);
     }
     return 0;
 }
@@ -248,11 +248,11 @@ fn listCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocato
     var stdout_buf: [2000]u8 = undefined;
     var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
-    w.writeAll("autoenv\n") catch return stdout.err.?;
+    w.writeAll("autoenv\n") catch return stdoutWriteFailed(stdout.err.?);
     for (msvcup_pkgs.items) |msvcup_pkg| {
-        w.print("{f}\n", .{msvcup_pkg}) catch return stdout.err.?;
+        w.print("{f}\n", .{msvcup_pkg}) catch return stdoutWriteFailed(stdout.err.?);
     }
-    w.flush() catch return stdout.err.?;
+    w.flush() catch return stdoutWriteFailed(stdout.err.?);
     return 0;
 }
 
@@ -278,9 +278,9 @@ fn listChannels(io: std.Io, args: *std.process.Args.Iterator) !u8 {
     var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
     for (Channel.known) |channel| {
-        w.print("{s: <16}{s}\n", .{ channel.asArg(), channel.httpsUrl() }) catch return stdout.err.?;
+        w.print("{s: <16}{s}\n", .{ channel.asArg(), channel.httpsUrl() }) catch return stdoutWriteFailed(stdout.err.?);
     }
-    w.flush() catch return stdout.err.?;
+    w.flush() catch return stdoutWriteFailed(stdout.err.?);
     return 0;
 }
 
@@ -371,9 +371,9 @@ fn listPayloads(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocat
         writePayloadListing(w, owner, switch (pkg.source) {
             .manifest => channel.asArg(),
             .extra => "extra",
-        }, pkg, payload) catch return stdout.err.?;
+        }, pkg, payload) catch return stdoutWriteFailed(stdout.err.?);
     }
-    w.flush() catch return stdout.err.?;
+    w.flush() catch return stdoutWriteFailed(stdout.err.?);
     return 0;
 }
 
@@ -581,8 +581,8 @@ fn fetchCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocat
         try finishCacheFetch(io, scratch, cache_dir, config.url, sha256, &atomic_file);
         var stdout_buf: [80]u8 = undefined;
         var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
-        stdout.interface.print("{f}\n", .{sha256}) catch return stdout.err.?;
-        stdout.interface.flush() catch return stdout.err.?;
+        stdout.interface.print("{f}\n", .{sha256}) catch return stdoutWriteFailed(stdout.err.?);
+        stdout.interface.flush() catch return stdoutWriteFailed(stdout.err.?);
     }
     return 0;
 }
@@ -3766,6 +3766,13 @@ fn insertSorted(
         .already_inserted => return,
         .not_inserted => |i| try list.insert(allocator, i, item),
     }
+}
+
+/// What to return when a write to stdout failed. When whoever was reading it went away, as in
+/// "msvcup list-payloads | head -1", there's no error to report and nothing left to write.
+fn stdoutWriteFailed(err: std.Io.File.Writer.Error) std.Io.File.Writer.Error {
+    if (err == error.BrokenPipe) std.process.exit(1);
+    return err;
 }
 
 pub fn stdoutFile() std.Io.File {
