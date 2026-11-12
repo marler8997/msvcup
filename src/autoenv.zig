@@ -379,6 +379,11 @@ fn ntPath(path: [:0]const u16, buf: *[std.os.windows.PATH_MAX_WIDE]u16) []u16 {
     const full = full_buf[0 .. full_byte_len / 2];
     const end = full_offset + full.len;
     if (std.mem.startsWith(u16, full, L("\\\\.\\"))) {
+        // a name like NUL or COM1 becomes a device path, opening it would succeed and read nothing
+        if (!isDevicePath(path)) errExit(
+            "'{f}' is a device, not a file",
+            .{std.unicode.fmtUtf16Le(path)},
+        );
         full[0..prefix.len].* = prefix.*;
         return full;
     }
@@ -389,6 +394,16 @@ fn ntPath(path: [:0]const u16, buf: *[std.os.windows.PATH_MAX_WIDE]u16) []u16 {
     const start = full_offset - prefix.len;
     buf[start..][0..prefix.len].* = prefix.*;
     return buf[start..end];
+}
+
+/// Whether a path starts with "\\.\", with either separator.
+fn isDevicePath(path: []const u16) bool {
+    if (path.len < 4 or path[2] != '.') return false;
+    for ([_]u16{ path[0], path[1], path[3] }) |c| switch (c) {
+        '\\', '/' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// Opens a file for reading, null if it doesn't exist. Close it with NtClose.
