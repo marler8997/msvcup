@@ -6,7 +6,26 @@ const global = struct {
     var string_pool: StringPool = undefined;
 };
 
+pub const panic = if (builtin.os.tag == .windows) wintrace.panic else std.debug.FullPanic(std.debug.defaultPanic);
+pub const wintrace_options: wintrace.Options = .{ .mode = .symbolize };
+pub const std_options: std.Options = .{ .enable_segfault_handler = builtin.os.tag != .windows };
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
+    if (builtin.os.tag == .windows) {
+        if (wintrace.SetUnhandledExceptionFilter(&wintrace.unhandledExceptionFilter) != null) unreachable;
+        var guarantee: u32 = wintrace.stack_guarantee;
+        if (wintrace.SetThreadStackGuarantee(&guarantee) == 0) std.debug.panic(
+            "SetThreadStackGuarantee failed, error={d}",
+            .{std.os.windows.GetLastError()},
+        );
+    }
+    return run(init) catch |err| {
+        if (builtin.os.tag == .windows) wintrace.exitWithErrorTrace(err, @errorReturnTrace());
+        return err;
+    };
+}
+
+fn run(init: std.process.Init.Minimal) !u8 {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
     global.string_pool = .init(arena);
@@ -3854,6 +3873,7 @@ fn initProxies(environ: std.process.Environ, client: *std.http.Client, arena: st
 const builtin = @import("builtin");
 const std = @import("std");
 const extrapkgs = @import("extrapkgs");
+const wintrace = @import("wintrace");
 const Channel = @import("channel.zig").Channel;
 const Arch = @import("arch.zig").Arch;
 const Arches = @import("arch.zig").Arches;
