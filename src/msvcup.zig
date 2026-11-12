@@ -40,39 +40,29 @@ fn run(init: std.process.Init.Minimal) !u8 {
         std.debug.unlockStderr();
     }
 
-    const all_args: [][]const u8 = blk: {
-        const args_array = try init.args.toSlice(arena);
-        const all_args = try arena.alloc([]const u8, args_array.len -| 1);
-        for (all_args, args_array[@min(1, args_array.len)..]) |*dst, src| dst.* = src;
-        break :blk all_args;
-    };
-
-    const cmd, const args = cmd_args_blk: {
-        const cmd_arg_index: usize = cmd_arg_index_blk: {
-            var arg_index: usize = 0;
-            while (true) : (arg_index += 1) {
-                if (arg_index == all_args.len) try usage(io, environ, arena);
-                const arg = all_args[arg_index];
-                if (isHelpArg(arg)) return help(io, environ, arena, for (all_args[arg_index + 1 ..]) |a| {
-                    if (!std.mem.startsWith(u8, a, "-")) break a;
-                } else null);
-                if (!std.mem.startsWith(u8, arg, "-")) break :cmd_arg_index_blk arg_index;
-                errExit("TODO: add support for specifying options before command", .{});
-            }
-        };
-        const cmd = all_args[cmd_arg_index];
-        for (cmd_arg_index + 1..all_args.len) |i| {
-            if (isHelpArg(all_args[i])) return help(io, environ, arena, cmd);
-            all_args[i - 1] = all_args[i];
+    const cmd = cmd: {
+        var args = try init.args.iterateAllocator(arena);
+        _ = args.skip();
+        const first = args.next() orelse try usage(io, environ, arena);
+        if (isHelpArg(first)) return help(io, environ, arena, while (args.next()) |arg| {
+            if (!std.mem.startsWith(u8, arg, "-")) break arg;
+        } else null);
+        if (std.mem.startsWith(u8, first, "-")) errExit("TODO: add support for specifying options before command", .{});
+        // a help option anywhere after the command asks for the command's help
+        while (args.next()) |arg| {
+            if (isHelpArg(arg)) return help(io, environ, arena, first);
         }
-        break :cmd_args_blk .{ cmd, all_args[0 .. all_args.len - 1] };
+        break :cmd first;
     };
-    if (std.mem.eql(u8, cmd, "install")) return install(io, environ, arena, args);
-    if (std.mem.eql(u8, cmd, "list")) return listCommand(io, environ, arena, args);
-    if (std.mem.eql(u8, cmd, "list-channels")) return listChannels(io, args);
-    if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(io, environ, arena, args);
-    if (std.mem.eql(u8, cmd, "msi")) return msiCommand(io, arena, args);
-    if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(io, environ, arena, args);
+    var args = try init.args.iterateAllocator(arena);
+    _ = args.skip();
+    _ = args.skip();
+    if (std.mem.eql(u8, cmd, "install")) return install(io, environ, arena, &args);
+    if (std.mem.eql(u8, cmd, "list")) return listCommand(io, environ, arena, &args);
+    if (std.mem.eql(u8, cmd, "list-channels")) return listChannels(io, &args);
+    if (std.mem.eql(u8, cmd, "list-payloads")) return listPayloads(io, environ, arena, &args);
+    if (std.mem.eql(u8, cmd, "msi")) return msiCommand(io, arena, &args);
+    if (std.mem.eql(u8, cmd, "fetch")) return fetchCommand(io, environ, arena, &args);
     log.err("unknown command '{s}'", .{cmd});
     return 0xff;
 }
@@ -217,17 +207,13 @@ fn arenaIsEmpty(arena: std.heap.ArenaAllocator) bool {
     return arena.state.end_index == 0;
 }
 
-fn listCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn listCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     // TODO: accept the "--manifest-update-*" arguments
     var channel = Channel.default;
     {
-        var arg_index: usize = 0;
-        while (arg_index < args.len) : (arg_index += 1) {
-            const arg = args[arg_index];
+        while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--channel")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--channel missing argument", .{});
-                channel = parseChannel(args[arg_index]);
+                channel = parseChannel(args.next() orelse errExit("--channel missing argument", .{}));
             } else errExit("list: unknown argument '{s}'", .{arg});
         }
     }
@@ -286,8 +272,8 @@ fn parseChannel(arg: []const u8) Channel {
     return channel;
 }
 
-fn listChannels(io: std.Io, args: []const []const u8) !u8 {
-    if (args.len != 0) errExit("list-channels: unknown argument '{s}'", .{args[0]});
+fn listChannels(io: std.Io, args: *std.process.Args.Iterator) !u8 {
+    if (args.next()) |arg| errExit("list-channels: unknown argument '{s}'", .{arg});
     var stdout_buf: [1000]u8 = undefined;
     var stdout = stdoutFile().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
@@ -338,16 +324,12 @@ const list_payloads_help =
     \\
 ;
 
-fn listPayloads(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn listPayloads(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     var channel = Channel.default;
     {
-        var arg_index: usize = 0;
-        while (arg_index < args.len) : (arg_index += 1) {
-            const arg = args[arg_index];
+        while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--channel")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--channel missing argument", .{});
-                channel = parseChannel(args[arg_index]);
+                channel = parseChannel(args.next() orelse errExit("--channel missing argument", .{}));
             } else errExit("list-payloads: unknown argument '{s}'", .{arg});
         }
     }
@@ -500,7 +482,7 @@ fn recipeOwner(recipes: *const Recipes, pkg: *const Package, payload: *const Pay
     };
 }
 
-fn msiCommand(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn msiCommand(io: std.Io, arena: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     const root_node = std.Progress.start(io, .{ .root_name = "msvcup msi" });
     defer root_node.end();
 
@@ -508,9 +490,7 @@ fn msiCommand(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !u
         var maybe_msi_path: ?[]const u8 = null;
         var maybe_install_path: ?[]const u8 = null;
 
-        var arg_index: usize = 0;
-        while (arg_index < args.len) : (arg_index += 1) {
-            const arg = args[arg_index];
+        while (args.next()) |arg| {
             if (!std.mem.startsWith(u8, arg, "-")) {
                 if (maybe_msi_path == null) {
                     maybe_msi_path = arg;
@@ -542,7 +522,7 @@ fn msiCommand(io: std.Io, arena: std.mem.Allocator, args: []const []const u8) !u
     return 0;
 }
 
-fn fetchCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn fetchCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     const root_node = std.Progress.start(io, .{ .root_name = "msvcup fetch" });
     defer root_node.end();
 
@@ -553,16 +533,12 @@ fn fetchCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocat
     const config: Config = blk_config: {
         var url: ?[]const u8 = null;
         var cache_dir: ?[]const u8 = null;
-        var arg_index: usize = 0;
-        while (arg_index < args.len) : (arg_index += 1) {
-            const arg = args[arg_index];
+        while (args.next()) |arg| {
             if (!std.mem.startsWith(u8, arg, "-")) {
                 if (url != null) errExit("too many cmdline args, expected 1 URL", .{});
                 url = arg;
             } else if (std.mem.eql(u8, arg, "--cache-dir")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
-                cache_dir = args[arg_index];
+                cache_dir = args.next() orelse errExit("--cache-dir missing argument", .{});
             } else errExit("unknown cmdline argument '{s}'", .{arg});
         }
         break :blk_config .{
@@ -721,7 +697,7 @@ fn defaultLockFile(allocator: std.mem.Allocator, install_dir: []const u8) error{
     return try std.fmt.allocPrint(allocator, "{s}.lock", .{dir});
 }
 
-fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: []const []const u8) !u8 {
+fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     const Config = struct {
         install_dir: []const u8,
         autoenv: bool,
@@ -742,9 +718,7 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
         var cache_dir: ?[]const u8 = null;
         var msiexec: bool = false;
 
-        var arg_index: usize = 0;
-        while (arg_index < args.len) : (arg_index += 1) {
-            const arg = args[arg_index];
+        while (args.next()) |arg| {
             if (!std.mem.startsWith(u8, arg, "-")) {
                 if (maybe_install_dir == null) {
                     maybe_install_dir = arg;
@@ -762,9 +736,7 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
                     .invalid_version => |v| errExit("package '{s}' has invalid version '{s}'", .{ arg, v }),
                 }
             } else if (std.mem.eql(u8, arg, "--lock-file")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--lock-file missing argument", .{});
-                maybe_lock_file = args[arg_index];
+                maybe_lock_file = args.next() orelse errExit("--lock-file missing argument", .{});
             } else if (std.mem.eql(u8, arg, "--manifest-update-off")) {
                 maybe_manifest_update = .off;
             } else if (std.mem.eql(u8, arg, "--manifest-update-daily")) {
@@ -772,13 +744,9 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
             } else if (std.mem.eql(u8, arg, "--manifest-update-always")) {
                 maybe_manifest_update = .always;
             } else if (std.mem.eql(u8, arg, "--channel")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--channel missing argument", .{});
-                channel = parseChannel(args[arg_index]);
+                channel = parseChannel(args.next() orelse errExit("--channel missing argument", .{}));
             } else if (std.mem.eql(u8, arg, "--cache-dir")) {
-                arg_index += 1;
-                if (arg_index == args.len) errExit("--cache-dir missing argument", .{});
-                cache_dir = args[arg_index];
+                cache_dir = args.next() orelse errExit("--cache-dir missing argument", .{});
             } else if (std.mem.eql(u8, arg, "--msiexec")) {
                 msiexec = true;
             } else errExit("unknown cmdline argument '{s}'", .{arg});
