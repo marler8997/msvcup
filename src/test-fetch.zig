@@ -9,6 +9,9 @@ const Response = enum {
     short,
     /// a different file than the lock file expects
     wrong,
+    /// a chunked response that closes the connection in the middle of a chunk, which fails the
+    /// read on the other end
+    truncated_chunk,
 };
 
 const Route = struct {
@@ -46,6 +49,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ .path = "/mismatch/p.vsix", .first = &.{.wrong} },
         .{ .path = "/concurrent-mismatch/p.vsix", .first = &.{.wrong}, .delay_ms = 500 },
         .{ .path = "/crash/p.vsix" },
+        .{ .path = "/read-retry/p.vsix", .first = &.{.truncated_chunk} },
+        .{ .path = "/read-gives-up/p.vsix", .first = &.{ .truncated_chunk, .truncated_chunk, .truncated_chunk } },
     };
     const payload_sha = shaHex(&payload_zip);
     const wrong_sha = shaHex(&wrong_zip);
@@ -79,6 +84,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try test_env.givesUp();
     try test_env.mismatch();
     try test_env.crashLeftover();
+    try test_env.readRetry();
+    try test_env.readGivesUp();
 
     // the server thread is blocked in accept, closing its socket from here can hang
     std.process.exit(0);
@@ -282,6 +289,31 @@ const Env = struct {
         try env.expectCache("crash", &.{env.payload_name});
         try env.expectFile(try std.fmt.allocPrint(env.arena, "crash/{s}", .{env.payload_name}), &payload_zip);
     }
+
+    /// A download whose read fails gets tried again.
+    fn readRetry(env: Env) !void {
+        try env.work_dir.createDir(env.io, "read-retry", .default_dir);
+        try env.writeLock("read-retry.lock", "/read-retry/p.vsix");
+        try env.expectInstalled("read-retry", "read-retry-inst", "read-retry.lock");
+        const count = routeNamed(env.routes, "/read-retry/p.vsix").request_count.load(.acquire);
+        if (count != 2) fail("read-retry made {} requests, expected 2", .{count});
+        try env.expectCache("read-retry", &.{env.payload_name});
+        try env.expectFile(try std.fmt.allocPrint(env.arena, "read-retry/{s}", .{env.payload_name}), &payload_zip);
+    }
+
+    /// A read that keeps failing is an error with a message, not a panic, and leaves no payload.
+    fn readGivesUp(env: Env) !void {
+        try env.work_dir.createDir(env.io, "read-gives-up", .default_dir);
+        try env.writeLock("read-gives-up.lock", "/read-gives-up/p.vsix");
+        const result = try env.run("read-gives-up", "read-gives-up-inst", "read-gives-up.lock");
+        if (result.term != .exited or result.term.exited != 0xff) fail("expected failure but got {}:\n{s}", .{ result.term, result.stderr });
+        if (std.mem.indexOf(u8, result.stderr, "read failed with") == null or
+            std.mem.indexOf(u8, result.stderr, "gave up") == null) fail("wrong error:\n{s}", .{result.stderr});
+        const count = routeNamed(env.routes, "/read-gives-up/p.vsix").request_count.load(.acquire);
+        if (count != 3) fail("read-gives-up made {} requests, expected 3", .{count});
+        try env.expectInstalled("read-gives-up", "read-gives-up-inst", "read-gives-up.lock");
+        try env.expectCache("read-gives-up", &.{env.payload_name});
+    }
 };
 
 /// A bug here could easily be a hang, this fails with a clear message rather than waiting for CI
@@ -331,9 +363,16 @@ fn handleRequest(io: std.Io, reader: *std.Io.Reader, writer: *std.Io.Writer, rou
 
     const response: Response = if (request_index < route.first.len) route.first[request_index] else .payload;
     const body: []const u8 = switch (response) {
-        .payload, .short => &payload_zip,
+        .payload, .short, .truncated_chunk => &payload_zip,
         .wrong => &wrong_zip,
     };
+    if (response == .truncated_chunk) {
+        try writer.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        try writer.print("{x}\r\n", .{body.len});
+        try writer.writeAll(body[0 .. body.len / 2]);
+        try writer.flush();
+        return;
+    }
     var header_buf: [200]u8 = undefined;
     const header = try std.fmt.bufPrint(
         &header_buf,
