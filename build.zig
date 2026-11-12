@@ -116,6 +116,23 @@ pub fn build(b: *std.Build) !void {
     }
     {
         const exe = b.addExecutable(.{
+            .name = "test-manifest",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/test-manifest.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        run.addArtifactArg(msvcup);
+        _ = run.addOutputDirectoryArg("manifest");
+        run.has_side_effects = true;
+        const step = b.step("test-manifest", "Read complete and cut short manifests from the data directory");
+        step.dependOn(&run.step);
+        test_step.dependOn(step);
+    }
+    {
+        const exe = b.addExecutable(.{
             .name = "test-lockfile",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/test-lockfile.zig"),

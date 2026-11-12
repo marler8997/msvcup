@@ -3655,7 +3655,7 @@ fn parseVsManifest(scratch: std.mem.Allocator, vsman: PathAndContent) std.json.P
     }) catch |err| switch (err) {
         error.OutOfMemory => |e| oom(e),
         else => |e| errExit(
-            "{s}:{}:{}: not a VS manifest we can read, parsing it failed with {t}",
+            "{s}:{}:{}: not a VS manifest we can read, parsing it failed with {t}, delete it to have it downloaded again",
             .{ vsman.path, diagnostics.getLine(), diagnostics.getColumn(), e },
         ),
     };
