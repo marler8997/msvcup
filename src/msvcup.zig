@@ -220,7 +220,7 @@ fn listCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocato
 
     const recipes = parseBuiltinRecipes(arena);
 
-    const root_node = std.Progress.start(io, .{ .root_name = "msvcup list-versions" });
+    const root_node = std.Progress.start(io, .{ .root_name = "msvcup list" });
     defer root_node.end();
 
     var scratch_instance: ScratchAllocator = .init();
