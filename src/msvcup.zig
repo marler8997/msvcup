@@ -108,7 +108,8 @@ fn writeUsage(w: *std.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!void 
         \\Commands:
         \\--------------------------------------------------------------------------------
         \\
-        \\  list [--channel CHANNEL]  | List all PKGS.
+        \\  list [--channel CHANNEL] [RecipeOptions]
+        \\                            | List all PKGS.
         \\  list-channels             | List the known channels with their URLs.
         \\  install DIR PKGS...       | Install the given PKGS to the given DIR. PKGS are
         \\                            | are of the form:
@@ -116,9 +117,22 @@ fn writeUsage(w: *std.Io.Writer, msvcup_dir: MsvcupDir) error{WriteFailed}!void 
         \\                            |      <PKG_NAME>-<VERSION>
         \\                            |
         \\                            | installed to {[install_dir]s}.
-        \\  list-payloads [--channel CHANNEL]
+        \\  list-payloads [--channel CHANNEL] [RecipeOptions]
         \\                            | List all payloads and their msvcup package.
         \\  msi MSI DIR               | Invoke builtin msi installer.
+        \\
+        \\RecipeOptions (list, list-payloads and install):
+        \\--------------------------------------------------------------------------------
+        \\  --add-recipes FILE        | Add the rules in FILE to the recipes that select
+        \\                            | which payloads belong to which package. A rule's
+        \\                            | package can be one only recipes make, a plain set
+        \\                            | of payloads, installed without an environment.
+        \\                            | Can be given more than once.
+        \\  --no-builtin-recipes      | Leave out msvcup's own recipes, i.e. so FILE can
+        \\                            | select payloads they already do: a payload
+        \\                            | matching more than one rule is an error.
+        \\  The lock file records both: it's updated when they aren't the ones it was
+        \\  made with.
         \\
         \\InstallOptions:
         \\--------------------------------------------------------------------------------
@@ -210,15 +224,16 @@ fn arenaIsEmpty(arena: std.heap.ArenaAllocator) bool {
 fn listCommand(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     // TODO: accept the "--manifest-update-*" arguments
     var channel = Channel.default;
+    var recipe_options: RecipeOptions = .{};
     {
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--channel")) {
                 channel = parseChannel(args.next() orelse errExit("--channel missing argument", .{}));
-            } else errExit("list: unknown argument '{s}'", .{arg});
+            } else if (!recipe_options.parseArg(arena, arg, args)) errExit("list: unknown argument '{s}'", .{arg});
         }
     }
 
-    const recipes = parseBuiltinRecipes(arena);
+    const recipes = loadRecipes(io, arena, &recipe_options).all;
 
     const root_node = std.Progress.start(io, .{ .root_name = "msvcup list" });
     defer root_node.end();
@@ -285,7 +300,7 @@ fn listChannels(io: std.Io, args: *std.process.Args.Iterator) !u8 {
 }
 
 const list_payloads_help =
-    \\Usage: msvcup list-payloads [--channel CHANNEL]
+    \\Usage: msvcup list-payloads [--channel CHANNEL] [--add-recipes FILE]... [--no-builtin-recipes]
     \\
     \\Lists every payload in the Visual Studio manifest (plus msvcup's builtin
     \\extra packages) along with the msvcup package that owns it, one payload
@@ -326,15 +341,16 @@ const list_payloads_help =
 
 fn listPayloads(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, args: *std.process.Args.Iterator) !u8 {
     var channel = Channel.default;
+    var recipe_options: RecipeOptions = .{};
     {
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--channel")) {
                 channel = parseChannel(args.next() orelse errExit("--channel missing argument", .{}));
-            } else errExit("list-payloads: unknown argument '{s}'", .{arg});
+            } else if (!recipe_options.parseArg(arena, arg, args)) errExit("list-payloads: unknown argument '{s}'", .{arg});
         }
     }
 
-    const recipes = parseBuiltinRecipes(arena);
+    const recipes = loadRecipes(io, arena, &recipe_options).all;
 
     const root_node = std.Progress.start(io, .{ .root_name = "msvcup list-payloads" });
     defer root_node.end();
@@ -364,10 +380,10 @@ fn listPayloads(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocat
     for (sorted) |payload_index| {
         const pkg = &pkgs.slice[pkgs.pkgIndexFromPayloadIndex(payload_index).int()];
         const payload = &pkgs.payloads[payload_index.int()];
-        const owner: []const u8 = if (recipeOwner(&recipes, pkg, payload)) |o|
-            MsvcupPackage.initStr(o.rule.package, o.package_version).poolString().slice
+        const owner: ?MsvcupPackage = if (recipeOwner(&recipes, pkg, payload)) |o|
+            .initStr(o.rule.package, o.package_version)
         else
-            "-";
+            null;
         writePayloadListing(w, owner, switch (pkg.source) {
             .manifest => channel.asArg(),
             .extra => "extra",
@@ -379,12 +395,16 @@ fn listPayloads(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocat
 
 fn writePayloadListing(
     w: *std.Io.Writer,
-    owner: []const u8,
+    maybe_owner: ?MsvcupPackage,
     channel_arg: []const u8,
     pkg: *const Package,
     payload: *const Payload,
 ) error{WriteFailed}!void {
-    try w.print("{s: <20}", .{owner});
+    const owner_column = 20;
+    if (maybe_owner) |owner| {
+        try w.print("{f}", .{owner});
+        try w.splatByteAll(' ', owner_column -| owner.formatLen());
+    } else try w.print("{s: <" ++ std.fmt.comptimePrint("{}", .{owner_column}) ++ "}", .{"-"});
     try writeListingAttr(w, "channel", channel_arg, pkg, payload);
     try writeListingAttr(w, "lang", pkg.language.name(), pkg, payload);
     try writeListingAttr(w, "id", pkg.id, pkg, payload);
@@ -422,17 +442,20 @@ const PayloadListingOrder = struct {
     }
 };
 
-// TODO: expose this documentation in a follow-up when we expose the ability to
-//       read/add recipes
+// TODO: expose this documentation, someone writing a file for --add-recipes has nowhere
+//       to read it
 //
-// Recipes select which manifest payloads belong to which msvcup package.
+// Recipes select which manifest payloads belong to which msvcup package. msvcup's own are
+// recipes.txt, --add-recipes adds a file's and --no-builtin-recipes leaves msvcup's out.
 //
 // Each rule is one line, an owner followed by predicates that must all match:
 //
 //     OWNER NAME=PATTERN...
 //
 // OWNER is PACKAGE-VERSION where VERSION is either a literal or {version}, which
-// takes the value captured by the {version} in one of the patterns. NAME is one of
+// takes the value captured by the {version} in one of the patterns. PACKAGE is one of
+// msvcup's (msvc, sdk, ...) or any other name of lowercase letters and digits: a package
+// only recipes make, its payloads installed without setting up an environment. NAME is one of
 // the attributes shown by "msvcup list-payloads": id, version or fileName. A
 // NAME=PATTERN containing whitespace is wrapped in double quotes.
 //
@@ -450,15 +473,88 @@ const PayloadListingOrder = struct {
 //
 // Only payloads of neutral and en-US packages can match. A payload can belong to at
 // most one msvcup package, it's an error if more than one rule matches it.
-fn parseBuiltinRecipes(arena: std.mem.Allocator) Recipes {
+const RecipeOptions = struct {
+    builtin: bool = true,
+    files: std.ArrayList(File) = .empty,
+
+    const File = struct {
+        path: []const u8,
+        /// Read by loadRecipes into memory that's never freed, the rules reference it.
+        text: []const u8 = "",
+        rule_count: usize = 0,
+    };
+
+    /// Takes `arg`, and its value from `args`, if it's a recipe option.
+    fn parseArg(o: *RecipeOptions, arena: std.mem.Allocator, arg: []const u8, args: *std.process.Args.Iterator) bool {
+        if (std.mem.eql(u8, arg, "--add-recipes")) {
+            const path = args.next() orelse errExit("--add-recipes missing argument", .{});
+            o.files.append(arena, .{ .path = path }) catch |e| oom(e);
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--no-builtin-recipes")) {
+            o.builtin = false;
+            return true;
+        }
+        return false;
+    }
+};
+
+/// The recipes a command uses. A lock file is made from all of them so it records the ones
+/// that are up to the command line, `builtin` and `added`, and is only good for the same ones.
+const LoadedRecipes = struct {
+    all: Recipes,
+    /// Whether msvcup's own recipes are in `all`, they're first.
+    builtin: bool,
+    /// The rules of the --add-recipes files in the order given, the rest of `all`.
+    added: []const Recipes.Rule,
+};
+
+/// Allocates the text of each file and one array of every rule, which stay in use until
+/// msvcup exits: there's nothing here to free.
+fn loadRecipes(io: std.Io, arena: std.mem.Allocator, options: *RecipeOptions) LoadedRecipes {
+    if (!options.builtin and options.files.items.len == 0) errExit(
+        "--no-builtin-recipes leaves no recipes without --add-recipes FILE",
+        .{},
+    );
+    // not just "recipes.txt", a file given to --add-recipes can have that name
+    const builtin_name = "builtin recipes.txt";
+    const builtin_text = @embedFile("recipes.txt");
+    const builtin_count = if (options.builtin) Recipes.countRules(builtin_text) else 0;
+
+    var count = builtin_count;
+    for (options.files.items) |*file| {
+        file.text = blk: {
+            const handle = std.Io.Dir.cwd().openFile(io, file.path, .{}) catch |e| errExit(
+                "open recipes '{s}' failed with {s}",
+                .{ file.path, @errorName(e) },
+            );
+            defer handle.close(io);
+            break :blk readToEndAlloc(io, handle, arena) catch |err| switch (err) {
+                error.OutOfMemory => |e| oom(e),
+                else => |e| errExit("read recipes '{s}' failed with {s}", .{ file.path, @errorName(e) }),
+            };
+        };
+        file.rule_count = Recipes.countRules(file.text);
+        if (file.rule_count == 0) errExit("recipes '{s}' has no rules", .{file.path});
+        count += file.rule_count;
+    }
+
+    const rules = arena.alloc(Recipes.Rule, count) catch |e| oom(e);
     var diagnostic: Recipes.Diagnostic = .{};
-    return Recipes.parse(arena, @embedFile("recipes.txt"), &diagnostic) catch |err| switch (err) {
-        error.OutOfMemory => |e| oom(e),
+    if (options.builtin) Recipes.parseInto(rules[0..builtin_count], &global.string_pool, builtin_name, builtin_text, &diagnostic) catch |err| switch (err) {
         error.InvalidRecipes => std.debug.panic(
-            "builtin recipes.txt:{}: {s}",
-            .{ diagnostic.line, diagnostic.message },
+            "{s}:{}: {s}",
+            .{ builtin_name, diagnostic.line, diagnostic.message },
         ),
     };
+    var rest = rules[builtin_count..];
+    for (options.files.items) |file| {
+        Recipes.parseInto(rest[0..file.rule_count], &global.string_pool, file.path, file.text, &diagnostic) catch |err| switch (err) {
+            error.InvalidRecipes => errExit("{s}:{}: {s}", .{ file.path, diagnostic.line, diagnostic.message }),
+        };
+        rest = rest[file.rule_count..];
+    }
+    return .{ .all = .{ .rules = rules }, .builtin = options.builtin, .added = rules[builtin_count..] };
 }
 
 /// Returns the msvcup package that the given payload belongs to, if any. A
@@ -475,9 +571,9 @@ fn recipeOwner(recipes: *const Recipes, pkg: *const Package, payload: *const Pay
     })) {
         .none => null,
         .one => |one| one,
-        .multiple => |rules| std.debug.panic(
-            "payload '{s}' of package '{s}' matches multiple rules, recipes.txt lines {} and {}",
-            .{ payload.file_name, pkg.id, rules[0].line, rules[1].line },
+        .multiple => |rules| errExit(
+            "payload '{s}' of package '{s}' matches multiple rules, {s}:{} and {s}:{}",
+            .{ payload.file_name, pkg.id, rules[0].file, rules[0].line, rules[1].file, rules[1].line },
         ),
     };
 }
@@ -650,11 +746,13 @@ fn finishCacheFetch(
 }
 
 const MsvcupPackage = struct {
-    kind: MsvcupPackageKind,
+    kind: Recipes.Package,
     version: StringPool.Val,
-    pub fn initStr(kind: MsvcupPackageKind, version: []const u8) MsvcupPackage {
+    pub fn initStr(kind: Recipes.Package, version: []const u8) MsvcupPackage {
         return .{ .kind = kind, .version = global.string_pool.add(version) catch |e| oom(e) };
     }
+    /// A name msvcup doesn't have is a recipe package's: whether a recipe makes it is up to
+    /// the caller (a lock file's packages are what's installed, whatever made them).
     pub fn fromString(pkg: []const u8) union(enum) {
         ok: MsvcupPackage,
         autoenv,
@@ -662,33 +760,37 @@ const MsvcupPackage = struct {
         invalid_version: []const u8,
     } {
         if (std.mem.eql(u8, pkg, "autoenv")) return .autoenv;
-        const kind: MsvcupPackageKind, const version: []const u8 = blk: {
-            if (startsWith(u8, pkg, "msvc-")) |version| break :blk .{ .msvc, version };
-            if (startsWith(u8, pkg, "sdk-")) |version| break :blk .{ .sdk, version };
-            if (startsWith(u8, pkg, "msbuild-")) |version| break :blk .{ .msbuild, version };
-            if (startsWith(u8, pkg, "diasdk-")) |version| break :blk .{ .diasdk, version };
-            if (startsWith(u8, pkg, "ninja-")) |version| break :blk .{ .ninja, version };
-            if (startsWith(u8, pkg, "cmake-")) |version| break :blk .{ .cmake, version };
-            return .unknown_name;
-        };
+        const dash = std.mem.indexOfScalar(u8, pkg, '-') orelse return .unknown_name;
+        const kind = Recipes.Package.fromName(&global.string_pool, pkg[0..dash]) orelse return .unknown_name;
+        const version = pkg[dash + 1 ..];
         return if (isValidVersion(version)) .{ .ok = .{
             .kind = kind,
             .version = global.string_pool.add(version) catch |e| oom(e),
         } } else .{ .invalid_version = version };
     }
-    pub fn poolString(self: MsvcupPackage) StringPool.Val {
-        var buf: [100]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "{f}", .{self}) catch @panic("version too long");
-        return global.string_pool.add(name) catch |e| oom(e);
-    }
+    /// msvcup's packages first, in their order, then recipe packages by name.
     pub fn order(_: void, lhs: MsvcupPackage, rhs: MsvcupPackage) std.math.Order {
-        return switch (MsvcupPackageKind.order({}, lhs.kind, rhs.kind)) {
+        const kind_order: std.math.Order = switch (lhs.kind) {
+            .builtin => |l| switch (rhs.kind) {
+                .builtin => |r| MsvcupPackageKind.order({}, l, r),
+                .recipe => .lt,
+            },
+            .recipe => |l| switch (rhs.kind) {
+                .builtin => .gt,
+                .recipe => |r| std.mem.order(u8, l.slice, r.slice),
+            },
+        };
+        return switch (kind_order) {
             .lt, .gt => |o| o,
             .eq => orderDottedNumeric({}, lhs.version.slice, rhs.version.slice),
         };
     }
     pub fn format(self: MsvcupPackage, writer: *std.Io.Writer) error{WriteFailed}!void {
-        try writer.print("{t}-{s}", .{ self.kind, self.version.slice });
+        try writer.print("{s}-{s}", .{ self.kind.name(), self.version.slice });
+    }
+    /// The number of bytes format writes.
+    pub fn formatLen(self: MsvcupPackage) usize {
+        return self.kind.name().len + 1 + self.version.slice.len;
     }
 };
 
@@ -708,6 +810,7 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
         cache_dir: ?[]const u8,
         msiexec: bool = false,
     };
+    var recipe_options: RecipeOptions = .{};
     const config: Config = blk_config: {
         var maybe_install_dir: ?[]const u8 = null;
         var autoenv: bool = false;
@@ -749,7 +852,7 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
                 cache_dir = args.next() orelse errExit("--cache-dir missing argument", .{});
             } else if (std.mem.eql(u8, arg, "--msiexec")) {
                 msiexec = true;
-            } else errExit("unknown cmdline argument '{s}'", .{arg});
+            } else if (!recipe_options.parseArg(arena, arg, args)) errExit("unknown cmdline argument '{s}'", .{arg});
         }
 
         // sanity check everything is sorted
@@ -784,6 +887,18 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
         .{},
     );
 
+    // Loaded even when the lock file has the packages: it's only good for the recipes it was
+    // made from, and a recipe package exists only if a recipe makes it, the same with a lock
+    // file or without.
+    const recipes = loadRecipes(io, arena, &recipe_options);
+    for (config.msvcup_pkgs) |pkg| switch (pkg.kind) {
+        .builtin => {},
+        .recipe => if (!recipes.all.hasPackage(pkg.kind)) errExit(
+            "unknown package '{f}', no recipe makes it (see --add-recipes)",
+            .{pkg},
+        ),
+    };
+
     const cache_dir: []const u8 = config.cache_dir orelse msvcup_dir.path(
         arena,
         &.{"cache"},
@@ -815,10 +930,11 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
             }
         };
         if (maybe_lock_file_content) |content| {
-            if (checkLockFilePkgs(
+            if (checkLockFile(
                 config.lock_file,
                 content,
                 config.autoenv,
+                &recipes,
                 config.msvcup_pkgs,
             )) |mismatch| {
                 std.log.info("{f}", .{mismatch});
@@ -842,8 +958,6 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
             }
         }
     }
-
-    const recipes = parseBuiltinRecipes(arena);
 
     const vsman = try readVsManifestLocking(io, environ, arena, root_node, scratch, msvcup_dir, config.channel, .off);
     defer vsman.freeConst(arena);
@@ -877,10 +991,11 @@ fn install(io: std.Io, environ: std.process.Environ, arena: std.mem.Allocator, a
         break :blk try readToEndAlloc(io, lock_file, arena);
     };
 
-    if (checkLockFilePkgs(
+    if (checkLockFile(
         config.lock_file,
         lock_file_content,
         config.autoenv,
+        &recipes,
         config.msvcup_pkgs,
     )) |mismatch| errExit(
         "lock file '{s}' still doesn't match what we're installing even after it's been updated: {f}",
@@ -1038,6 +1153,8 @@ fn updateFile(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, content: []cons
 const LockFileMismatch = union(enum) {
     msvc: struct { requested: []const u8, lockfile: []const u8 },
     autoenv: bool, // lockfile value
+    builtin_recipes: bool, // lockfile value
+    added_recipes,
     missing_pkg: MsvcupPackage,
     extra_pkg: MsvcupPackage,
 
@@ -1051,21 +1168,32 @@ const LockFileMismatch = union(enum) {
                 "lock file {s} autoenv",
                 .{@as([]const u8, if (lockfile_value) "has" else "does not have")},
             ),
+            .builtin_recipes => |lockfile_value| try writer.print(
+                "lock file was made {s} msvcup's builtin recipes",
+                .{@as([]const u8, if (lockfile_value) "with" else "without")},
+            ),
+            .added_recipes => try writer.writeAll("lock file was made with different --add-recipes rules"),
             .missing_pkg => |pkg| try writer.print("lock file is missing package '{f}'", .{pkg}),
             .extra_pkg => |pkg| try writer.print("lock file has extra package '{f}' that was not given on cmdline", .{pkg}),
         }
     }
 };
-fn checkLockFilePkgs(
+/// Returns how the lock file differs from what's being installed, null if it's for the same
+/// packages made by the same recipes.
+fn checkLockFile(
     lock_file_path: []const u8,
     lock_file_content: []const u8,
     autoenv: bool,
+    recipes: *const LoadedRecipes,
     msvcup_pkgs: []const MsvcupPackage,
 ) ?LockFileMismatch {
     std.debug.assert(msvcup_pkgs.len > 0);
     var line_it = std.mem.tokenizeAny(u8, lock_file_content, "\r\n");
     var lineno: u32 = 0;
     var has_autoenv: bool = false;
+    var has_builtin_recipes: bool = true;
+    var added_recipe_count: usize = 0;
+    var seen_payload = false;
     var msvcup_pkg_index: usize = 0;
     var msvcup_pkg_match_count: usize = 0;
     while (line_it.next()) |line| {
@@ -1076,8 +1204,21 @@ fn checkLockFilePkgs(
                 has_autoenv = true;
                 continue;
             },
+            .no_builtin_recipes => {
+                if (seen_payload) errExit("{s}:{}: the recipes must come before the payloads", .{ lock_file_path, lineno });
+                has_builtin_recipes = false;
+                continue;
+            },
+            .recipe => |rule| {
+                if (seen_payload) errExit("{s}:{}: the recipes must come before the payloads", .{ lock_file_path, lineno });
+                if (added_recipe_count == recipes.added.len) return .added_recipes;
+                if (!rule.eql(&recipes.added[added_recipe_count])) return .added_recipes;
+                added_recipe_count += 1;
+                continue;
+            },
             .payload => |payload| payload,
         };
+        seen_payload = true;
         while (true) {
             switch (payload.url_kind) {
                 .top_level => |payload_msvcup_pkg| switch (MsvcupPackage.order(
@@ -1111,6 +1252,8 @@ fn checkLockFilePkgs(
         .missing_pkg = msvcup_pkgs[msvcup_pkg_index],
     };
     if (autoenv != has_autoenv) return .{ .autoenv = has_autoenv };
+    if (recipes.builtin != has_builtin_recipes) return .{ .builtin_recipes = has_builtin_recipes };
+    if (added_recipe_count != recipes.added.len) return .added_recipes;
     return null;
 }
 
@@ -1125,8 +1268,8 @@ const LockFilePayload = struct {
     pub fn stripRootDir(payload: *const LockFilePayload) bool {
         return switch (payload.url_kind) {
             .top_level => |pkg| switch (pkg.kind) {
-                .cmake => true,
-                else => false,
+                .builtin => |kind| kind == .cmake,
+                .recipe => false,
             },
             .cab => false,
         };
@@ -1135,14 +1278,17 @@ const LockFilePayload = struct {
     pub fn hostArchLimit(payload: *const LockFilePayload) ?Arch {
         return switch (payload.url_kind) {
             .top_level => |pkg| switch (pkg.kind) {
-                .msvc, .sdk, .msbuild, .diasdk => null,
-                .ninja, .cmake => switch (extra.parseUrl(payload.url_decoded)) {
-                    .ok => |p| p.arch,
-                    .unexpected => |u| errExit(
-                        "invalid package url '{s}' expected {s} at offset {} but got '{s}'",
-                        .{ payload.url_decoded, u.what, u.offset, payload.url_decoded[u.offset..] },
-                    ),
+                .builtin => |kind| switch (kind) {
+                    .msvc, .sdk, .msbuild, .diasdk => null,
+                    .ninja, .cmake => switch (extra.parseUrl(payload.url_decoded)) {
+                        .ok => |p| p.arch,
+                        .unexpected => |u| errExit(
+                            "invalid package url '{s}' expected {s} at offset {} but got '{s}'",
+                            .{ payload.url_decoded, u.what, u.offset, payload.url_decoded[u.offset..] },
+                        ),
+                    },
                 },
+                .recipe => null,
             },
             .cab => null,
         };
@@ -1151,8 +1297,14 @@ const LockFilePayload = struct {
 
 const LockFileLine = union(enum) {
     autoenv,
+    /// The lock file was made without msvcup's builtin recipes.
+    no_builtin_recipes,
+    /// A rule of an --add-recipes file the lock file was made with.
+    recipe: Recipes.Rule,
     payload: LockFilePayload,
 };
+const lock_file_no_builtin_recipes = "no-builtin-recipes";
+const lock_file_recipe_prefix = "recipe ";
 
 fn parseLockFileLine(
     lock_file_path: []const u8,
@@ -1160,6 +1312,13 @@ fn parseLockFileLine(
     line: []const u8,
 ) LockFileLine {
     if (std.mem.eql(u8, line, "autoenv")) return .autoenv;
+    if (std.mem.eql(u8, line, lock_file_no_builtin_recipes)) return .no_builtin_recipes;
+    if (startsWith(u8, line, lock_file_recipe_prefix)) |rule| {
+        var diagnostic: Recipes.Diagnostic = .{};
+        return .{ .recipe = Recipes.parseRule(&global.string_pool, lock_file_path, rule, lineno, &diagnostic) catch |err| switch (err) {
+            error.InvalidRecipes => errExit("{s}:{}: invalid recipe: {s}", .{ lock_file_path, lineno, diagnostic.message }),
+        } };
+    }
     const msvcup_pkg_end = std.mem.indexOfScalar(u8, line, '|') orelse errExit(
         "{s}:{}: this line has no '|' character separate the pkg/URL/hash '{s}'",
         .{ lock_file_path, lineno, line },
@@ -1167,8 +1326,7 @@ fn parseLockFileLine(
     const msvcup_pkg_str = line[0..msvcup_pkg_end];
     const maybe_msvcup_pkg = if (msvcup_pkg_str.len == 0) null else switch (MsvcupPackage.fromString(msvcup_pkg_str)) {
         .ok => |pkg| pkg,
-        .autoenv => @panic("todo"),
-        .unknown_name, .invalid_version => errExit(
+        .autoenv, .unknown_name, .invalid_version => errExit(
             "{s}:{}: invalid msvcup pkg '{s}'",
             .{ lock_file_path, lineno, msvcup_pkg_str },
         ),
@@ -1273,6 +1431,8 @@ fn installFromLockFileLocking(
                 unique_pkgs.autoenv = true;
                 continue;
             },
+            // what the payloads were selected with, checkLockFile compares them
+            .no_builtin_recipes, .recipe => continue,
             .payload => |payload| payload,
         };
         if (payload.hostArchLimit()) |host_arch_limit| {
@@ -1287,17 +1447,21 @@ fn installFromLockFileLocking(
         }
         switch (payload.url_kind) {
             .top_level => |payload_msvcup_pkg| {
+                // msvc and sdk set up the environment, for one version of each
                 const maybe_version_ref: ?*?StringPool.Val = switch (payload_msvcup_pkg.kind) {
-                    .msvc => &unique_pkgs.msvc,
-                    .sdk => &unique_pkgs.sdk,
-                    .msbuild, .diasdk, .ninja, .cmake => null,
+                    .builtin => |kind| switch (kind) {
+                        .msvc => &unique_pkgs.msvc,
+                        .sdk => &unique_pkgs.sdk,
+                        .msbuild, .diasdk, .ninja, .cmake => null,
+                    },
+                    .recipe => null,
                 };
                 if (maybe_version_ref) |version_ref| {
                     if (version_ref.*) |v| {
                         if (!v.eql(payload_msvcup_pkg.version)) {
                             errExit(
-                                "lock file contains multiple {s} package versions ('{f}' and '{f}')",
-                                .{ @tagName(payload_msvcup_pkg.kind), v, payload_msvcup_pkg.version },
+                                "lock file contains multiple {t} package versions ('{f}' and '{f}')",
+                                .{ payload_msvcup_pkg.kind.builtin, v, payload_msvcup_pkg.version },
                             );
                         }
                     } else {
@@ -1382,9 +1546,11 @@ fn queryInstallVersion(
         .sdk => std.fs.path.join(scratch, &.{ install_path, "Windows Kits", "10", "Include" }) catch |e| oom(e),
     };
     defer scratch.free(query_path);
-    var query_dir = std.Io.Dir.cwd().openDir(io, query_path, .{ .iterate = true }) catch |e| std.debug.panic(
-        "open directory '{s}' failed with {s}",
-        .{ query_path, @errorName(e) },
+    // not a panic: with --no-builtin-recipes the package's payloads are whatever a file's
+    // rules select
+    var query_dir = std.Io.Dir.cwd().openDir(io, query_path, .{ .iterate = true }) catch |e| errExit(
+        "open directory '{s}' failed with {s}, the payloads of the {t} package are expected to install it",
+        .{ query_path, @errorName(e), kind },
     );
     defer query_dir.close(io);
     var version_entry: ?[]u8 = null;
@@ -1392,16 +1558,16 @@ fn queryInstallVersion(
     while (try it.next(io)) |entry| {
         if (!isValidVersion(entry.name)) {
             std.log.info("entry '{s}' in directory '{s}' is not a valid version", .{ entry.name, query_path });
-        } else if (version_entry) |existing| std.debug.panic(
+        } else if (version_entry) |existing| errExit(
             "directory '{s}' has multiple version entries '{s}' and '{s}'",
             .{ query_path, existing, entry.name },
         ) else {
             version_entry = allocator.dupe(u8, entry.name) catch |e| oom(e);
         }
     }
-    return version_entry orelse std.debug.panic(
-        "directory '{s}' did not contain any version subdirectories",
-        .{query_path},
+    return version_entry orelse errExit(
+        "directory '{s}' did not contain any version subdirectories, the payloads of the {t} package are expected to install one",
+        .{ query_path, kind },
     );
 }
 
@@ -1662,7 +1828,7 @@ fn installPayloadLocking(
             lineno += 1;
             if (line.len == 0) continue;
             const payload = switch (parseLockFileLine(lock_file_path, lineno, line)) {
-                .autoenv => continue,
+                .autoenv, .no_builtin_recipes, .recipe => continue,
                 .payload => |payload| payload,
             };
             const cab_cache_entry = CacheEntry.alloc(scratch, scratch, cache_dir, payload.sha256, basenameFromUrl(payload.url_decoded));
@@ -1722,7 +1888,7 @@ fn installPayloadLocking(
                     lineno += 1;
                     if (line.len == 0) continue;
                     const payload = switch (parseLockFileLine(lock_file_path, lineno, line)) {
-                        .autoenv => unreachable,
+                        .autoenv, .no_builtin_recipes, .recipe => continue,
                         .payload => |payload| payload,
                     };
                     const installer_sub_path = switch (payload.url_kind) {
@@ -2260,6 +2426,37 @@ fn endInstall(
     try std.Io.Dir.rename(.cwd(), installed_manifest_path_tmp, .cwd(), installed_manifest_path, io);
 }
 
+/// Exits if the payload a rule selects for a package being installed isn't one msvcup can
+/// install as that package: here, where the rule is known, not when the lock file is used.
+fn checkRulePayload(rule: *const Recipes.Rule, pkg: *const Package, payload: *const Payload) void {
+    const cant_install = "{s}:{}: selects payload '{s}' of package '{s}', ";
+    const context = .{ rule.file, rule.line, payload.file_name, pkg.id };
+    switch (getLockFileUrlKind(payload.url_decoded) orelse errExit(
+        cant_install ++ "unable to determine the payload kind from url '{s}'",
+        context ++ .{payload.url_decoded},
+    )) {
+        .vsix, .msi, .zip => {},
+        .cab => errExit(
+            cant_install ++ "a cab is installed by the msi that needs it, select the msi",
+            context,
+        ),
+    }
+    switch (rule.package) {
+        .builtin => |kind| switch (kind) {
+            .msvc, .sdk, .msbuild, .diasdk => {},
+            // their host arch comes from the url, see hostArchLimit
+            .ninja, .cmake => switch (extra.parseUrl(payload.url_decoded)) {
+                .ok => {},
+                .unexpected => |u| errExit(
+                    cant_install ++ "a {t} payload's url must have {s} at offset {} but it's '{s}'",
+                    context ++ .{ kind, u.what, u.offset, payload.url_decoded },
+                ),
+            },
+        },
+        .recipe => {},
+    }
+}
+
 const InstallPayload = struct {
     target: MsvcupPackage,
     index: PayloadIndex,
@@ -2281,7 +2478,7 @@ fn updateLockFileLocking(
     environ: std.process.Environ,
     scratch: std.mem.Allocator,
     progress_node: std.Progress.Node,
-    recipes: *const Recipes,
+    recipes: *const LoadedRecipes,
     channel: Channel,
     autoenv: bool,
     msvcup_pkgs: []const MsvcupPackage,
@@ -2297,10 +2494,11 @@ fn updateLockFileLocking(
         for (pkgs.slice, 0..) |*pkg, pkg_index| {
             const payload_range = pkgs.payloadRangeFromPkgIndex(.fromInt(pkg_index));
             for (payload_range.start..payload_range.limit) |payload_index| {
-                const owner = recipeOwner(recipes, pkg, &pkgs.payloads[payload_index]) orelse continue;
+                const owner = recipeOwner(&recipes.all, pkg, &pkgs.payloads[payload_index]) orelse continue;
                 for (msvcup_pkgs) |msvcup_pkg| {
-                    if (msvcup_pkg.kind != owner.rule.package) continue;
+                    if (!msvcup_pkg.kind.eql(owner.rule.package)) continue;
                     if (!std.mem.eql(u8, msvcup_pkg.version.slice, owner.package_version)) continue;
+                    checkRulePayload(owner.rule, pkg, &pkgs.payloads[payload_index]);
                     insertSorted(
                         InstallPayload,
                         scratch,
@@ -2436,6 +2634,7 @@ fn updateLockFileLocking(
     var lock_file_writer = lock_file.writer(io, &write_buf);
     writeLockFile(
         autoenv,
+        recipes,
         pkgs,
         payloads,
         cabs.items,
@@ -2447,6 +2646,7 @@ fn updateLockFileLocking(
 }
 fn writeLockFile(
     autoenv: bool,
+    recipes: *const LoadedRecipes,
     pkgs: Packages,
     payloads: []const InstallPayload,
     cabs: []const PayloadIndex,
@@ -2456,6 +2656,8 @@ fn writeLockFile(
     if (autoenv) {
         try writer.writeAll("autoenv\n");
     }
+    if (!recipes.builtin) try writer.writeAll(lock_file_no_builtin_recipes ++ "\n");
+    for (recipes.added) |rule| try writer.print(lock_file_recipe_prefix ++ "{f}\n", .{rule});
     for (payloads, 0..) |install_payload, payload_cab_offsets_index| {
         const payload = pkgs.payloads[install_payload.index.int()];
         _ = uriFromUrlDecoded(payload.url_decoded) catch errExit(
@@ -2523,18 +2725,18 @@ fn writePayload(
         .cab => false,
     };
     std.debug.assert(expect_target_string == (maybe_target != null));
-    const target_str: []const u8 = if (maybe_target) |t| t.poolString().slice else "";
+    if (maybe_target) |target| try writer.print("{f}", .{target});
 
     const sha_hex = sha256.toHex();
     if (std.ascii.findIgnoreCase(url, &sha_hex)) |hash_index| {
         try writer.print(
-            "{s}|{s}|{d}{s}{s}\n",
-            .{ target_str, url, hash_index, space, out_file_name },
+            "|{s}|{d}{s}{s}\n",
+            .{ url, hash_index, space, out_file_name },
         );
     } else {
         try writer.print(
-            "{s}|{s}|{f}{s}{s}\n",
-            .{ target_str, url, sha256, space, std.fs.path.basenameWindows(out_file_name) },
+            "|{s}|{f}{s}{s}\n",
+            .{ url, sha256, space, std.fs.path.basenameWindows(out_file_name) },
         );
     }
 }

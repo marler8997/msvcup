@@ -1,5 +1,5 @@
 # Selects which manifest payloads belong to which msvcup package. The format is
-# documented above parseBuiltinRecipes in msvcup.zig.
+# documented above RecipeOptions in msvcup.zig.
 
 # contains vcruntime.h
 msvc-{version} id=Microsoft.VC.{version}.CRT.Headers.base
