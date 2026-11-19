@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) !void {
         run.addArtifactArg(msvcup);
         _ = run.addOutputDirectoryArg("manifest");
         run.has_side_effects = true;
-        const step = b.step("test-manifest", "Read complete and cut short manifests from the data directory");
+        const step = b.step("test-manifest", "Read complete and cut short manifests from the data directory, and recipes from files");
         step.dependOn(&run.step);
         test_step.dependOn(step);
     }

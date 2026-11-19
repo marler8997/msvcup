@@ -47,17 +47,6 @@ pub fn add(self: *@This(), s: []const u8) error{OutOfMemory}!Val {
     return val;
 }
 
-pub fn addFormatted(self: *@This(), comptime fmt: []const u8, args: anytype) error{OutOfMemory}!Val {
-    const s = try std.fmt.allocPrint(self.allocator, fmt, args);
-    errdefer self.allocator.free(s);
-
-    const val = try self.add(s);
-    if (val.slice.ptr != s.ptr) {
-        self.allocator.free(s);
-    }
-    return val;
-}
-
 pub const HashContext = struct {
     pub fn hash(self: HashContext, s: Val) u64 {
         _ = self;
@@ -97,7 +86,7 @@ test "stringpool" {
     const s = try pool.add("hello");
     {
         var buf: [5]u8 = undefined;
-        std.mem.copy(u8, buf[0..], "hello");
+        @memcpy(buf[0..], "hello");
         const s2 = try pool.add(buf[0..]);
         try std.testing.expect(s.slice.ptr == s2.slice.ptr);
     }

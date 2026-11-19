@@ -1,5 +1,5 @@
 //! Parses and matches the rules that select which manifest payloads belong to
-//! which msvcup package. The format is documented above parseBuiltinRecipes in
+//! which msvcup package. The format is documented above RecipeOptions in
 //! msvcup.zig.
 //!
 //! Recipes reference the text they were parsed from rather than copying it, so
@@ -11,15 +11,83 @@ const Recipes = @This();
 rules: []const Rule,
 
 pub const Rule = struct {
+    /// The path of the recipe file the rule is in, for messages.
+    file: []const u8,
     line: u32,
-    package: MsvcupPackageKind,
+    package: Package,
     /// The version of the msvcup package, null to use the {version} capture.
     package_version: ?[]const u8,
     // patterns, validated by parse
     id: ?[]const u8,
     version: ?[]const u8,
     file_name: ?[]const u8,
+
+    /// Whether the rules select the same payloads for the same package, wherever they are.
+    pub fn eql(a: *const Rule, b: *const Rule) bool {
+        return a.package.eql(b.package) and
+            optionalEql(a.package_version, b.package_version) and
+            optionalEql(a.id, b.id) and
+            optionalEql(a.version, b.version) and
+            optionalEql(a.file_name, b.file_name);
+    }
+    fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
+        return std.mem.eql(u8, a orelse return b == null, b orelse return false);
+    }
+
+    /// Writes the rule as one line that parseRule reads back as an equal rule.
+    pub fn format(rule: Rule, w: *std.Io.Writer) error{WriteFailed}!void {
+        try w.print("{s}-{s}", .{ rule.package.name(), rule.package_version orelse version_placeholder });
+        for ([_]struct { []const u8, ?[]const u8 }{
+            .{ "id", rule.id },
+            .{ "version", rule.version },
+            .{ "fileName", rule.file_name },
+        }) |predicate| {
+            const name, const pattern = .{ predicate[0], predicate[1] orelse continue };
+            // parse leaves no other whitespace in a pattern
+            const quote = if (std.mem.indexOfScalar(u8, pattern, ' ') == null) "" else "\"";
+            try w.print(" {s}{s}={s}{s}", .{ quote, name, pattern, quote });
+        }
+    }
 };
+
+/// The package a rule's payloads belong to: one of msvcup's, or one only recipes define, a
+/// plain set of payloads, installed without the environment msvc and sdk get.
+pub const Package = union(enum) {
+    builtin: MsvcupPackageKind,
+    recipe: StringPool.Val,
+
+    pub fn name(package: Package) []const u8 {
+        return switch (package) {
+            .builtin => |kind| @tagName(kind),
+            .recipe => |recipe_name| recipe_name.slice,
+        };
+    }
+
+    pub fn eql(a: Package, b: Package) bool {
+        return switch (a) {
+            .builtin => |kind| b == .builtin and b.builtin == kind,
+            .recipe => |recipe_name| b == .recipe and b.recipe.eql(recipe_name),
+        };
+    }
+
+    /// A recipe package's name is lowercase letters and digits: it can't contain the '-'
+    /// before the version.
+    pub fn fromName(pool: *StringPool, package_name: []const u8) ?Package {
+        if (std.meta.stringToEnum(MsvcupPackageKind, package_name)) |kind| return .{ .builtin = kind };
+        if (package_name.len == 0) return null;
+        for (package_name) |c| switch (c) {
+            'a'...'z', '0'...'9' => {},
+            else => return null,
+        };
+        return .{ .recipe = pool.add(package_name) catch |e| oom(e) };
+    }
+};
+
+/// Whether a rule makes payloads belong to `package`.
+pub fn hasPackage(self: *const Recipes, package: Package) bool {
+    for (self.rules) |*rule| if (rule.package.eql(package)) return true;
+    return false;
+}
 
 const version_placeholder = "{version}";
 const arch_placeholder = "{arch}";
@@ -47,23 +115,51 @@ pub const Match = union(enum) {
     };
 };
 
-/// The returned Recipes references `text`, which must stay in memory.
-pub fn parse(
-    arena: std.mem.Allocator,
+/// The number of rules in `text`, to allocate exactly what parseInto fills: the rules of any
+/// number of texts can go in one allocation with nothing to copy or free.
+pub fn countRules(text: []const u8) usize {
+    var count: usize = 0;
+    var lines: RuleLines = .init(text);
+    while (lines.next()) |_| count += 1;
+    return count;
+}
+
+/// Parses the rules of `text` into `rules`, one for each that countRules counted. The rules
+/// reference `file` and `text`, which must stay in memory: they're never to be freed while
+/// the rules are in use. A Rule owns nothing, so on an error there's nothing to clean up in
+/// the ones already written.
+pub fn parseInto(
+    rules: []Rule,
+    pool: *StringPool,
+    file: []const u8,
     text: []const u8,
     diagnostic: *Diagnostic,
-) error{ OutOfMemory, InvalidRecipes }!Recipes {
-    // count the rules first so this one allocation is exactly the right size
-    var rule_count: usize = 0;
-    var count_lines: RuleLines = .init(text);
-    while (count_lines.next()) |_| rule_count += 1;
+) error{InvalidRecipes}!void {
+    // what Windows PowerShell's redirection writes, every rule would be an error that says
+    // nothing of why
+    if (std.mem.startsWith(u8, text, "\xFF\xFE") or std.mem.startsWith(u8, text, "\xFE\xFF"))
+        return fail(diagnostic, 1, "is UTF-16, save it as UTF-8");
 
-    const rules = try arena.alloc(Rule, rule_count);
     var lines: RuleLines = .init(text);
     for (rules) |*rule| {
         const line = lines.next().?;
-        rule.* = try parseRule(line, lines.number, diagnostic);
+        rule.* = try parseRule(pool, file, line, lines.number, diagnostic);
     }
+    std.debug.assert(lines.next() == null);
+}
+
+/// The rules of one text, for the tests.
+fn parse(
+    allocator: std.mem.Allocator,
+    pool: *StringPool,
+    file: []const u8,
+    text: []const u8,
+    diagnostic: *Diagnostic,
+) error{InvalidRecipes}!Recipes {
+    const rules = allocator.alloc(Rule, countRules(text)) catch |e| oom(e);
+    // a Rule owns nothing: it references the text and file, and its package name is the pool's
+    errdefer allocator.free(rules);
+    try parseInto(rules, pool, file, text, diagnostic);
     return .{ .rules = rules };
 }
 
@@ -73,7 +169,10 @@ const RuleLines = struct {
     number: u32 = 0,
 
     fn init(text: []const u8) RuleLines {
-        return .{ .lines = std.mem.splitScalar(u8, text, '\n') };
+        // some Windows editors start UTF-8 with a byte order mark, the first line starts after it
+        const utf8_bom = "\xEF\xBB\xBF";
+        const start: usize = if (std.mem.startsWith(u8, text, utf8_bom)) utf8_bom.len else 0;
+        return .{ .lines = .{ .buffer = text, .index = start, .delimiter = '\n' } };
     }
     fn next(self: *RuleLines) ?[]const u8 {
         while (self.lines.next()) |line_with_ending| {
@@ -128,14 +227,19 @@ const Fields = struct {
     }
 };
 
-fn parseRule(text: []const u8, line: u32, diagnostic: *Diagnostic) error{InvalidRecipes}!Rule {
+/// Parses the one rule in `text`, which the returned Rule references along with `file`. Its
+/// package name goes in `pool` if it's a recipe package's.
+pub fn parseRule(pool: *StringPool, file: []const u8, text: []const u8, line: u32, diagnostic: *Diagnostic) error{InvalidRecipes}!Rule {
     var fields: Fields = .{ .line = text };
-    // RuleLines only returns lines that aren't blank
-    const owner = (try nextField(&fields, line, diagnostic)).?;
+    const owner = try nextField(&fields, line, diagnostic) orelse return fail(diagnostic, line, "expected a rule");
     const dash = std.mem.indexOfScalar(u8, owner, '-') orelse
         return fail(diagnostic, line, "expected an owner like PACKAGE-VERSION");
-    const package = std.meta.stringToEnum(MsvcupPackageKind, owner[0..dash]) orelse
-        return fail(diagnostic, line, "unknown msvcup package");
+    const package_name = owner[0..dash];
+    // not a package with a version, "autoenv-1" next to it would only confuse
+    if (std.mem.eql(u8, package_name, "autoenv"))
+        return fail(diagnostic, line, "autoenv is msvcup's, a recipe can't make it");
+    const package = Package.fromName(pool, package_name) orelse
+        return fail(diagnostic, line, "a package name is lowercase letters and digits");
     const owner_version = owner[dash + 1 ..];
     if (owner_version.len == 0) return fail(diagnostic, line, "owner is missing a version");
     const package_version: ?[]const u8 = if (std.mem.eql(u8, owner_version, version_placeholder)) null else blk: {
@@ -145,6 +249,7 @@ fn parseRule(text: []const u8, line: u32, diagnostic: *Diagnostic) error{Invalid
     };
 
     var rule: Rule = .{
+        .file = file,
         .line = line,
         .package = package,
         .package_version = package_version,
@@ -209,6 +314,8 @@ fn validatePattern(pattern: []const u8, line: u32, diagnostic: *Diagnostic) erro
                 } else return fail(diagnostic, line, "unknown placeholder, expected {version} or {arch}");
             },
             '}' => return fail(diagnostic, line, "unexpected '}' in pattern"),
+            // a rule is one line, here and where a lock file records it
+            0...' ' - 1, 0x7f => return fail(diagnostic, line, "control character in pattern"),
             else => index += 1,
         }
     }
@@ -330,7 +437,9 @@ fn testMatch(recipes: *const Recipes, attributes: TestAttributes) Match {
 
 fn testParse(arena: std.mem.Allocator, text: []const u8) !Recipes {
     var diagnostic: Diagnostic = .{};
-    return parse(arena, text, &diagnostic) catch |err| {
+    // in the arena, which the test frees
+    var pool: StringPool = .init(arena);
+    return parse(arena, &pool, "test.txt", text, &diagnostic) catch |err| {
         std.debug.print("recipes:{}: {s}\n", .{ diagnostic.line, diagnostic.message });
         return err;
     };
@@ -345,7 +454,7 @@ fn testExpectOwner(
     switch (testMatch(recipes, attributes)) {
         .none, .multiple => return error.TestUnexpectedResult,
         .one => |one| {
-            try std.testing.expectEqual(package, one.rule.package);
+            try std.testing.expect(one.rule.package.eql(.{ .builtin = package }));
             try std.testing.expectEqualStrings(package_version, one.package_version);
         },
     }
@@ -362,9 +471,10 @@ fn testExpectParseError(line: u32, message: []const u8, text: []const u8) !void 
     var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_instance.deinit();
     var diagnostic: Diagnostic = .{};
+    var pool: StringPool = .init(arena_instance.allocator());
     try std.testing.expectError(
         error.InvalidRecipes,
-        parse(arena_instance.allocator(), text, &diagnostic),
+        parse(arena_instance.allocator(), &pool, "test.txt", text, &diagnostic),
     );
     try std.testing.expectEqual(line, diagnostic.line);
     try std.testing.expectEqualStrings(message, diagnostic.message);
@@ -489,7 +599,9 @@ test "the text is referenced and parsing allocates exactly the rules" {
     var failing: std.testing.FailingAllocator = .init(arena_instance.allocator(), .{});
     const text = @embedFile("recipes.txt");
     var diagnostic: Diagnostic = .{};
-    const recipes = try parse(failing.allocator(), text, &diagnostic);
+    // the builtin recipes only have msvcup's packages, nothing goes in the pool
+    var pool: StringPool = .init(failing.allocator());
+    const recipes = try parse(failing.allocator(), &pool, "recipes.txt", text, &diagnostic);
     try std.testing.expect(recipes.rules.len > 0);
     try std.testing.expectEqual(@as(usize, 1), failing.allocations);
     try std.testing.expectEqual(recipes.rules.len * @sizeOf(Rule), failing.allocated_bytes);
@@ -501,7 +613,9 @@ test "the text is referenced and parsing allocates exactly the rules" {
 
 test "parse errors" {
     try testExpectParseError(2, "expected an owner like PACKAGE-VERSION", "# comment\nfoo id=a");
-    try testExpectParseError(1, "unknown msvcup package", "foo-1 id=a");
+    try testExpectParseError(1, "a package name is lowercase letters and digits", "Foo-1 id=a");
+    try testExpectParseError(1, "a package name is lowercase letters and digits", "foo_bar-1 id=a");
+    try testExpectParseError(1, "autoenv is msvcup's, a recipe can't make it", "autoenv-1 id=a");
     try testExpectParseError(1, "owner is missing a version", "msvc- id=a");
     try testExpectParseError(1, "owner version must be digits separated by dots or {version}", "msvc-* id=a");
     try testExpectParseError(1, "owner version must be digits separated by dots or {version}", "msvc-1.x id=a");
@@ -531,11 +645,66 @@ test "parse errors" {
     try testExpectParseError(1, "rule has more than one {version}", "msvc-{version} id={version} version={version}");
     try testExpectParseError(1, "owner uses {version} but no pattern captures it", "msvc-{version} id=a");
     try testExpectParseError(1, "pattern captures {version} but the owner doesn't use it", "msvc-1 id={version}");
+    try testExpectParseError(1, "control character in pattern", "msvc-1 id=a\rb");
+    try testExpectParseError(1, "control character in pattern", "msvc-1 \"id=a\tb\"");
+    try testExpectParseError(1, "is UTF-16, save it as UTF-8", "\xFF\xFEm\x00s\x00");
+    try testExpectParseError(1, "is UTF-16, save it as UTF-8", "\xFE\xFF\x00m\x00s");
+    // only at the start of the file
+    try testExpectParseError(2, "a package name is lowercase letters and digits", "# comment\n\xEF\xBB\xBFmsvc-1 id=a");
 }
 
-const std = @import("std");
-const Arch = @import("arch.zig").Arch;
-const MsvcupPackageKind = @import("msvcuppackagekind.zig").MsvcupPackageKind;
+test "a rule is written as a line that parses to an equal rule" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var pool: StringPool = .init(arena);
+    var diagnostic: Diagnostic = .{};
+    const recipes = try parse(arena, &pool, "test.txt",
+        \\fxc-{version}   "fileName=Installers/Windows SDK for Windows Store Apps Tools-*"   version={version}
+        \\msvc-{version} id=Microsoft.VC.{version}.Tools.Host{arch}.Target{arch}.base
+        \\msbuild-170 version=1.2 id=Microsoft.Build fileName=a/b.msi
+    , &diagnostic);
+    const expected = [_][]const u8{
+        // the predicates in one order, separated by one space
+        "fxc-{version} version={version} \"fileName=Installers/Windows SDK for Windows Store Apps Tools-*\"",
+        "msvc-{version} id=Microsoft.VC.{version}.Tools.Host{arch}.Target{arch}.base",
+        "msbuild-170 id=Microsoft.Build version=1.2 fileName=a/b.msi",
+    };
+    for (recipes.rules, expected, 0..) |*rule, expected_line, i| {
+        const line = try std.fmt.allocPrint(arena, "{f}", .{rule.*});
+        try std.testing.expectEqualStrings(expected_line, line);
+        const reparsed = try parseRule(&pool, "lock", line, 1, &diagnostic);
+        try std.testing.expect(rule.eql(&reparsed));
+        for (recipes.rules, 0..) |*other, j| try std.testing.expectEqual(i == j, rule.eql(other));
+    }
+    // each part of a rule matters
+    const rule = try parseRule(&pool, "a", "msbuild-170 id=a version=1", 1, &diagnostic);
+    for ([_][]const u8{
+        "msbuild-171 id=a version=1",
+        "msbuild-{version} id=a version={version}",
+        "diasdk-170 id=a version=1",
+        "tool-170 id=a version=1",
+        "msbuild-170 id=b version=1",
+        "msbuild-170 id=a",
+        "msbuild-170 id=a version=1 fileName=c",
+    }) |different| {
+        const other = try parseRule(&pool, "b", different, 1, &diagnostic);
+        try std.testing.expect(!rule.eql(&other));
+    }
+    try std.testing.expectError(error.InvalidRecipes, parseRule(&pool, "a", "  ", 7, &diagnostic));
+    try std.testing.expectEqual(@as(u32, 7), diagnostic.line);
+    try std.testing.expectEqualStrings("expected a rule", diagnostic.message);
+}
+
+test "a UTF-8 byte order mark is skipped" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    for ([_][]const u8{ "\xEF\xBB\xBFmsbuild-170 id=foo", "\xEF\xBB\xBF# comment\nmsbuild-170 id=foo" }) |text| {
+        const recipes = try testParse(arena_instance.allocator(), text);
+        try testExpectOwner(.msbuild, "170", &recipes, .{ .id = "foo" });
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try testParse(arena_instance.allocator(), "\xEF\xBB\xBF")).rules.len);
+}
 
 test "a slash in a fileName pattern matches either path separator" {
     var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -564,3 +733,36 @@ test "a slash in a fileName pattern matches either path separator" {
     try testExpectOwner(.ninja, "2", &recipes, .{ .id = "c/d" });
     try testExpectNone(&recipes, .{ .id = "c\\d" });
 }
+
+test "a package only recipes define" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    var pool: StringPool = .init(arena_instance.allocator());
+    var diagnostic: Diagnostic = .{};
+    const recipes = try parse(arena_instance.allocator(), &pool, "fxc.txt",
+        \\fxc-{version} version={version} "fileName=Installers/Windows SDK for Windows Store Apps Tools-*"
+    , &diagnostic);
+    const fxc: Package = .{ .recipe = pool.add("fxc") catch |e| oom(e) };
+    try std.testing.expect(recipes.hasPackage(fxc));
+    try std.testing.expect(!recipes.hasPackage(.{ .recipe = pool.add("dxc") catch |e| oom(e) }));
+    try std.testing.expect(!recipes.hasPackage(.{ .builtin = .sdk }));
+    switch (testMatch(&recipes, .{ .version = "10.0.28000.6", .file_name = "Installers\\Windows SDK for Windows Store Apps Tools-x86_en-us.msi" })) {
+        .none, .multiple => return error.TestUnexpectedResult,
+        .one => |one| {
+            try std.testing.expect(one.rule.package.eql(fxc));
+            try std.testing.expectEqualStrings("10.0.28000.6", one.package_version);
+            try std.testing.expectEqualStrings("fxc.txt", one.rule.file);
+        },
+    }
+    // a builtin name is msvcup's package, even in a recipe file
+    try std.testing.expect(Package.fromName(&pool, "sdk").?.eql(.{ .builtin = .sdk }));
+}
+
+fn oom(e: error{OutOfMemory}) noreturn {
+    @panic(@errorName(e));
+}
+
+const std = @import("std");
+const Arch = @import("arch.zig").Arch;
+const MsvcupPackageKind = @import("msvcuppackagekind.zig").MsvcupPackageKind;
+const StringPool = @import("StringPool.zig");
