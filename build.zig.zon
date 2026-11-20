@@ -23,5 +23,8 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "LICENSE",
+        "README.md",
+        "extrapkgs.lock",
     },
 }
